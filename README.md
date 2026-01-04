@@ -21,7 +21,7 @@ This project demonstrates **agent orchestration, tool usage, validation, and hum
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/<your-username>/ai-travel-planner-agent.git
+git clone https://github.com/Siddharthsinghkumar/ai-travel-planner-agent.git
 cd ai-travel-planner-agent
 pip install -r requirements.txt
 ollama run mistral
