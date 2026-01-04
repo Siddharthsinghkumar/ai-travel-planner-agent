@@ -39,20 +39,20 @@ uvicorn api.app:app --reload
 
 ```mermaid
 flowchart TD
-    UI[Streamlit UI] --> API[FastAPI Layer]
-    API --> Planner[Planner Agent]
+    UI["Streamlit UI"] --> API["FastAPI Layer"]
+    API --> Planner["Planner Agent"]
 
-    Planner --> Flights[Flight Search Tool]
-    Planner --> Weather[Weather Tool]
-    Planner --> Pricing[Price Scoring Engine]
-    Planner --> LLM[LLM Router]
+    Planner --> Flights["Flight Search Tool"]
+    Planner --> Weather["Weather Tool"]
+    Planner --> Pricing["Price Scoring Engine"]
+    Planner --> LLM["LLM Router"]
 
-    LLM --> Ollama[Local LLM (Ollama)]
-    LLM --> Cloud[Cloud LLM (Optional Fallback)]
+    LLM --> Ollama["Local LLM - Ollama"]
+    LLM --> Cloud["Cloud LLM - Optional Fallback"]
 
-    Planner --> Handoff[Deterministic Booking Handoff]
-    Planner --> DB[(Session History / Audit Log)]
-```
+    Planner --> Handoff["Deterministic Booking Handoff"]
+    Planner --> DB["Session History and Audit Log"]
+
 
 ---
 
