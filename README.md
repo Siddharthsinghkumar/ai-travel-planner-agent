@@ -53,6 +53,7 @@ flowchart TD
     Planner --> Handoff["Deterministic Booking Handoff"]
     Planner --> DB["Session History and Audit Log"]
 
+---
 
 ## 🧠 Core Design Principles
 
