@@ -54,8 +54,6 @@ flowchart TD
     Planner --> DB["Session History and Audit Log"]
 
 
----
-
 ## 🧠 Core Design Principles
 
 - Local-first inference
