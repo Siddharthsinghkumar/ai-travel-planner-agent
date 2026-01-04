@@ -29,6 +29,7 @@ streamlit run ui/streamlit_app.py
 ```
 
 (Optional API mode)
+
 ```bash
 uvicorn api.app:app --reload
 ```
@@ -52,8 +53,7 @@ flowchart TD
 
     Planner --> Handoff["Deterministic Booking Handoff"]
     Planner --> DB["Session History and Audit Log"]
-
----
+```
 
 ## 🧠 Core Design Principles
 
