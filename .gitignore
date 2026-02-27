@@ -1,21 +1,64 @@
-# Ignore virtual environment
-venv/
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.crt
 
+# =========================
+# Virtual Environment
+# =========================
+venv/
+.venv/
+
+# =========================
 # Python
+# =========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
+# =========================
 # Streamlit
+# =========================
 .streamlit/
 
+# =========================
 # Logs
+# =========================
 *.log
 
-# VSCode
-.vscode/
+# =========================
+# Local Data / Temp
+# =========================
+data/
+chromium137/
+terminal.txt
+testenv.py
+Failed api&scrapper script/
 
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
+
+# personal notes
+terminal.txt
+test run reslts output
+future_ita_fix_plan.md
+Failed api&scrapper script
+
+# local scripts
+

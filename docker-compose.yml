@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: llm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: llm_user
+      POSTGRES_PASSWORD: strongpassword
+      POSTGRES_DB: llm_travel
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    container_name: llm-travel-api
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://llm_user:strongpassword@postgres:5432/llm_travel
+      OLLAMA_BASE_URL: http://192.168.0.17:11434
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
