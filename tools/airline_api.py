@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from core.http_client import get_client
 from core.circuit_breaker import get_circuit_breaker
 from core.metrics import TOOL_REQUESTS, TOOL_LATENCY, AIRLINE_RETRIES, AIRLINE_ATTEMPTS
+from core.config import TESTING
 
 load_dotenv()
 
@@ -45,11 +46,6 @@ class Flight:
     arrival_time: str
     duration_min: int
     price_inr: int
-
-# ----------------------------------------------------------------------
-# API key loaded from environment (validation moved inside function)
-# ----------------------------------------------------------------------
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # may be None; checked later
 
 # ----------------------------------------------------------------------
 # Rate limiting (async, with lock for concurrency safety)
@@ -121,7 +117,23 @@ async def search_flights(
     Raises:
         AirlineAPIError: If the request fails after retries, or if API key is missing.
     """
-    # Validate API key at call time (not at import)
+    # --- TESTING bypass: return deterministic fake results and avoid HTTP calls ---
+    # This must run before any API-key checks or network logic.
+    if TESTING:
+        logger.info("TESTING mode enabled — returning fake flight result")
+        return [
+            Flight(
+                airline="TestAir",
+                flight_no="TA123",
+                departure_time="06:00",
+                arrival_time="08:00",
+                duration_min=120,
+                price_inr=1000,
+            )
+        ]
+
+    # Read API key at call-time (so CI / env changes affect behavior)
+    SERPAPI_KEY = os.getenv("SERPAPI_KEY")
     if not SERPAPI_KEY:
         raise AirlineAPIError("SERPAPI_KEY not configured in environment")
 
@@ -326,7 +338,6 @@ async def search_flights(
         # Execute the whole retryable operation under circuit breaker protection
         parsed_results, attempts_used = await breaker.call(_make_request_with_retries)
 
-
         # Log final success with actual attempts count
         logger.info("SerpAPI final success", extra={
             "results_count": len(parsed_results),
@@ -358,6 +369,7 @@ async def health_check() -> str:
     Uses a fixed route (DEL → BOM) for tomorrow's date. Returns "ok" if a successful
     response is received and parsed; "fail" otherwise.
     """
+    SERPAPI_KEY = os.getenv("SERPAPI_KEY")
     if not SERPAPI_KEY:
         logger.error("Health check failed: SERPAPI_KEY not configured")
         return "fail"
