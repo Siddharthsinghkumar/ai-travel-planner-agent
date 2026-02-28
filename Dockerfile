@@ -11,7 +11,7 @@ WORKDIR /app
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DEFAULT_TIMEOUT=120
 
-COPY requirements-prod.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install -r /app/requirements.txt
