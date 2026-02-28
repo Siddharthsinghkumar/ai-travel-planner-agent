@@ -1,23 +1,4 @@
-# =========================
-# Environment / Secrets
-# =========================
-.env
-.env.*
-*.env
-*.key
-*.pem
-*.crt
-
-# =========================
-# Virtual Environment
-# =========================
-venv/
-.venv/
-
-# =========================
-# Python
-# =========================
-__pycache__/
+  GNU nano 7.2                       .gitignore *                               
 *.pyc
 *.pyo
 *.pyd
@@ -38,26 +19,7 @@ __pycache__/
 # =========================
 data/
 chromium137/
-terminal.txt
-testenv.py
-Failed api&scrapper script/
 
-# =========================
-# IDE
-# =========================
-.vscode/
-.idea/
-
-# =========================
-# OS
-# =========================
-.DS_Store
-Thumbs.db
-
-# personal notes
-terminal.txt
-test run reslts output
-future_ita_fix_plan.md
-Failed api&scrapper script
-
-# local dependency test bypass
+# Old / experimental requirements
+requirements_clean.txt
+requirements-now-dev-only.txt

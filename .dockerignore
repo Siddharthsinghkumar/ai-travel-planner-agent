@@ -18,3 +18,10 @@ testenv.py
 .idea
 .vscode
 'test run reslts output'
+venv
+chromium137
+__pycache__
+tests
+.git
+.env
+*.log
