@@ -42,10 +42,20 @@ try:
 except ImportError:
     TTLCache = None
 
-# Local imports (will be used as defaults for injection)
-from tools.airline_api import search_flights as default_flight_tool
-from tools.weather_api import check_weather as default_weather_tool
+# Local imports – use wrappers for testability
+from tools.airline_api import search_flights as _search_flights_impl
+from tools.weather_api import check_weather as _check_weather_impl
 from agents.llm_router import generate
+
+# Wrappers (unit‑test seam)
+def search_flights(*args, **kwargs):
+    return _search_flights_impl(*args, **kwargs)
+
+def check_weather(*args, **kwargs):
+    return _check_weather_impl(*args, **kwargs)
+
+default_flight_tool = search_flights
+default_weather_tool = check_weather
 
 # Metrics instrumentation
 import core.metrics as metrics

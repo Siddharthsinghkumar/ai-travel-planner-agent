@@ -42,6 +42,15 @@ MAX_COST_PER_REQUEST = float(os.getenv("CLOUD_LLM_MAX_COST", "0"))  # 0 = disabl
 FALLBACK_MODELS = [m.strip() for m in os.getenv("CLOUD_LLM_FALLBACK_MODELS", "").split(",") if m.strip()]
 STREAM_CHUNK_TIMEOUT = float(os.getenv("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", "5.0"))
 
+# ---- Cooldown globals for health check ----
+PROVIDER_FAIL_COOLDOWN = int(os.getenv("PROVIDER_FAIL_COOLDOWN", "300"))  # seconds
+_PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we skip health checks
+# --------------------------------------------------
+
+# ---- Cloud enablement flag ----
+USE_CLOUD_LLM = os.getenv("USE_CLOUD_LLM", "1") == "1"
+# --------------------------------------------------
+
 # ----------------------------------------------------------------------
 # Helper: per‑chunk timeout wrapper for async iterators
 # ----------------------------------------------------------------------
@@ -274,29 +283,36 @@ def _parse_provider_chain() -> List[str]:
 
 
 def _init_provider(provider: str):
-    """Initialise a single provider. Returns (adapter, retry_exceptions) or raises."""
+    """Initialise a single provider. Returns (adapter, retry_exceptions) or None if skipped."""
     if provider == "openai":
+        # If there is no key configured, skip adding OpenAI as a provider.
         if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY missing")
+            logger.warning("OPENAI_API_KEY missing - skipping 'openai' provider (will not be used).")
+            return None
         from openai import AsyncOpenAI, RateLimitError, APIConnectionError
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         return ProviderAdapter(client, provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError)
 
-    elif provider == "anthropic":
+    elif provider == "anthropic": #currently i dont have money for claude ai 
+        # Skip if API key missing
+        if not ANTHROPIC_API_KEY:
+            logger.warning("ANTHROPIC_API_KEY missing - skipping 'anthropic' provider.")
+            return None
         try:
             from anthropic import AsyncAnthropic, RateLimitError as AnthroRateLimitError, APIConnectionError as AnthroConnErr
         except ImportError:
-            raise RuntimeError("Anthropic provider requested but `anthropic` package not installed")
-        if not ANTHROPIC_API_KEY:
-            raise RuntimeError("ANTHROPIC_API_KEY missing")
+            logger.warning("Anthropic package not installed - skipping provider.")
+            return None
         client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         return ProviderAdapter(client, provider), (AnthroRateLimitError, AnthroConnErr, asyncio.TimeoutError)
 
     elif provider == "gemini":
+        # Try to import the helper; if it fails, skip Gemini.
         try:
             gemini_mod = importlib.import_module("gemini_multikey_9_3_helper_script")
         except Exception as e:
-            raise RuntimeError("Gemini helper module not importable") from e
+            logger.warning("Gemini helper module not importable - skipping provider: %s", e)
+            return None
 
         # Look for a GeminiClient class, otherwise use module-level generate functions
         GeminiClient = getattr(gemini_mod, "GeminiClient", None)
@@ -326,7 +342,6 @@ def _init_provider(provider: str):
             "instance": gemini_instance   # keep for potential close()
         }
         # Only retry on timeout (or a specific Gemini exception if defined)
-        # If the helper defines a custom exception, add it here.
         gemini_retry_exc = (asyncio.TimeoutError,)
         # Optionally, if gemini_mod has a known exception class, include it:
         # gemini_exc = getattr(gemini_mod, "GeminiError", None)
@@ -335,7 +350,8 @@ def _init_provider(provider: str):
         return ProviderAdapter(client, provider), gemini_retry_exc
 
     else:
-        raise RuntimeError(f"Unsupported provider: {provider}")
+        logger.warning("Unsupported provider %s - skipping.", provider)
+        return None
 
 
 # Build the chain of available providers
@@ -344,12 +360,17 @@ _adapters = {}  # for closing later
 
 for prov in _parse_provider_chain():
     try:
-        adapter, retry_exc = _init_provider(prov)
+        res = _init_provider(prov)
+        if res is None:
+            logger.info("Provider %s intentionally skipped (missing config).", prov)
+            continue
+        adapter, retry_exc = res
         provider_chain.append((prov, adapter, retry_exc))
         _adapters[prov] = adapter
         logger.info("Initialised cloud provider", extra={"provider": prov})
     except Exception as e:
-        logger.warning("Skipping provider %s due to initialisation error: %s", prov, e, exc_info=True)
+        logger.warning("Skipping provider %s due to initialization error: %s", prov, e, exc_info=True)
+        continue
 
 if not provider_chain:
     # Do NOT raise here — allow the application to start even if cloud providers
@@ -681,17 +702,34 @@ async def generate_stream(
 
 async def health_check() -> str:
     """
-    Lightweight health check for dependency injection / health endpoints.
-    Returns "ok" if at least one cloud backend is reachable, otherwise "fail".
+    Cloud health check.
+    - If USE_CLOUD_LLM=0 → cloud is optional → return "ok"
+    - If USE_CLOUD_LLM=1 → require at least one provider healthy
     """
+    if not USE_CLOUD_LLM:
+        logger.info("Cloud LLM disabled via USE_CLOUD_LLM=0; skipping health enforcement.")
+        return "ok"
+
+    now = time.time()
+
     for prov_name, adapter, _ in provider_chain:
+        if adapter is None:
+            continue
+
+        cooldown_until = _PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0)
+        if now < cooldown_until:
+            continue
+
         try:
             await adapter.ping(DEFAULT_MODEL)
             logger.info("Health check ok", extra={"provider": prov_name})
             return "ok"
-        except Exception:
-            logger.warning("Health check failed for provider %s", prov_name, exc_info=True)
+        except Exception as e:
+            msg = str(e).lower()
+            if "ratelimit" in msg or "insufficient_quota" in msg or "429" in msg:
+                _PROVIDER_FAIL_COOLDOWNS[prov_name] = now + PROVIDER_FAIL_COOLDOWN
             continue
+
     return "fail"
 
 

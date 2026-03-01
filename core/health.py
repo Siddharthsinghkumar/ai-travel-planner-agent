@@ -1,13 +1,13 @@
 # core/health.py
 
 import asyncio
+import importlib
+import logging
 from sqlalchemy import text
 from typing import Dict
 from agents.database import SessionLocal
-from agents.cloud_llm import health_check as cloud_health
-from agents.ollama_client import health_check as ollama_health
-from tools.airline_api import health_check as airline_health
-from tools.weather_api import health_check as weather_health
+
+logger = logging.getLogger(__name__)
 
 
 async def check_database() -> str:
@@ -19,26 +19,67 @@ async def check_database() -> str:
     except Exception:
         return "fail"
 
-async def full_health_check() -> Dict:
-    checks = {
-        "openai": cloud_health(),
-        "ollama": ollama_health(),
-        "airline": airline_health(),
-        "weather": weather_health(),
-        "database": check_database(),
-    }
 
-    # Run async ones concurrently
+# Map health checks to module paths (all must expose a callable named `health_check`)
+_HEALTH_PROVIDERS = {
+    "openai": "agents.cloud_llm",
+    "ollama": "agents.ollama_client",
+    "airline": "tools.airline_api",
+    "weather": "tools.weather_api",
+}
+
+
+def _get_health_func(module_path: str):
+    """Dynamically import a module and return its `health_check` function."""
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, "health_check")
+    except Exception:
+        logger.exception("Failed to import health module", extra={"module": module_path})
+        # Return a dummy failing function to keep the health check running
+        async def _fail():
+            return "fail"
+        return _fail
+
+
+async def full_health_check() -> Dict:
+    """
+    Run all health checks, resolving modules at runtime so monkeypatching works.
+    Returns:
+        {
+            "status": "ok" or "degraded",
+            "dependencies": {
+                "openai": "ok"/"fail",
+                "ollama": ...,
+                "database": ...,
+                ...
+            }
+        }
+    """
     results = {}
-    for name, check in checks.items():
+
+    # Check external API services
+    for name, module_path in _HEALTH_PROVIDERS.items():
+        func = _get_health_func(module_path)
         try:
-            if asyncio.iscoroutine(check):
-                results[name] = await check
+            maybe = func()
+            if asyncio.iscoroutine(maybe):
+                results[name] = await maybe
             else:
-                results[name] = check
+                results[name] = maybe
         except Exception:
+            logger.exception("Health check failed", extra={"provider": name})
             results[name] = "fail"
 
+    # Check database separately (defined locally)
+    try:
+        db_result = check_database()          # returns coroutine
+        results["database"] = await db_result
+    except Exception:
+        logger.exception("Database health check failed")
+        results["database"] = "fail"
+
+    # Determine overall status
     overall = "ok" if all(v == "ok" for v in results.values()) else "degraded"
 
     return {
