@@ -17,11 +17,12 @@ import logging
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
 
 from fastapi import FastAPI, Request, Response, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 # Use module import instead of direct function import for better testability
@@ -117,6 +118,28 @@ app = FastAPI(
 )
 
 
+# Middleware to log raw request bodies for debugging 422 errors
+@app.middleware("http")
+async def log_request_body(request: Request, call_next):
+    try:
+        body_bytes = await request.body()
+        logger.debug(
+            "Raw request body",
+            extra={
+                "path": request.url.path,
+                "method": request.method,
+                "body": body_bytes.decode(errors="replace")
+            }
+        )
+        # Reattach the body so FastAPI can still read it
+        request._body = body_bytes
+    except Exception:
+        # Logging must never break the request
+        pass
+    response = await call_next(request)
+    return response
+
+
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     """Generate a unique request ID and store it in the context."""
@@ -128,20 +151,55 @@ async def add_request_id(request: Request, call_next):
 
 
 class AskRequest(BaseModel):
-    origin: str | None = None
-    destination: str | None = None
-    date: str = Field(..., description="YYYY-MM-DD")
-    user_query: str
-    trip_type: str = "Business"
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+    date: Optional[str] = None
+    user_query: Optional[str] = None
+    trip_type: Optional[str] = None          # now optional, planner may default to "Business"
 
     @field_validator("date")
     @classmethod
-    def date_must_be_future(cls, v):
-        """Validate that the provided date is not in the past."""
-        dt = datetime.strptime(v, "%Y-%m-%d")
+    def validate_date(cls, v):
+        """If date provided, ensure it's in YYYY-MM-DD format and not in the past."""
+        if v is None or v == "":
+            return None
+        try:
+            dt = datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Date must be in YYYY-MM-DD format")
+
         if dt.date() < datetime.now().date():
             raise ValueError("Date cannot be in the past")
+
         return v
+
+    @model_validator(mode="after")
+    def normalize_and_validate(self):
+        # Normalize: strip whitespace, convert empty strings to None
+        self.origin = self.origin.strip() if self.origin else None
+        self.destination = self.destination.strip() if self.destination else None
+        self.date = self.date.strip() if self.date else None
+        self.user_query = self.user_query.strip() if self.user_query else None
+        self.trip_type = self.trip_type.strip() if self.trip_type else None
+
+        origin = self.origin
+        destination = self.destination
+        date = self.date
+        user_query = self.user_query
+
+        # Rule 1 — reject completely empty
+        if not origin and not destination and not date and not user_query:
+            raise ValueError(
+                "At least one of user_query or origin/destination must be provided."
+            )
+
+        # Rule 2 — structured must include both origin and destination together
+        if (origin or destination) and not (origin and destination):
+            raise ValueError(
+                "Both origin and destination must be provided together."
+            )
+
+        return self
 
 
 @app.post("/ask")
@@ -157,11 +215,49 @@ async def ask(
         - If `stream=false` (default), returns a single JSON response.
         - If `stream=true`, returns a Server‑Sent Events (SSE) stream of tokens.
     """
+    # Define global timeout early so it's available in exception handlers
+    GLOBAL_TIMEOUT = int(os.getenv("PLANNER_GLOBAL_TIMEOUT", "60"))
+
+    # Use the already normalized values from the model
+    origin = req.origin
+    destination = req.destination
+    # Detect structured‑only mode (no user query, both origin/destination present, date missing)
+    is_structured_only = (
+        not req.user_query
+        and origin
+        and destination
+        and not req.date
+    )
+
+    # Compute effective date (structured default rule applies to all branches)
+    DEFAULT_STRUCTURED_OFFSET_DAYS = int(
+        os.getenv("DEFAULT_STRUCTURED_OFFSET_DAYS", "15")
+    )
+    effective_date = req.date
+
+    if is_structured_only:
+        effective_date = (
+            datetime.now() + timedelta(days=DEFAULT_STRUCTURED_OFFSET_DAYS)
+        ).strftime("%Y-%m-%d")
+
+    # Determine the user query to send to the planner
+    if is_structured_only:
+        # For pure structured requests, give a sensible default prompt
+        planner_user_query = "Provide best available option."
+    else:
+        planner_user_query = req.user_query or ""
+
     try:
         # Background job branch
         if async_job:
             from core.job_queue import enqueue_job
-            payload = req.model_dump()
+            # Exclude None fields for a cleaner payload
+            payload = req.model_dump(exclude_none=True)
+            # Override with processed values
+            payload["origin"] = origin
+            payload["destination"] = destination
+            payload["date"] = effective_date
+            payload["user_query"] = planner_user_query
             job_id = await enqueue_job(payload)
             return Response(
                 status_code=202,
@@ -169,19 +265,19 @@ async def ask(
                 media_type="application/json"
             )
 
-        GLOBAL_TIMEOUT = int(os.getenv("PLANNER_GLOBAL_TIMEOUT", "60"))
-
         if stream:
-            # Streaming branch: call planner with stream=True and yield SSE events
+            # Streaming branch: call planner with stream=True
+            # No outer timeout – planner handles streaming timeouts internally
+            agen_or_result = await planner_agent.plan_trip(
+                origin=origin,
+                destination=destination,
+                date=effective_date,
+                user_query=planner_user_query,
+                trip_type=req.trip_type,
+                stream=True
+            )
+
             async def event_stream():
-                agen_or_result = await planner_agent.plan_trip(
-                    origin=req.origin,
-                    destination=req.destination,
-                    date=req.date,
-                    user_query=req.user_query,
-                    trip_type=req.trip_type,
-                    stream=True
-                )
                 # If the planner returns an async generator, iterate and yield SSE frames
                 if hasattr(agen_or_result, "__aiter__"):
                     async for chunk in agen_or_result:
@@ -199,11 +295,11 @@ async def ask(
         # Non‑streaming branch: apply global timeout
         result = await asyncio.wait_for(
             planner_agent.plan_trip(
-                origin=req.origin,
-                destination=req.destination,
-                date=req.date,
-                user_query=req.user_query,
-                trip_type=req.trip_type
+                origin=origin,
+                destination=destination,
+                date=effective_date,
+                user_query=planner_user_query,
+                trip_type=req.trip_type,
             ),
             timeout=GLOBAL_TIMEOUT
         )
@@ -316,3 +412,16 @@ async def health():
 async def metrics():
     """Prometheus metrics endpoint."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/version")
+async def version():
+    """
+    Return version information to help debug deployment consistency.
+    - git_commit: set via environment variable GIT_COMMIT (optional)
+    - timestamp: last modification time of this file
+    """
+    return {
+        "git_commit": os.getenv("GIT_COMMIT", "unknown"),
+        "file_mtime": os.path.getmtime(__file__)
+    }

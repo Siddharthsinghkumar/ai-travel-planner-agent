@@ -75,6 +75,11 @@ PLANNER_LLM_MODEL = os.getenv("PLANNER_LLM_MODEL", "gpt-4o-mini")
 PLANNER_LLM_TIMEOUT = float(os.getenv("PLANNER_LLM_TIMEOUT", "29"))
 STREAM_INIT_TIMEOUT = float(os.getenv("PLANNER_STREAM_INIT_TIMEOUT", "5"))
 
+# Per‑call timeouts
+FLIGHT_TOOL_TIMEOUT = float(os.getenv("FLIGHT_TOOL_TIMEOUT", "8"))
+WEATHER_TOOL_TIMEOUT = float(os.getenv("WEATHER_TOOL_TIMEOUT", "5"))
+LLM_CORRECTION_TIMEOUT = float(os.getenv("LLM_CORRECTION_TIMEOUT", "5"))
+
 logger.info(
     f"LLM Configuration: USE_CLOUD_FALLBACK={USE_CLOUD_FALLBACK}, "
     f"MODEL={PLANNER_LLM_MODEL}, TIMEOUT={PLANNER_LLM_TIMEOUT}s"
@@ -388,6 +393,25 @@ def normalize_airport(input_value: Optional[str]) -> Optional[str]:
     # Otherwise resolve city name
     return resolve_city_to_iata(value)
 
+def fuzzy_resolve_city(city_name: str, cutoff: float = 0.7) -> Optional[str]:
+    """
+    Try exact match, then difflib close matches against known city names.
+    Useful as a deterministic fallback when LLM correction fails.
+    """
+    if not city_name:
+        return None
+    name = city_name.strip().lower()
+    name = CITY_ALIASES.get(name, name)
+    if name in CITY_TO_IATA:
+        return CITY_TO_IATA[name]
+    # fuzzy fallback
+    candidates = get_close_matches(name, CITY_TO_IATA.keys(), n=3, cutoff=cutoff)
+    if candidates:
+        best = candidates[0]
+        logger.info(f"Fuzzy matched '{city_name}' -> '{best}' ({CITY_TO_IATA[best]})")
+        return CITY_TO_IATA[best]
+    return None
+
 CITY_TO_IATA = build_city_to_iata_map()
 logger.info(f"Loaded city map: {list(CITY_TO_IATA.items())[:10]}")
 
@@ -420,7 +444,7 @@ class ParsedIntent(BaseModel):
     trip_duration_days: Optional[int] = None
     stopover_city: Optional[str] = None
     flight_pref: str = "default"
-    trip_type: str = "Business"
+    trip_type: Optional[str] = None   # No default – fallback applied in business logic
 
 def parse_intent(user_query: str) -> ParsedIntent:
     """Extract all structured data from the natural language query."""
@@ -454,6 +478,14 @@ def parse_intent(user_query: str) -> ParsedIntent:
     # --- Date parsing ---
     today = datetime.now().date()
     parsed_date = None
+
+    # --- NEW: relative days fallback (e.g., "14 days after today", "14 days from now") ---
+    rel_days = re.search(r'(\d+)\s+days?\s+(after|from)\s+today|(\d+)\s+days?\s+from\s+now', q)
+    if rel_days:
+        # pick the first numeric group that matched (group 1 or 3)
+        n = int(rel_days.group(1) or rel_days.group(3))
+        intent.date = (today + timedelta(days=n)).strftime("%Y-%m-%d")
+        # Do NOT return early – continue parsing other preferences
 
     if HAS_DATEPARSER:
         settings = {'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'DMY'}
@@ -558,11 +590,24 @@ def price_to_int(price: Union[str, int]) -> int:
     except:
         return 10**9
 
+def normalize_flight_field(value: Any) -> str:
+    """Convert flight field to a normalized string for matching."""
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip().lower()
+
 def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
-    """Apply all user filters to the flight list."""
+    """Apply all user filters to the flight list with tolerant matching."""
     filtered = []
     for f in flights:
         reasons = []
+        # Normalize fields
+        stops = normalize_flight_field(getattr(f, "stops", ""))
+        baggage = normalize_flight_field(getattr(f, "baggage", ""))
+        airline = normalize_flight_field(getattr(f, "airline", ""))
+
         if intent.time_pref:
             start, end = TIME_WINDOWS[intent.time_pref]
             dep = f.departure_time[-5:]
@@ -573,27 +618,40 @@ def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
             if price > intent.price_limit:
                 reasons.append("price")
         if intent.wants_direct:
-            stops = f.stops.lower()
-            if stops and not any(s in stops for s in ["non", "0", "direct"]):
+            # Tolerant direct detection
+            stops_clean = stops.replace("stops", "").strip()
+            direct = False
+            if any(x in stops for x in ("non-stop", "nonstop", "direct")):
+                direct = True
+            else:
+                try:
+                    if int(stops_clean) == 0:
+                        direct = True
+                except:
+                    pass
+            if not direct:
                 reasons.append("not direct")
         if intent.preferred_airlines:
-            airline = f.airline.lower()
             if not any(pref in airline for pref in intent.preferred_airlines):
                 reasons.append("airline")
         if intent.layover_limit_minutes:
-            layover_val = f.layover_time
             try:
-                layover_min = int(layover_val)
+                layover_min = int(getattr(f, "layover_time", 0))
             except:
                 layover_min = 0
             if layover_min > intent.layover_limit_minutes:
                 reasons.append("layover")
         if intent.baggage_pref:
-            baggage = f.baggage.lower()
-            if intent.baggage_pref == "hand" and "hand" not in baggage:
-                reasons.append("baggage")
-            if intent.baggage_pref == "checked" and "check" not in baggage:
-                reasons.append("baggage")
+            if intent.baggage_pref == "hand":
+                if not any(x in baggage for x in (
+                    "hand", "cabin", "carry", "7kg", "8kg", "10kg"
+                )):
+                    reasons.append("baggage")
+            if intent.baggage_pref == "checked":
+                if not any(x in baggage for x in (
+                    "checked", "check", "hold", "1pc", "2pc", "15kg", "20kg"
+                )):
+                    reasons.append("baggage")
 
         if not reasons:
             filtered.append(f)
@@ -727,7 +785,7 @@ def generate_deterministic_summary(best_flight: Flight, weather: Dict, filters: 
     return base
 
 # ----------------------------------------------------------------------
-# City correction using LLM (with circuit breaker)
+# City correction using LLM (with circuit breaker + fuzzy fallback)
 # ----------------------------------------------------------------------
 async def correct_cities_with_llm(user_query: str) -> Tuple[Optional[str], Optional[str]]:
     """Attempt to extract origin/destination IATA codes using LLM, respecting circuit breaker."""
@@ -745,18 +803,27 @@ to: <destination city>
 Query: {user_query}
 """
     try:
-        fixed_text = await generate(
-            prompt=mini_prompt,
-            system="You are a precise travel assistant. Always output the requested format.",
-            model=PLANNER_LLM_MODEL,
-            stream=False
+        fixed_text = await asyncio.wait_for(
+            generate(
+                prompt=mini_prompt,
+                system="You are a precise travel assistant. Always output the requested format.",
+                model=PLANNER_LLM_MODEL,
+                stream=False
+            ),
+            timeout=LLM_CORRECTION_TIMEOUT
         )
         from_match = re.search(r'from:\s*(.+)', fixed_text, re.IGNORECASE)
         to_match = re.search(r'to:\s*(.+)', fixed_text, re.IGNORECASE)
         if from_match and to_match:
             from_city = from_match.group(1).strip().lower()
             to_city = to_match.group(1).strip().lower()
-            return resolve_city_to_iata(from_city), resolve_city_to_iata(to_city)
+            origin_iata = fuzzy_resolve_city(from_city)
+            dest_iata = fuzzy_resolve_city(to_city)
+            if origin_iata and dest_iata:
+                return origin_iata, dest_iata
+            # If fuzzy resolution fails, fall through to return None
+    except asyncio.TimeoutError:
+        logger.warning("LLM city correction timed out")
     except Exception as e:
         logger.warning(f"LLM city correction failed: {e}")
     return None, None
@@ -778,7 +845,8 @@ async def _plan_trip_internal(
     skip_llm: bool = False   # NEW: if True, return data without LLM explanation
 ) -> Union[PlanResult, MultiCityResult, Dict]:
     """Internal implementation without top-level timeout. Used for non‑streaming mode."""
-    if depth > MAX_RECURSION_DEPTH:
+    # Prevent excessive recursion
+    if depth >= MAX_RECURSION_DEPTH:
         logger.error("Max recursion depth reached")
         return {"error": "Too deep recursion in trip planning"}
 
@@ -797,12 +865,17 @@ async def _plan_trip_internal(
 
     # Phase timing
     phases = {}
+    warnings = []
 
     # ------------------------------------------------------------------
     # 1. Parse intent (overrides explicit params)
     # ------------------------------------------------------------------
     start = time.monotonic()
-    intent = parse_intent(user_query)
+    # Only parse if there is meaningful user input; otherwise start with empty intent.
+    if user_query:
+        intent = parse_intent(user_query)
+    else:
+        intent = ParsedIntent()
 
     # Override with explicit parameters if provided, using normalize_airport for codes
     if origin:
@@ -811,13 +884,15 @@ async def _plan_trip_internal(
         intent.destination_iata = normalize_airport(destination)
     if date:
         intent.date = date
-    if trip_type:
-        intent.trip_type = trip_type
+
+    # Trip type resolution: explicit parameter > parsed intent > fallback "Business"
+    resolved_trip_type = trip_type or intent.trip_type or "Business"
+    intent.trip_type = resolved_trip_type
 
     phases['intent_parsing'] = time.monotonic() - start
 
-    # If we still lack origin/destination, try LLM correction
-    if not intent.origin_iata or not intent.destination_iata:
+    # If we still lack origin/destination, try LLM correction only if user_query exists
+    if user_query and (not intent.origin_iata or not intent.destination_iata):
         logger.info("Missing origin/destination, attempting LLM correction")
         start = time.monotonic()
         corrected_origin, corrected_dest = await correct_cities_with_llm(user_query)
@@ -845,42 +920,91 @@ async def _plan_trip_internal(
     if not intent.return_date and intent.trip_duration_days:
         intent.return_date = (base_date + timedelta(days=intent.trip_duration_days)).strftime("%Y-%m-%d")
 
-    # Handle stopover (multicity) recursively
+    # Handle stopover (multicity) recursively – run both legs concurrently with skip_llm=True
     if intent.stopover_city:
         stopover_iata = resolve_city_to_iata(intent.stopover_city)
         if not stopover_iata:
             return {"error": f"Could not resolve stopover city: {intent.stopover_city}"}
-        leg1 = await _plan_trip_internal(
-            origin=intent.origin_iata,
-            destination=stopover_iata,
-            date=search_date,
-            user_query=user_query,
-            trip_type=intent.trip_type,
-            depth=depth+1,
-            flight_tool=flight_tool,
-            weather_tool=weather_tool,
-            skip_llm=skip_llm
+        leg1_task = asyncio.create_task(
+            _plan_trip_internal(
+                origin=intent.origin_iata,
+                destination=stopover_iata,
+                date=search_date,
+                user_query="",  # avoid re‑parsing the original query with stopover phrase
+                trip_type=intent.trip_type,
+                depth=depth+1,
+                flight_tool=flight_tool,
+                weather_tool=weather_tool,
+                skip_llm=True  # inner legs skip LLM
+            )
         )
-        leg2 = await _plan_trip_internal(
-            origin=stopover_iata,
-            destination=intent.destination_iata,
-            date=search_date,
-            user_query=user_query,
-            trip_type=intent.trip_type,
-            depth=depth+1,
-            flight_tool=flight_tool,
-            weather_tool=weather_tool,
-            skip_llm=skip_llm
+        leg2_task = asyncio.create_task(
+            _plan_trip_internal(
+                origin=stopover_iata,
+                destination=intent.destination_iata,
+                date=search_date,
+                user_query="",
+                trip_type=intent.trip_type,
+                depth=depth+1,
+                flight_tool=flight_tool,
+                weather_tool=weather_tool,
+                skip_llm=True
+            )
         )
-        # Type safety: ensure legs are PlanResult
-        if not isinstance(leg1, PlanResult):
-            return leg1
-        if not isinstance(leg2, PlanResult):
-            return leg2
-        return MultiCityResult(legs=[leg1, leg2])
+        leg1_result = None
+        leg2_result = None
+        try:
+            leg1_result, leg2_result = await asyncio.gather(leg1_task, leg2_task, return_exceptions=True)
+        except Exception as e:
+            logger.exception("Unexpected error during stopover leg execution")
+            return {"error": "Internal error processing stopover legs"}
+
+        leg_warnings = []
+
+        # Handle leg1
+        if isinstance(leg1_result, Exception):
+            logger.warning(f"Stopover leg1 failed: {leg1_result}")
+            leg1_result = None
+            leg_warnings.append("First leg had no results")
+        elif isinstance(leg1_result, dict) and "error" in leg1_result:
+            logger.warning(f"Leg1 returned error: {leg1_result['error']}")
+            leg1_result = None
+            leg_warnings.append("First leg had no results")
+        elif not isinstance(leg1_result, PlanResult):
+            leg1_result = None
+            leg_warnings.append("First leg invalid result type")
+
+        # Handle leg2
+        if isinstance(leg2_result, Exception):
+            logger.warning(f"Stopover leg2 failed: {leg2_result}")
+            leg2_result = None
+            leg_warnings.append("Second leg had no results")
+        elif isinstance(leg2_result, dict) and "error" in leg2_result:
+            logger.warning(f"Leg2 returned error: {leg2_result['error']}")
+            leg2_result = None
+            leg_warnings.append("Second leg had no results")
+        elif not isinstance(leg2_result, PlanResult):
+            leg2_result = None
+            leg_warnings.append("Second leg invalid result type")
+
+        legs = []
+        if isinstance(leg1_result, PlanResult):
+            legs.append(leg1_result)
+        if isinstance(leg2_result, PlanResult):
+            legs.append(leg2_result)
+
+        if not legs:
+            return {"error": "No valid legs found for stopover trip", "warnings": leg_warnings}
+
+        # If any warnings, attach to first leg for simplicity
+        if leg_warnings:
+            legs[0].warnings = legs[0].warnings or []
+            legs[0].warnings.extend(leg_warnings)
+
+        return MultiCityResult(legs=legs)
 
     # ------------------------------------------------------------------
-    # 3. Fetch flights and weather in parallel
+    # 3. Fetch flights and weather in parallel with per‑call timeouts
     # ------------------------------------------------------------------
     weather_task: Optional[asyncio.Task] = None
     all_flights: List[Flight] = []
@@ -888,12 +1012,51 @@ async def _plan_trip_internal(
     if flights is not None:
         # Normalize provided flights (could be dicts or Flight objects)
         all_flights = normalize_flights(flights, search_date)
-        weather_task = asyncio.create_task(cached_weather(intent.destination_iata))
+        try:
+            weather = await asyncio.wait_for(
+                cached_weather(intent.destination_iata),
+                timeout=WEATHER_TOOL_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error("Weather tool timed out", extra={"dest": intent.destination_iata})
+            weather = {}
+        phases['weather_fetch'] = time.monotonic() - start if 'start' in locals() else 0
     else:
         if intent.trip_type.lower() == "flexible":
-            dates = [(base_date + timedelta(days=delta)).strftime("%Y-%m-%d") for delta in range(-2, 3)]
-            flight_tasks = [asyncio.create_task(cached_search(intent.origin_iata, intent.destination_iata, d)) for d in dates]
-            weather_task = asyncio.create_task(cached_weather(intent.destination_iata))
+            today_date = datetime.now().date()
+            # Generate dates ±2 days, but only include today and future dates
+            all_dates = [(base_date + timedelta(days=delta)) for delta in range(-2, 3)]
+            dates = [
+                d.strftime("%Y-%m-%d")
+                for d in all_dates
+                if d.date() >= today_date
+            ]
+            if not dates:
+                # Fallback to just today if all generated dates were in the past
+                dates = [base_date.strftime("%Y-%m-%d")]
+            flight_tasks = []
+            for d in dates:
+                # Capture date correctly by using a default argument
+                async def fetch_with_timeout(date=d):
+                    try:
+                        return await asyncio.wait_for(
+                            cached_search(intent.origin_iata, intent.destination_iata, date),
+                            timeout=FLIGHT_TOOL_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Flight tool timed out for date {date}")
+                        return []
+                    except Exception as e:
+                        logger.exception(f"Flight tool error for date {date}")
+                        return []
+                flight_tasks.append(asyncio.create_task(fetch_with_timeout()))
+
+            weather_task = asyncio.create_task(
+                asyncio.wait_for(
+                    cached_weather(intent.destination_iata),
+                    timeout=WEATHER_TOOL_TIMEOUT
+                )
+            )
             start = time.monotonic()
             results = await asyncio.gather(*flight_tasks)
             phases['flight_search'] = time.monotonic() - start
@@ -902,12 +1065,27 @@ async def _plan_trip_internal(
             for day_flights in results:
                 all_flights.extend(normalize_flights(day_flights, search_date))
         else:
-            flight_task = asyncio.create_task(cached_search(intent.origin_iata, intent.destination_iata, search_date))
-            weather_task = asyncio.create_task(cached_weather(intent.destination_iata))
-            start = time.monotonic()
-            raw_flights = await flight_task
-            phases['flight_search'] = time.monotonic() - start
-            all_flights = normalize_flights(raw_flights, search_date)
+            try:
+                start = time.monotonic()
+                raw_flights = await asyncio.wait_for(
+                    cached_search(intent.origin_iata, intent.destination_iata, search_date),
+                    timeout=FLIGHT_TOOL_TIMEOUT
+                )
+                phases['flight_search'] = time.monotonic() - start
+                all_flights = normalize_flights(raw_flights, search_date)
+            except asyncio.TimeoutError:
+                logger.error("Flight tool timed out", extra={"origin": intent.origin_iata, "dest": intent.destination_iata})
+                return {"error": "Upstream flight search timed out"}
+            except Exception as e:
+                logger.exception("Flight tool failed")
+                return {"error": f"Flight tool error: {e}"}
+
+            weather_task = asyncio.create_task(
+                asyncio.wait_for(
+                    cached_weather(intent.destination_iata),
+                    timeout=WEATHER_TOOL_TIMEOUT
+                )
+            )
 
     logger.info(
         "Flights fetched",
@@ -920,9 +1098,16 @@ async def _plan_trip_internal(
 
     if not all_flights:
         if weather_task:
-            start = time.monotonic()
-            weather = await weather_task
-            phases['weather_fetch'] = time.monotonic() - start
+            try:
+                start = time.monotonic()
+                weather = await weather_task
+                phases['weather_fetch'] = time.monotonic() - start
+            except asyncio.TimeoutError:
+                logger.error("Weather tool timed out")
+                weather = {}
+            except Exception as e:
+                logger.exception("Weather tool failed")
+                weather = {}
         else:
             weather = {}
         return {
@@ -933,22 +1118,53 @@ async def _plan_trip_internal(
             "weather": weather
         }
 
-    # Await weather (only once)
+    # Await weather (only once) with timeout
     if weather_task:
-        start = time.monotonic()
-        weather = await weather_task
-        phases['weather_fetch'] = time.monotonic() - start
+        try:
+            start = time.monotonic()
+            weather = await weather_task
+            phases['weather_fetch'] = time.monotonic() - start
+        except asyncio.TimeoutError:
+            logger.error("Weather tool timed out")
+            weather = {}
+        except Exception as e:
+            logger.exception("Weather tool failed")
+            weather = {}
     else:
         weather = {}
 
     # ------------------------------------------------------------------
-    # 4. Apply filters and rank
+    # 4. Apply filters and rank (with fallback)
     # ------------------------------------------------------------------
     start = time.monotonic()
     filtered = filter_flights(all_flights, intent)
     filtered_count = len(filtered)
+
+    # If strict filtering yields nothing, apply relaxed fallback
     if not filtered:
+        logger.warning("No flights after strict filtering; applying relaxed fallback")
+        warnings.append("No exact matches found; showing results with relaxed filters (airline/baggage ignored).")
+
+        # Relax non-critical filters
+        relaxed_intent = intent.model_copy()
+        relaxed_intent.preferred_airlines = []
+        relaxed_intent.baggage_pref = None
+
+        relaxed_filtered = filter_flights(all_flights, relaxed_intent)
+
+        if relaxed_filtered:
+            filtered = relaxed_filtered
+        else:
+            # Final fallback: use all flights
+            filtered = all_flights
+            warnings.append("No flights match your criteria; showing all available options.")
+
+        filtered_count = len(filtered)
+
+    if not filtered:
+        # Even all_flights was empty, but we already handled that earlier
         return {"error": "Sorry, I couldn't find any flights matching your preferences."}
+
     ranked = rank_flights(filtered, intent)
     best_flight = ranked[0]
     ranked_count = len(ranked)
@@ -1020,7 +1236,7 @@ async def _plan_trip_internal(
         debug_info["phases"] = phases.copy()   # refresh after LLM
 
     # ------------------------------------------------------------------
-    # 9. Prepare result and handle round-trip
+    # 9. Prepare result and handle round-trip (run in parallel)
     # ------------------------------------------------------------------
     result = PlanResult(
         llm_response=llm_text,
@@ -1028,25 +1244,33 @@ async def _plan_trip_internal(
         weather=weather_dict,
         search_date=search_date,
         fallback_note="",
-        debug_info=debug_info
+        debug_info=debug_info,
+        warnings=warnings if warnings else None
     )
 
     if intent.return_date:
         start = time.monotonic()
-        return_trip_result = await _plan_trip_internal(
-            origin=intent.destination_iata,
-            destination=intent.origin_iata,
-            date=intent.return_date,
-            user_query=user_query,
-            trip_type=intent.trip_type,
-            depth=depth+1,
-            flight_tool=flight_tool,
-            weather_tool=weather_tool,
-            skip_llm=skip_llm
+        return_trip_task = asyncio.create_task(
+            _plan_trip_internal(
+                origin=intent.destination_iata,
+                destination=intent.origin_iata,
+                date=intent.return_date,
+                user_query="",  # avoid re‑parsing original query for return leg
+                trip_type=intent.trip_type,
+                depth=depth+1,
+                flight_tool=flight_tool,
+                weather_tool=weather_tool,
+                skip_llm=True  # return leg skips LLM
+            )
         )
-        phases['return_trip'] = time.monotonic() - start
-        if isinstance(return_trip_result, PlanResult):
-            result.return_trip = return_trip_result
+        phases['return_trip_wait'] = None
+        try:
+            return_trip_result = await asyncio.wait_for(return_trip_task, timeout=FLIGHT_TOOL_TIMEOUT * 2)
+            phases['return_trip'] = time.monotonic() - start
+            if isinstance(return_trip_result, PlanResult):
+                result.return_trip = return_trip_result
+        except asyncio.TimeoutError:
+            logger.warning("Return trip search timed out; continuing without return leg")
 
     # ------------------------------------------------------------------
     # 10. Log session (only if not skipping LLM)
@@ -1065,7 +1289,8 @@ async def _plan_trip_internal(
                         "flight_pref": intent.flight_pref,
                         "trip_type": intent.trip_type,
                         "use_cloud_llm": USE_CLOUD_FALLBACK,
-                        "phases": phases
+                        "phases": phases,
+                        "warnings": warnings
                     },
                     tool_output={
                         "all_flights_count": len(all_flights),
@@ -1081,6 +1306,12 @@ async def _plan_trip_internal(
             )
         except asyncio.TimeoutError:
             logger.error("Database write timed out")
+
+    # ------------------------------------------------------------------
+    # 11. Final safety: ensure llm_response exists when not skipped
+    # ------------------------------------------------------------------
+    if not skip_llm and not result.llm_response:
+        result.llm_response = "I found a flight matching your criteria, but the detailed explanation is currently unavailable."
 
     return result
 

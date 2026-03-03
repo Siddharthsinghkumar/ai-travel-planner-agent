@@ -39,6 +39,7 @@ from core.metrics import increment_llm_success, increment_llm_failure, increment
 # ----------------------------------------------------------------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "openhermes")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30.0"))   # default timeout in seconds
 
 if not OLLAMA_MODEL:
     raise RuntimeError("OLLAMA_MODEL not configured")
@@ -156,7 +157,7 @@ retry_cfg = RetryConfig(
 async def _streaming_call_internal(
     payload: dict,
     request_id: Optional[str] = None,
-    timeout: float = 30.0
+    timeout: float = 28.0
 ) -> AsyncGenerator[str, None]:
     """
     Core streaming logic – no circuit breaker, no retry.
@@ -348,7 +349,7 @@ async def _non_streaming_call_impl(
                 raise OllamaError("Model not found")
             raise OllamaError(f"HTTP 404: {body_text}")
 
-        # Log rate limiting and server/client errors
+        # Raise dedicated exception for rate limiting (so retry can respect Retry-After)
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
             logger.warning(
@@ -360,18 +361,24 @@ async def _non_streaming_call_impl(
                     "model": payload.get("model")
                 }
             )
-            # Raise dedicated exception so retry logic can respect Retry-After
             raise RateLimitError(retry_after=retry_after)
-        elif 500 <= response.status_code < 600:
+
+        # FAIL FAST: for 5xx errors (server / model runner), raise an OllamaError
+        if 500 <= response.status_code < 600:
             logger.error(
                 "Ollama server error",
                 extra={
                     "request_id": request_id,
                     "status": response.status_code,
-                    "model": payload.get("model")
+                    "model": payload.get("model"),
+                    "body": body_text[:1000]  # truncated for logs
                 }
             )
-        elif 400 <= response.status_code < 500 and response.status_code != 404:
+            # Create a clear error message including the server body to help upstream decide
+            raise OllamaError(f"Ollama server error {response.status_code}: {body_text}")
+
+        # client error (4xx except 404) – log but do not raise; raise_for_status will handle
+        if 400 <= response.status_code < 500 and response.status_code != 404:
             logger.warning(
                 "Ollama client error",
                 extra={
@@ -448,7 +455,7 @@ async def generate(
     temperature: float = 0.2,
     stream: bool = False,
     request_id: Optional[str] = None,
-    timeout: float = 30.0
+    timeout: float = OLLAMA_TIMEOUT   # use env var default
 ) -> Union[str, AsyncGenerator[str, None]]:
     """
     Generate a completion from Ollama using the chat API.
@@ -460,7 +467,7 @@ async def generate(
         temperature: Sampling temperature (should be between 0 and 2).
         stream: If True, returns an async generator of tokens.
         request_id: Optional correlation ID (added to headers).
-        timeout: Total timeout in seconds (for both streaming and non‑streaming).
+        timeout: Total timeout in seconds (for both streaming and non‑streaming). Defaults to env OLLAMA_TIMEOUT.
 
     Returns:
         Full response string if stream=False, else async generator.
@@ -595,7 +602,6 @@ async def health_check() -> str:
             write=2.0,
             pool=2.0
         )
-
 
         response = await client.get(
             f"{OLLAMA_BASE_URL}/api/tags",

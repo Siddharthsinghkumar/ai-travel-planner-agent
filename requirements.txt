@@ -13,3 +13,4 @@ asyncpg
 redis
 airportsdata
 langchain
+dateparser
