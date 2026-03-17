@@ -1,47 +1,61 @@
 # core/logging_config.py
 
+import os
 import logging
-import json
-from datetime import datetime, UTC
-from core.request_context import get_request_id
+import logging.config
 
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        log_record = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "request_id": get_request_id(),
-        }
+def _parse_log_level() -> str:
+    level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
+    return level if level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"} else "INFO"
 
-        # If extra fields were passed
-        if hasattr(record, "__dict__"):
-            for key, value in record.__dict__.items():
-                if key not in log_record and key not in (
-                    "args", "msg", "levelname", "levelno",
-                    "pathname", "filename", "module",
-                    "exc_info", "exc_text", "stack_info",
-                    "lineno", "funcName", "created",
-                    "msecs", "relativeCreated", "thread",
-                    "threadName", "processName", "process"
-                ):
-                    log_record[key] = value
-        if record.exc_info:
-            log_record["exception"] = self.formatException(record.exc_info)
-        return json.dumps(log_record)
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def setup_logging():
-    # Prevent sensitive data from being logged by HTTP libraries
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    log_level = _parse_log_level()
+    enable_access_log = _parse_bool_env("ENABLE_UVICORN_ACCESS_LOG", default=False)
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.handlers.clear()
-    root.addHandler(handler)
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {
+                "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "standard",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "root": {
+            "level": log_level,
+            "handlers": ["console"],
+        },
+        "loggers": {
+            "httpx": {"level": "WARNING"},
+            "httpcore": {"level": "WARNING"},
+            "uvicorn": {"level": log_level, "handlers": ["console"], "propagate": False},
+            "uvicorn.error": {"level": log_level, "handlers": ["console"], "propagate": False},
+            "uvicorn.access": {
+                "level": "INFO" if enable_access_log else "WARNING",
+                "handlers": ["console"],
+                "propagate": False,
+            },
+            "gunicorn": {"level": log_level, "handlers": ["console"], "propagate": False},
+            "gunicorn.error": {"level": log_level, "handlers": ["console"], "propagate": False},
+            "gunicorn.access": {
+                "level": "INFO" if enable_access_log else "WARNING",
+                "handlers": ["console"],
+                "propagate": False,
+            },
+        },
+    })

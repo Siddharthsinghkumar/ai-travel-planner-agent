@@ -47,15 +47,18 @@ def test_streaming_endpoint_returns_sse(monkeypatch):
                 "arrival_time": "08:00",
                 "duration_min": 120,
                 "price_inr": "₹1000",
-                "stops": "N/A",
-                "baggage": "N/A",
-                "layover_time": "0",
+                "stops": 0,
+                "layover_info": "",
+                "baggage": "1 checked bag",
+                "booking_token": "fake_token_123",
+                "shareable_link": "https://google.com/flights",
+                "carbon_emissions_g": 45000,
                 "date": "2026-03-15"
             }
         ]
 
     monkeypatch.setattr(
-        "tools.airline_api.search_flights",
+        "agents.planner_agent._search_flights_impl",
         fake_search_flights
     )
 

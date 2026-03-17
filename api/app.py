@@ -16,12 +16,15 @@ import json
 import logging
 import os
 import asyncio
+import time
+import fcntl                     # for process‑level locking
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Request, Response, HTTPException, Query
+from fastapi import FastAPI, Request, Response, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -36,48 +39,212 @@ from core.logging_config import setup_logging
 from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
 from core import job_queue                     # background job worker
+from core.api_key_manager import key_manager    # key rotation manager
+from agents.cloud_llm import on_key_event       # callback for key changes
 
 logger = logging.getLogger(__name__)
+
+# --- Pluggable lock helpers (file-based default, redis optional) ---
+try:
+    import redis.asyncio as redis_async  # optional dependency for redis lock backend
+except ImportError:
+    redis_async = None
+
+KEY_MANAGER_LOCK_BACKEND = os.getenv("KEY_MANAGER_LOCK_BACKEND", "file").lower()
+KEY_MANAGER_REDIS_URL = os.getenv("KEY_MANAGER_REDIS_URL", "redis://localhost:6379/0")
+KEY_MANAGER_LOCK_NAME = os.getenv("KEY_MANAGER_LOCK_NAME", "llm:key_refresh_lock")
+KEY_MANAGER_LOCK_TTL = int(os.getenv("KEY_MANAGER_LOCK_TTL_SECONDS", "60"))  # lock TTL for redis
+KEY_MANAGER_LOCK_PATH = os.getenv("KEY_MANAGER_LOCK_PATH", "/tmp/llm_key_refresh.lock")
+
+
+def _acquire_process_lock(path: str) -> Optional[int]:
+    """
+    Try to acquire an exclusive lock on the given file.
+    Returns a file descriptor if successful, None if another process holds the lock.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, str(os.getpid()).encode())
+        return fd
+    except (IOError, OSError, BlockingIOError):
+        # Lock already held by another process
+        if fd is not None:
+            os.close(fd)
+        return None
+    except Exception:
+        # Unexpected error; fall back to no lock
+        if fd is not None:
+            os.close(fd)
+        return None
+
+
+async def _acquire_redis_lock(redis_url: str, name: str, ttl: int):
+    """Try to acquire a Redis-based distributed lock. Returns a tuple (client, lock) on success, or (None, None)."""
+    if redis_async is None:
+        return None, None
+    client = None
+    try:
+        client = redis_async.from_url(redis_url)
+        lock = client.lock(name, timeout=ttl)
+        acquired = await lock.acquire(blocking=False)
+        if acquired:
+            return client, lock
+        else:
+            await client.close()
+            return None, None
+    except Exception:
+        # Any redis error -> don't acquire
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        return None, None
+
+
+async def _acquire_pluggable_lock():
+    """Return a tuple (backend, handle) where backend is 'file' or 'redis' and handle is fd or (client, lock)."""
+    if KEY_MANAGER_LOCK_BACKEND == "redis":
+        client, lock = await _acquire_redis_lock(KEY_MANAGER_REDIS_URL, KEY_MANAGER_LOCK_NAME, KEY_MANAGER_LOCK_TTL)
+        if lock:
+            return "redis", (client, lock)
+        return "redis", None
+    # default: file lock
+    fd = _acquire_process_lock(KEY_MANAGER_LOCK_PATH)
+    if fd is not None:
+        return "file", fd
+    return "file", None
 
 
 async def prewarm_llm():
     """
-    Ollama-only prewarm. Will NOT attempt cloud.
-    Calls Ollama client generate() directly to guarantee local-only call.
+    Ollama prewarm with retries and exponential backoff.
+    Will not crash startup if Ollama is slow or unavailable.
     """
-    try:
-        # Call Ollama directly to avoid router fallback to cloud.
-        from agents import ollama_client
+    from agents import ollama_client
+    from agents.ollama_client import OllamaError
 
-        # Use the configured OLLAMA_MODEL (ollama_client module uses OLLAMA_MODEL)
-        model = getattr(ollama_client, "OLLAMA_MODEL", None)
+    timeout = int(os.getenv("OLLAMA_PREWARM_TIMEOUT", "60"))
+    max_retries = int(os.getenv("OLLAMA_PREWARM_RETRIES", "3"))
+    backoff = 1
 
-        # Small safe prompt; short timeout
-        await ollama_client.generate(
-            prompt="Hello (warmup).",
-            system="warmup",
-            model=model,
-            stream=False,
-            request_id="prewarm",
-            timeout=10.0
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Using a hardcoded model name; adjust if needed.
+            await ollama_client.generate(
+                prompt="hi",
+                model="openhermes",
+                timeout=timeout,
+                stream=False
+            )
+            logger.info("Ollama prewarm OK")
+            return
+        except OllamaError as e:
+            logger.warning("Ollama prewarm attempt %d failed: %s", attempt, e)
+            if attempt < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            else:
+                logger.warning(
+                    "Ollama prewarm failed after %d attempts — continuing without prewarm",
+                    max_retries
+                )
+                return
+        except Exception as e:
+            # Catch any other unexpected errors (e.g., import issues) and treat as failure
+            logger.warning("Unexpected error during prewarm attempt %d: %s", attempt, e)
+            if attempt < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            else:
+                logger.warning("Prewarm aborted after %d attempts", max_retries)
+                return
 
-        logger.info("Ollama prewarm completed successfully")
 
-    except Exception as e:
-        # Prewarm must not crash startup — log and continue
-        logger.warning("Ollama prewarm failed (ignored)", exc_info=e)
+def require_admin_token(x_admin_token: str = Header(...)):
+    """Dependency to protect admin endpoints with a token from environment."""
+    expected = os.getenv("ADMIN_TOKEN")
+    if not expected or x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.startup_complete = False
+
     # Startup: configure structured JSON logging
     setup_logging()
 
     # Initialize shared LLM client
     await init_llm_client()
 
-    # Start the background job worker loop
+    # Load API keys from environment into the key manager
+    try:
+        await key_manager.load_env_keys()
+    except Exception:
+        logger.exception("key_manager_load_failed")
+
+    # ---- Register key event listener early (idempotent) ----
+    try:
+        already_registered = False
+        # best-effort detection to avoid duplicate registration in same process
+        listeners = getattr(key_manager, "_key_event_listeners", None)
+        if listeners is not None:
+            try:
+                if on_key_event in listeners:
+                    already_registered = True
+            except Exception:
+                # fall back to identity scan
+                for item in list(listeners):
+                    if getattr(item, "__name__", None) == getattr(on_key_event, "__name__", None):
+                        already_registered = True
+                        break
+
+        if not already_registered:
+            key_manager.register_key_event_listener(on_key_event)
+            app.state.cloud_llm_listener_registered = True
+            logger.info("Registered cloud LLM key event listener")
+        else:
+            logger.info("Cloud LLM key event listener already registered in this process")
+    except Exception:
+        logger.exception("Failed to register cloud LLM key event listener")
+
+    # ---- Pluggable lock to ensure only one process/replica runs the refresh loop ----
+    lock_backend, lock_handle = await _acquire_pluggable_lock()
+    should_run_refresh = lock_handle is not None
+
+    # Fallback: env var override (useful for containers where you set one replica manually)
+    if not should_run_refresh and os.getenv("RUN_KEY_REFRESH", "").lower() in ("1", "true"):
+        logger.warning(
+            "RUN_KEY_REFRESH=true but lock not acquired; starting refresh loop anyway. "
+            "Ensure only one replica has this variable set."
+        )
+        should_run_refresh = True
+
+    if should_run_refresh:
+        logger.info("Starting key manager background refresh loop (lock_backend=%s).", lock_backend)
+        # Save lock handle for shutdown cleanup
+        app.state.key_manager_lock_backend = lock_backend
+        app.state.key_manager_lock_handle = lock_handle
+
+        # Start the key manager's background refresh loop (interval configurable)
+        refresh_interval = int(os.getenv("KEY_ENV_MONITOR_TICK", "60"))
+        # start_refresh_loop is synchronous; it creates an internal task.
+        key_manager.start_refresh_loop(
+            interval_seconds=refresh_interval,
+            skip_lock_check=True      # we already acquired the lock ourselves
+        )
+        # Store the internal task so we can cancel it on shutdown
+        app.state.key_manager_task = key_manager._refresh_task
+    else:
+        logger.info("Another process/replica holds the key manager lock; not starting refresh loop.")
+        app.state.key_manager_lock_backend = None
+        app.state.key_manager_lock_handle = None
+        app.state.key_manager_task = None
+
+    # Start the background job worker loop (always needed)
     app.state.job_worker = asyncio.create_task(job_queue.worker_loop())
 
     # Optional prewarm (non‑blocking)
@@ -89,9 +256,12 @@ async def lifespan(app: FastAPI):
                 logger.exception("Background prewarm failed")
         asyncio.create_task(background_prewarm())
 
+    app.state.startup_complete = True
     yield
 
-    # Shutdown: gracefully stop the worker
+    app.state.startup_complete = False
+
+    # Shutdown: gracefully stop the job worker
     try:
         await job_queue.stop_worker()
         await app.state.job_worker
@@ -99,6 +269,46 @@ async def lifespan(app: FastAPI):
         pass
     except Exception:
         pass
+
+    # Stop the key manager's background refresh loop only if we started it
+    if getattr(app.state, "key_manager_task", None):
+        try:
+            # stop_refresh_loop is synchronous; it cancels the internal task.
+            key_manager.stop_refresh_loop()
+        except Exception:
+            logger.exception("key_manager_stop_refresh_loop_failed")
+
+        # Cancel background task if still running (though stop_refresh_loop should have done it)
+        task = app.state.key_manager_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("key_manager_task_cancel_failed")
+
+    # Release the lock we acquired (backend-specific)
+    backend = getattr(app.state, "key_manager_lock_backend", None)
+    handle = getattr(app.state, "key_manager_lock_handle", None)
+    if backend == "file" and handle is not None:
+        try:
+            os.close(handle)
+            logger.info("Released file lock for key manager refresh.")
+        except Exception:
+            logger.exception("failed_to_release_file_lock")
+    elif backend == "redis" and handle is not None:
+        client, lock = handle
+        try:
+            # release the redis lock and close connection
+            await lock.release()
+        except Exception:
+            logger.exception("failed_to_release_redis_lock")
+        try:
+            await client.close()
+        except Exception:
+            pass
 
     # Clean up clients
     await close_llm_client()
@@ -115,6 +325,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LLM Travel Agent",
     lifespan=lifespan
+)
+
+# Add CORS middleware – now configurable via environment variable
+# Read production origins from environment, fallback to localhost for dev
+env_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173")
+allowed_origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -160,16 +383,13 @@ class AskRequest(BaseModel):
     @field_validator("date")
     @classmethod
     def validate_date(cls, v):
-        """If date provided, ensure it's in YYYY-MM-DD format and not in the past."""
+        """If date is provided, ensure it's in YYYY-MM-DD format."""
         if v is None or v == "":
             return None
         try:
-            dt = datetime.strptime(v, "%Y-%m-%d")
+            datetime.strptime(v, "%Y-%m-%d")
         except ValueError:
-            raise ValueError("Date must be in YYYY-MM-DD format")
-
-        if dt.date() < datetime.now().date():
-            raise ValueError("Date cannot be in the past")
+            raise ValueError("date must be YYYY-MM-DD")
 
         return v
 
@@ -383,6 +603,32 @@ async def job_events(request: Request, job_id: str):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+# Admin‑protected debug endpoints
+@app.get("/debug/keys", dependencies=[Depends(require_admin_token)])
+async def debug_keys():
+    """Return masked keys and their status (active/exhausted until). Requires admin token."""
+    try:
+        # key_manager.status() may be async or sync; handle both
+        status = key_manager.status()
+        if asyncio.iscoroutine(status):
+            status = await status
+        return status
+    except Exception:
+        logger.exception("debug_keys_failed")
+        raise HTTPException(status_code=500, detail="key manager error")
+
+
+@app.post("/debug/keys/reload", dependencies=[Depends(require_admin_token)])
+async def reload_keys_endpoint():
+    """Force a reload of API keys from environment variables. Requires admin token."""
+    try:
+        await key_manager.load_env_keys()
+        return {"status": "reloaded"}
+    except Exception:
+        logger.exception("debug_keys_reload_failed")
+        raise HTTPException(status_code=500, detail="reload failed")
+
+
 @app.get("/health/live")
 async def liveness():
     """Kubernetes liveness probe."""
@@ -392,20 +638,157 @@ async def liveness():
 @app.get("/health/ready")
 async def readiness():
     """Kubernetes readiness probe."""
-    health = await full_health_check()
-    if health["status"] != "ok":
+    if not getattr(app.state, "startup_complete", False):
+        health = {"status": "starting"}
         return Response(
             content=json.dumps(health),
             status_code=503,
             media_type="application/json"
         )
-    return health
+    return {"status": "ok"}
 
 
 @app.get("/health")
 async def health():
-    """Comprehensive health check for monitoring."""
-    return await full_health_check()
+    """Lightweight health check for container probes (no external API calls)."""
+    logger.debug("lightweight health check")
+
+    async def _check_key_manager() -> str:
+        try:
+            status = key_manager.status()
+            if asyncio.iscoroutine(status):
+                await status
+            return "ok"
+        except Exception:
+            logger.exception("lightweight_health_key_manager_failed")
+            return "fail"
+
+    async def _check_database() -> str:
+        try:
+            from agents.database import SessionLocal  # local import keeps startup behavior unchanged
+            from sqlalchemy import text
+        except Exception:
+            # Database layer not available in this runtime.
+            return "unavailable"
+
+        def _ping_db() -> None:
+            db = SessionLocal()
+            try:
+                db.execute(text("SELECT 1"))
+            finally:
+                db.close()
+
+        try:
+            await asyncio.wait_for(asyncio.to_thread(_ping_db), timeout=0.2)
+            return "ok"
+        except Exception:
+            logger.exception("lightweight_health_database_failed")
+            return "fail"
+
+    async def _check_ollama() -> str:
+        # Optional lightweight check. Do not fail overall status if this fails.
+        try:
+            from agents.ollama_client import health_check as ollama_health_check
+        except Exception:
+            return "unavailable"
+
+        try:
+            res = await asyncio.wait_for(ollama_health_check(), timeout=0.05)
+            return "ok" if res == "ok" else "fail"
+        except Exception:
+            logger.warning("lightweight_health_ollama_failed", exc_info=True)
+            return "fail"
+
+    dependencies = {
+        "app": "ok" if getattr(app.state, "startup_complete", False) else "fail",
+        "key_manager": "fail",
+        "database": "unavailable",
+        "ollama": "unavailable",
+    }
+
+    key_manager_status, database_status, ollama_status = await asyncio.gather(
+        _check_key_manager(),
+        _check_database(),
+        _check_ollama(),
+    )
+    dependencies["key_manager"] = key_manager_status
+    dependencies["database"] = database_status
+    dependencies["ollama"] = ollama_status
+
+    # /health should remain stable and avoid external-API-triggered failures.
+    hard_fail_fields = ("app", "key_manager", "database")
+    status = "fail" if any(dependencies[f] == "fail" for f in hard_fail_fields) else "ok"
+
+    return {"status": status, "dependencies": dependencies}
+
+
+@app.get("/health/deep")
+async def health_deep():
+    """Deep health check (includes external API checks)."""
+    logger.debug("deep health check (external APIs)")
+    start = time.monotonic()
+    result = await full_health_check()
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    logger.debug(
+        "deep health check complete",
+        extra={"elapsed_ms": elapsed_ms, "status": result.get("status")},
+    )
+    return result
+
+
+@app.get("/health/keys")
+async def health_keys():
+    """Return key manager metadata status (no secret values)."""
+    status = await key_manager.get_status()
+
+    out = {}
+    for service, entries in (status or {}).items():
+        rows = []
+        if isinstance(entries, list):
+            iterable = enumerate(entries)
+        elif isinstance(entries, dict):
+            # Backward compatibility if a dict shape is returned.
+            iterable = []
+            for k, v in entries.items():
+                try:
+                    idx = int(k)
+                except Exception:
+                    idx = len(iterable)
+                iterable.append((idx, v))
+        else:
+            iterable = [(0, entries)]
+
+        for idx, entry in iterable:
+            if isinstance(entry, dict):
+                rows.append(
+                    {
+                        "index": entry.get("index", idx),
+                        "active": bool(entry.get("active", False)),
+                        "in_use": int(entry.get("in_use", 0) or 0),
+                        "exhausted_until": entry.get("exhausted_until"),
+                    }
+                )
+            elif isinstance(entry, str):
+                rows.append(
+                    {
+                        "index": idx,
+                        "active": entry == "active",
+                        "in_use": 0,
+                        "exhausted_until": None,
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "index": idx,
+                        "active": False,
+                        "in_use": 0,
+                        "exhausted_until": None,
+                    }
+                )
+        out[service] = rows
+
+    return out
 
 
 @app.get("/metrics")

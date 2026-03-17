@@ -28,10 +28,16 @@ async def test_origin_override():
     fake_flight = Flight(
         flight_no="XX123",
         airline="TestAir",
-        departure_time="2025-01-01T10:00:00",
-        arrival_time="2025-01-01T12:00:00",
+        departure_time="10:00",  # Fixed format for new Pydantic validator
+        arrival_time="12:00",    # Fixed format for new Pydantic validator
         duration_min=120,
-        price_inr=5000.0,
+        price_inr=5000,
+        stops=0,
+        layover_info="",
+        baggage="Check airline",
+        booking_token="fake_token",
+        shareable_link="https://google.com",
+        carbon_emissions_g=50000
     )
     fake_parsed_results = [fake_flight]
     fake_attempts = 1

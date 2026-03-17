@@ -18,6 +18,10 @@ def test_full_blocking_flow():
     assert "best_flight" in data
     assert "weather" in data
     assert "llm_response" in data
+    # NEW ASSERTIONS
+    assert "booking_token" in data["best_flight"] or "shareable_link" in data["best_flight"]
+    assert "debug_info" in data
+    assert "price_insights_str" in data["debug_info"]
 
 
 def test_streaming_flow():

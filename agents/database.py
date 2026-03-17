@@ -3,6 +3,7 @@
 from sqlalchemy import create_engine, Column, Integer, Text, TIMESTAMP, JSON, String
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 from dotenv import load_dotenv
 from pathlib import Path
 import os
@@ -21,6 +22,17 @@ def _build_engine(database_url: Optional[str] = None):
     if database_url is None:
         _ensure_env_loaded()
         database_url = os.getenv("DATABASE_URL")
+
+    is_testing = os.getenv("TESTING", "false").lower() in ("1", "true", "yes", "on")
+    if is_testing:
+        # Use in-memory SQLite for pytest/import safety.
+        # StaticPool ensures all sessions share one in-memory DB.
+        return create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
     if not database_url:
         database_url = "sqlite:///./local.db"
     return create_engine(database_url, pool_pre_ping=True)

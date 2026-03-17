@@ -18,21 +18,22 @@ import time
 import asyncio
 import logging
 import importlib
-from typing import Optional, Any, List, Tuple
+import hashlib
+from contextlib import asynccontextmanager
+from typing import Optional, Any, List, Tuple, Dict
 
 # Core infrastructure
 from core.retry import retry_async, RetryConfig
 from core.circuit_breaker import get_circuit_breaker, CircuitBreakerOpenError, is_open as circuit_is_open
 from core.request_context import get_request_id
+from core.api_key_manager import key_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Environment configuration
+# Environment configuration (no longer used directly for API keys)
 CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "openai").lower()
 CLOUD_PROVIDER_CHAIN = os.getenv("CLOUD_PROVIDER_CHAIN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DEFAULT_MODEL = os.getenv("CLOUD_LLM_MODEL", "gpt-4o-mini")
 DEFAULT_TIMEOUT = float(os.getenv("CLOUD_LLM_TIMEOUT", "30"))
 DEFAULT_TEMPERATURE = float(os.getenv("CLOUD_LLM_TEMPERATURE", "0.7"))
@@ -50,6 +51,299 @@ _PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we 
 # ---- Cloud enablement flag ----
 USE_CLOUD_LLM = os.getenv("USE_CLOUD_LLM", "1") == "1"
 # --------------------------------------------------
+
+# Lazy imports for optional provider SDKs
+try:
+    from openai import AsyncOpenAI, RateLimitError, APIConnectionError, AuthenticationError as OpenAIAuthError
+except ImportError:
+    AsyncOpenAI = None
+    RateLimitError = None
+    APIConnectionError = None
+    OpenAIAuthError = None
+
+try:
+    from anthropic import AsyncAnthropic, RateLimitError as AnthroRateLimitError, APIConnectionError as AnthroConnErr, AuthenticationError as AnthroAuthError
+except ImportError:
+    AsyncAnthropic = None
+    AnthroRateLimitError = None
+    AnthroConnErr = None
+    AnthroAuthError = None
+
+
+# ----------------------------------------------------------------------
+# Client cache with in‑use tracking, per‑entry locks, and fingerprints
+# ----------------------------------------------------------------------
+_clients: Dict[Tuple[str, int], dict] = {}       # (provider, idx) -> metadata dict
+_client_lock = asyncio.Lock()
+
+async def _create_client(provider: str, idx: int, key: str):
+    """Create a new client for the given provider and key."""
+    if provider == "openai":
+        if AsyncOpenAI is None:
+            raise CloudLLMError("OpenAI SDK not installed")
+        return AsyncOpenAI(api_key=key)
+    elif provider == "anthropic":
+        if AsyncAnthropic is None:
+            raise CloudLLMError("Anthropic SDK not installed")
+        return AsyncAnthropic(api_key=key)
+    else:
+        raise CloudLLMError(f"Unsupported provider for client creation: {provider}")
+
+async def _close_client(client):
+    """Safely close a client if it has a close method."""
+    try:
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        elif hasattr(client, "close"):
+            maybe = client.close()
+            if asyncio.iscoroutine(maybe):
+                await maybe
+    except Exception:
+        logger.exception("Error closing cached client")
+
+@asynccontextmanager
+async def get_client(provider: str, idx: int, key: str):
+    """
+    Async context manager that yields a cached client for (provider, idx).
+    Increments _in_use while the client is held; refuses if _pending_clear is set.
+    Uses per‑entry locks for atomicity.
+    """
+    cache_key = (provider, idx)
+    entry_obj = None
+    created_local_client = None
+
+    # Fast path: try to reuse an existing entry
+    async with _client_lock:
+        existing = _clients.get(cache_key)
+
+    if existing:
+        # Ensure the per-entry lock exists (create if missing) under global lock to avoid races
+        if "_lock" not in existing:
+            async with _client_lock:
+                if "_lock" not in existing:
+                    existing["_lock"] = asyncio.Lock()
+
+        entry_lock = existing["_lock"]
+        # Acquire the per-entry lock to check pending_clear and bump _in_use atomically
+        async with entry_lock:
+            # It's possible another coroutine cleared the entry concurrently; re-check presence
+            async with _client_lock:
+                if cache_key not in _clients:
+                    existing = None
+                else:
+                    existing = _clients[cache_key]
+
+            if existing is None:
+                # fall through to creation path
+                pass
+            else:
+                if existing.get("_pending_clear"):
+                    raise CloudLLMError(f"Client for {provider}:{idx} is pending clear and cannot be used")
+                existing["_in_use"] = existing.get("_in_use", 0) + 1
+                entry_obj = existing
+
+    # If absent, create client outside the lock (avoid blocking other coros)
+    if entry_obj is None:
+        created_local_client = await _create_client(provider, idx, key)
+        # Compute a stable fingerprint for this key so env-change events can target exact instances
+        key_fingerprint = hashlib.sha256(key.encode()).hexdigest()
+        new_entry = {
+            "client": created_local_client,
+            "_in_use": 1,
+            "_pending_clear": False,
+            "created_at": time.time(),
+            "_lock": asyncio.Lock(),
+            "fingerprint": key_fingerprint,
+        }
+
+        async with _client_lock:
+            # double-check whether another coroutine created it meanwhile
+            existing = _clients.get(cache_key)
+            if existing:
+                # ensure per-entry lock exists
+                if "_lock" not in existing:
+                    existing["_lock"] = asyncio.Lock()
+                entry_lock = existing["_lock"]
+
+                async with entry_lock:
+                    if existing.get("_pending_clear"):
+                        # If theirs is pending_clear, drop our client and error
+                        await _close_client(created_local_client)
+                        raise CloudLLMError(f"Client for {provider}:{idx} is pending clear and cannot be used")
+                    existing["_in_use"] = existing.get("_in_use", 0) + 1
+                    entry_obj = existing
+                    # close our unused created client to avoid leaks
+                    await _close_client(created_local_client)
+                    created_local_client = None
+            else:
+                _clients[cache_key] = new_entry
+                entry_obj = new_entry
+
+    try:
+        yield entry_obj["client"]
+    finally:
+        # decrement the specific entry object we incremented earlier using its per-entry lock
+        if entry_obj:
+            entry_lock = entry_obj.get("_lock")
+            if entry_lock:
+                async with entry_lock:
+                    entry_obj["_in_use"] = max(0, entry_obj.get("_in_use", 1) - 1)
+            else:
+                # fallback (should not happen)
+                async with _client_lock:
+                    entry_obj["_in_use"] = max(0, entry_obj.get("_in_use", 1) - 1)
+
+async def clear_client_cache(provider: str, idx: int, timeout: float = 30.0, expected_fingerprint: str | None = None) -> bool:
+    """
+    Safely remove the cached client for (provider, idx).
+    Marks it pending_clear, waits for _in_use to become zero (with timeout), then closes and removes it.
+    If expected_fingerprint is provided, it must match the current entry's fingerprint to proceed.
+    Returns True if removed, False if timed out or fingerprint mismatch.
+    """
+    cache_key = (provider, idx)
+    start = time.monotonic()
+
+    async with _client_lock:
+        entry = _clients.get(cache_key)
+        if not entry:
+            return True  # already gone
+        # If caller provided an expected_fingerprint, ensure it matches the current entry
+        if expected_fingerprint is not None:
+            actual_fp = entry.get("fingerprint")
+            if actual_fp != expected_fingerprint:
+                logger.info(
+                    "clear_client_cache skipped for %s:%d due to fingerprint mismatch (expected=%s actual=%s)",
+                    provider, idx, expected_fingerprint, actual_fp
+                )
+                return False
+        # Now mark pending_clear while holding client global lock (we will also acquire per-entry lock below)
+        entry["_pending_clear"] = True
+
+    # Wait for in_use to drop to zero (exponential backoff)
+    backoff = 0.1
+    while True:
+        async with _client_lock:
+            current_entry = _clients.get(cache_key)
+        if not current_entry:
+            # already removed
+            break
+
+        entry_lock = current_entry.get("_lock")
+        if entry_lock is None:
+            # create a lock if somehow missing (under global lock)
+            async with _client_lock:
+                current_entry = _clients.get(cache_key)
+                if current_entry and "_lock" not in current_entry:
+                    current_entry["_lock"] = asyncio.Lock()
+                entry_lock = current_entry.get("_lock")
+
+        async with entry_lock:
+            # Re-read in_use while holding per-entry lock
+            in_use = current_entry.get("_in_use", 0)
+            if in_use == 0:
+                break
+
+        if time.monotonic() - start > timeout:
+            # Snapshot in_use under per-entry lock for the log
+            async with entry_lock:
+                final_in_use = current_entry.get("_in_use", 0)
+            logger.warning(
+                "clear_client_cache timed out for %s:%d (in_use=%d), force-closing",
+                provider, idx, final_in_use
+            )
+            break
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 1.0)
+
+    # Now close and remove – hold BOTH locks to ensure atomic pop
+    async with _client_lock:
+        entry = _clients.get(cache_key)
+        if not entry:
+            return True
+
+        entry_lock = entry.get("_lock")
+        if entry_lock:
+            async with entry_lock:
+                # verify fingerprint once more
+                if expected_fingerprint is not None and entry.get("fingerprint") != expected_fingerprint:
+                    logger.info("clear_client_cache aborted at removal: fingerprint changed for %s:%d", provider, idx)
+                    return False
+                popped = _clients.pop(cache_key, None)
+        else:
+            # fallback if no per-entry lock (should not happen)
+            popped = _clients.pop(cache_key, None)
+
+    # Close outside both locks to avoid blocking
+    if popped:
+        await _close_client(popped["client"])
+        logger.info("Cleared cached client for %s:%d", provider, idx)
+        return True
+    return False
+
+async def close_all_clients():
+    """Close all cached clients (used during shutdown)."""
+    # Mark all as pending clear to block new acquisitions
+    async with _client_lock:
+        for entry in _clients.values():
+            entry["_pending_clear"] = True
+
+    # Wait briefly for in_use to drop
+    for cache_key, entry in list(_clients.items()):
+        waited = 0.0
+        while waited < 5.0:
+            async with _client_lock:
+                if entry["_in_use"] == 0:
+                    break
+            await asyncio.sleep(0.1)
+            waited += 0.1
+
+    # Now close all clients
+    async with _client_lock:
+        for cache_key, entry in list(_clients.items()):
+            await _close_client(entry["client"])
+            _clients.pop(cache_key, None)
+    logger.info("All cached clients closed")
+
+
+# ----------------------------------------------------------------------
+# Key event listener (to be registered by application startup)
+# ----------------------------------------------------------------------
+async def on_key_event(event: str, payload: dict):
+    """
+    Handle key events from the key manager.
+    Expected events: "key_exhausted", "env_changed".
+    """
+    try:
+        if event == "key_exhausted":
+            provider = payload.get("service")
+            idx = payload.get("index")
+            if provider and idx is not None:
+                logger.info("Key exhausted for %s:%d – clearing client cache", provider, idx)
+                asyncio.create_task(clear_client_cache(provider, idx))
+        elif event == "env_changed":
+            # payload may include new_fingerprint_maps / old_fingerprint_maps
+            new_maps = payload.get("new_fingerprint_maps", {}) or {}
+            old_maps = payload.get("old_fingerprint_maps", {}) or {}
+            affected = payload.get("affected", [])
+            for provider, idx in affected:
+                # try to find the new fingerprint for this provider/idx (fall back to old)
+                expected_fp = None
+                try:
+                    expected_fp = new_maps.get(provider, {}).get(idx)
+                    if expected_fp is None:
+                        expected_fp = old_maps.get(provider, {}).get(idx)
+                except Exception:
+                    # if maps use string keys or other shape, do a best-effort
+                    pass
+
+                logger.info("Environment changed for %s:%d – clearing client cache (expected_fp=%s)", provider, idx, expected_fp)
+                asyncio.create_task(clear_client_cache(provider, idx, expected_fingerprint=expected_fp))
+        else:
+            logger.debug("Ignoring unknown key event: %s", event)
+    except Exception:
+        logger.exception("on_key_event raised unexpectedly (event=%s)", event)
+
 
 # ----------------------------------------------------------------------
 # Helper: per‑chunk timeout wrapper for async iterators
@@ -74,201 +368,286 @@ async def _aiter_with_timeout(aiter, per_item_timeout: float):
 # Provider Adapter – normalizes API responses to a consistent shape
 # ----------------------------------------------------------------------
 class ProviderAdapter:
-    def __init__(self, client, provider: str):
-        self.client = client
+    def __init__(self, provider: str, gemini_module=None, gemini_instance=None):
         self.provider = provider
+        # For Gemini we keep the module and instance (if any) for reuse, but keys come from key_manager
+        self.gemini_module = gemini_module
+        self.gemini_instance = gemini_instance
 
     async def ping(self, model: str) -> None:
         """Perform a minimal health check call. Raises exception on failure."""
-        if self.provider == "gemini":
-            # Use the wrapper with minimal tokens
-            await self.client["call"](
-                prompt="ping",
-                model=model,
-                max_tokens=1,
-                temperature=0.0
-            )
-        else:
-            await self.create_completion(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                temperature=0.0,
-                max_tokens=1,
-                timeout=5.0
-            )
+        # Use a minimal completion
+        await self.create_completion(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            temperature=0.0,
+            max_tokens=1,
+            timeout=5.0
+        )
 
     async def create_completion(self, *, model, messages, temperature, max_tokens, timeout):
         """Non‑streaming completion. Returns a normalized object with .choices[0].message.content and .usage."""
-        if self.provider == "openai":
-            raw = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                ),
-                timeout=timeout
-            )
-            return raw
+        provider = self.provider
 
-        elif self.provider == "anthropic":
-            # Convert messages to Anthropic prompt format (simplified; real apps need proper formatting)
-            system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
-            user_msgs = [m["content"] for m in messages if m["role"] == "user"]
-            prompt = "\n\n".join(user_msgs)
+        if provider == "openai":
+            async with key_manager.reserve_key("openai") as (idx, key):
+                async with get_client(provider, idx, key) as client:
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                            ),
+                            timeout=timeout
+                        )
+                        await key_manager.record_usage("openai", idx)
+                        return raw
+                    except OpenAIAuthError as e:
+                        await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
+                        raise
+                    except RateLimitError as e:
+                        await key_manager.mark_exhausted("openai", idx, reason="rate_limit")
+                        raise
+                    except (APIConnectionError, asyncio.TimeoutError) as e:
+                        # Transient errors, don't mark exhausted
+                        raise
+                    except Exception as e:
+                        raise
 
-            raw = await asyncio.wait_for(
-                self.client.completions.create(
-                    model=model,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ),
-                timeout=timeout
-            )
-            # Normalize to match OpenAI's response structure
-            class FakeChoice:
-                def __init__(self, text):
-                    self.message = type("Message", (), {"content": text})
-            class FakeResponse:
-                def __init__(self, text, usage):
-                    self.choices = [FakeChoice(text)]
-                    self.usage = usage
-            text = raw.completion if hasattr(raw, "completion") else raw.choices[0].text
-            usage = getattr(raw, "usage", None)
-            return FakeResponse(text, usage)
+        elif provider == "anthropic":
+            async with key_manager.reserve_key("anthropic") as (idx, key):
+                async with get_client(provider, idx, key) as client:
+                    # Convert messages to Anthropic prompt format (simplified)
+                    system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+                    user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+                    prompt = "\n\n".join(user_msgs)
 
-        elif self.provider == "gemini":
-            # Build a prompt from messages
-            system_part = ""
-            user_part = ""
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_part = msg["content"]
-                elif msg["role"] == "user":
-                    user_part = msg["content"]
-            prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.completions.create(
+                                model=model,
+                                prompt=prompt,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                            ),
+                            timeout=timeout
+                        )
+                        await key_manager.record_usage("anthropic", idx)
+                        # Normalize to match OpenAI's response structure
+                        class FakeChoice:
+                            def __init__(self, text):
+                                self.message = type("Message", (), {"content": text})
+                        class FakeResponse:
+                            def __init__(self, text, usage):
+                                self.choices = [FakeChoice(text)]
+                                self.usage = usage
+                        text = raw.completion if hasattr(raw, "completion") else raw.choices[0].text
+                        usage = getattr(raw, "usage", None)
+                        return FakeResponse(text, usage)
+                    except AnthroAuthError as e:
+                        await key_manager.mark_exhausted("anthropic", idx, reason="unauthorized")
+                        raise
+                    except AnthroRateLimitError as e:
+                        await key_manager.mark_exhausted("anthropic", idx, reason="rate_limit")
+                        raise
+                    except (AnthroConnErr, asyncio.TimeoutError) as e:
+                        raise
+                    except Exception as e:
+                        raise
 
-            # Call the Gemini wrapper (this runs in a thread)
-            content = await self.client["call"](
-                prompt=prompt,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
+        elif provider == "gemini":
+            # Use the Gemini helper module stored during init
+            if self.gemini_module is None:
+                raise CloudLLMError("Gemini helper not available")
+            async with key_manager.reserve_key("gemini") as (idx, key):
+                # Build a prompt from messages
+                system_part = ""
+                user_part = ""
+                for msg in messages:
+                    if msg["role"] == "system":
+                        system_part = msg["content"]
+                    elif msg["role"] == "user":
+                        user_part = msg["content"]
+                prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
 
-            # Build a fake response object with usage=None (Gemini helper may not return usage)
-            class FakeChoice:
-                def __init__(self, text):
-                    self.message = type("Message", (), {"content": text})
-            class FakeResponse:
-                def __init__(self, text):
-                    self.choices = [FakeChoice(text)]
-                    self.usage = None
-            return FakeResponse(content)
+                # Define a sync function that calls the helper with the key
+                def sync_call() -> str:
+                    # Try client method first if we have an instance that can accept a key
+                    if self.gemini_instance is not None and hasattr(self.gemini_instance, "generate"):
+                        return self.gemini_instance.generate(prompt, model=model, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                    # Then module-level generate() with api_key param
+                    if hasattr(self.gemini_module, "generate"):
+                        return self.gemini_module.generate(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                    # Finally generate_single()
+                    if hasattr(self.gemini_module, "generate_single"):
+                        return self.gemini_module.generate_single(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                    raise RuntimeError("No usable Gemini entrypoint found")
+
+                try:
+                    content = await asyncio.to_thread(sync_call)
+                    await key_manager.record_usage("gemini", idx)
+                    # Build a fake response
+                    class FakeChoice:
+                        def __init__(self, text):
+                            self.message = type("Message", (), {"content": text})
+                    class FakeResponse:
+                        def __init__(self, text):
+                            self.choices = [FakeChoice(text)]
+                            self.usage = None
+                    return FakeResponse(content)
+                except Exception as e:
+                    # If the error indicates quota exhaustion, mark key exhausted
+                    if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                        await key_manager.mark_exhausted("gemini", idx, reason="rate_limit")
+                    elif "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "key" in str(e).lower():
+                        await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
+                    raise
 
         else:
-            raise RuntimeError(f"Unsupported provider: {self.provider}")
+            raise RuntimeError(f"Unsupported provider: {provider}")
 
     async def open_stream(self, *, model, messages, temperature, max_tokens, timeout):
         """Open a streaming connection. Returns an async iterable yielding normalized chunks."""
-        if self.provider == "openai":
-            stream = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=True,
-                ),
-                timeout=timeout
-            )
-            return stream
+        provider = self.provider
 
-        elif self.provider == "anthropic":
-            system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
-            user_msgs = [m["content"] for m in messages if m["role"] == "user"]
-            prompt = "\n\n".join(user_msgs)
+        if provider == "openai":
+            async def _stream_generator():
+                async with key_manager.reserve_key("openai") as (idx, key):
+                    async with get_client(provider, idx, key) as client:
+                        try:
+                            stream = await asyncio.wait_for(
+                                client.chat.completions.create(
+                                    model=model,
+                                    messages=messages,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    stream=True,
+                                ),
+                                timeout=timeout
+                            )
+                        except OpenAIAuthError as e:
+                            await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
+                            raise
+                        except RateLimitError as e:
+                            await key_manager.mark_exhausted("openai", idx, reason="rate_limit")
+                            raise
+                        except (APIConnectionError, asyncio.TimeoutError) as e:
+                            raise
+                        except Exception as e:
+                            raise
 
-            raw_stream = await asyncio.wait_for(
-                self.client.completions.create(
-                    model=model,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True,
-                ),
-                timeout=timeout
-            )
-            # Wrap to yield normalized chunks (with .choices[0].delta.content)
-            async def _normalize_anthropic_stream():
-                async for chunk in raw_stream:
-                    delta_text = getattr(chunk, "completion", None) or chunk.choices[0].text
-                    if delta_text is None:
-                        continue
-                    # Build fake chunk object
+                        async for chunk in stream:
+                            yield chunk
+
+                        await key_manager.record_usage("openai", idx)
+            return _stream_generator()
+
+        elif provider == "anthropic":
+            async def _stream_generator():
+                async with key_manager.reserve_key("anthropic") as (idx, key):
+                    async with get_client(provider, idx, key) as client:
+                        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+                        user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+                        prompt = "\n\n".join(user_msgs)
+                        try:
+                            raw_stream = await asyncio.wait_for(
+                                client.completions.create(
+                                    model=model,
+                                    prompt=prompt,
+                                    max_tokens=max_tokens,
+                                    temperature=temperature,
+                                    stream=True,
+                                ),
+                                timeout=timeout
+                            )
+                        except AnthroAuthError as e:
+                            await key_manager.mark_exhausted("anthropic", idx, reason="unauthorized")
+                            raise
+                        except AnthroRateLimitError as e:
+                            await key_manager.mark_exhausted("anthropic", idx, reason="rate_limit")
+                            raise
+                        except (AnthroConnErr, asyncio.TimeoutError) as e:
+                            raise
+                        except Exception as e:
+                            raise
+
+                        async for chunk in raw_stream:
+                            delta_text = getattr(chunk, "completion", None) or chunk.choices[0].text
+                            if delta_text is None:
+                                continue
+                            # Build fake chunk object
+                            class FakeDelta:
+                                def __init__(self, content): self.content = content
+                            class FakeChoice:
+                                def __init__(self, delta): self.delta = delta
+                            class FakeChunk:
+                                def __init__(self, delta): self.choices = [FakeChoice(FakeDelta(delta))]
+                            yield FakeChunk(delta_text)
+
+                        await key_manager.record_usage("anthropic", idx)
+            return _stream_generator()
+
+        elif provider == "gemini":
+            # Gemini streaming not natively supported; fallback to non-streaming
+            async def _stream_generator():
+                async with key_manager.reserve_key("gemini") as (idx, key):
+                    # Build prompt
+                    system_part = ""
+                    user_part = ""
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            system_part = msg["content"]
+                        elif msg["role"] == "user":
+                            user_part = msg["content"]
+                    prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
+
+                    def sync_call() -> str:
+                        if self.gemini_instance is not None and hasattr(self.gemini_instance, "generate"):
+                            return self.gemini_instance.generate(prompt, model=model, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                        if hasattr(self.gemini_module, "generate"):
+                            return self.gemini_module.generate(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                        if hasattr(self.gemini_module, "generate_single"):
+                            return self.gemini_module.generate_single(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
+                        raise RuntimeError("No usable Gemini entrypoint found")
+
+                    try:
+                        content = await asyncio.to_thread(sync_call)
+                    except Exception as e:
+                        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                            await key_manager.mark_exhausted("gemini", idx, reason="rate_limit")
+                        elif "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "key" in str(e).lower():
+                            await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
+                        raise
+
+                    # Yield as one chunk
                     class FakeDelta:
                         def __init__(self, content): self.content = content
                     class FakeChoice:
                         def __init__(self, delta): self.delta = delta
                     class FakeChunk:
                         def __init__(self, delta): self.choices = [FakeChoice(FakeDelta(delta))]
-                    yield FakeChunk(delta_text)
-            return _normalize_anthropic_stream()
+                    yield FakeChunk(content)
 
-        elif self.provider == "gemini":
-            # Gemini helper likely does not support streaming. Fallback: get full response
-            # and yield it as a single chunk.
-            system_part = ""
-            user_part = ""
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_part = msg["content"]
-                elif msg["role"] == "user":
-                    user_part = msg["content"]
-            prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
-
-            content = await self.client["call"](
-                prompt=prompt,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-
-            # Define an async generator that yields the whole content as one chunk
-            async def _gemini_stream():
-                # Build a fake chunk with the complete content
-                class FakeDelta:
-                    def __init__(self, content): self.content = content
-                class FakeChoice:
-                    def __init__(self, delta): self.delta = delta
-                class FakeChunk:
-                    def __init__(self, delta): self.choices = [FakeChoice(FakeDelta(delta))]
-                yield FakeChunk(content)
-            return _gemini_stream()
+                    await key_manager.record_usage("gemini", idx)
+            return _stream_generator()
 
         else:
-            raise RuntimeError(f"Unsupported provider: {self.provider}")
+            raise RuntimeError(f"Unsupported provider: {provider}")
 
     async def close(self):
-        """Close the underlying client if possible."""
+        """Close any persistent resources (Gemini client may have its own close)."""
         try:
-            if self.provider in ("openai", "anthropic"):
-                close_coro = getattr(self.client, "close", None)
-                if callable(close_coro):
-                    maybe = close_coro()
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
-            # Gemini client (if any) may have its own close method
-            elif self.provider == "gemini" and self.client.get("instance") is not None:
-                close_method = getattr(self.client["instance"], "close", None)
+            if self.provider == "gemini" and self.gemini_instance is not None:
+                close_method = getattr(self.gemini_instance, "close", None)
                 if callable(close_method):
                     maybe = close_method()
                     if asyncio.iscoroutine(maybe):
                         await maybe
-            logger.info("Cloud provider client closed", extra={"provider": self.provider})
+            logger.info("Cloud provider adapter closed", extra={"provider": self.provider})
         except Exception as e:
-            logger.exception("cloud_client_close_failed", extra={"provider": self.provider, "error": str(e)})
+            logger.exception("cloud_adapter_close_failed", extra={"provider": self.provider, "error": str(e)})
 
 
 # ----------------------------------------------------------------------
@@ -285,26 +664,15 @@ def _parse_provider_chain() -> List[str]:
 def _init_provider(provider: str):
     """Initialise a single provider. Returns (adapter, retry_exceptions) or None if skipped."""
     if provider == "openai":
-        # If there is no key configured, skip adding OpenAI as a provider.
-        if not OPENAI_API_KEY:
-            logger.warning("OPENAI_API_KEY missing - skipping 'openai' provider (will not be used).")
-            return None
-        from openai import AsyncOpenAI, RateLimitError, APIConnectionError
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        return ProviderAdapter(client, provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError)
+        # No client created here; key_manager will provide keys at call time
+        return ProviderAdapter(provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError, OpenAIAuthError)
 
-    elif provider == "anthropic": #currently i dont have money for claude ai 
-        # Skip if API key missing
-        if not ANTHROPIC_API_KEY:
-            logger.warning("ANTHROPIC_API_KEY missing - skipping 'anthropic' provider.")
-            return None
-        try:
-            from anthropic import AsyncAnthropic, RateLimitError as AnthroRateLimitError, APIConnectionError as AnthroConnErr
-        except ImportError:
+    elif provider == "anthropic":
+        # Skip if SDK not installed (but we already have lazy imports)
+        if AsyncAnthropic is None:
             logger.warning("Anthropic package not installed - skipping provider.")
             return None
-        client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        return ProviderAdapter(client, provider), (AnthroRateLimitError, AnthroConnErr, asyncio.TimeoutError)
+        return ProviderAdapter(provider), (AnthroRateLimitError, AnthroConnErr, asyncio.TimeoutError, AnthroAuthError)
 
     elif provider == "gemini":
         # Try to import the helper; if it fails, skip Gemini.
@@ -318,36 +686,19 @@ def _init_provider(provider: str):
         GeminiClient = getattr(gemini_mod, "GeminiClient", None)
         gemini_instance = None
         if GeminiClient is not None:
-            gemini_instance = GeminiClient()   # adjust constructor args if needed
+            # Instantiate without a key; we'll pass key per call
+            try:
+                gemini_instance = GeminiClient(api_key=None)
+            except TypeError:
+                try:
+                    gemini_instance = GeminiClient()
+                except Exception:
+                    gemini_instance = None  # adjust if constructor requires key
 
-        async def _gemini_generate(prompt: str, *, stream: bool = False, model: Optional[str] = None,
-                                   max_tokens: Optional[int] = None, temperature: Optional[float] = None,
-                                   **kwargs) -> str:
-            def sync_call() -> str:
-                # Try client method first
-                if gemini_instance is not None and hasattr(gemini_instance, "generate"):
-                    return gemini_instance.generate(prompt, model=model, max_output_tokens=max_tokens, temperature=temperature)
-                # Then module-level generate()
-                if hasattr(gemini_mod, "generate"):
-                    return gemini_mod.generate(prompt, max_output_tokens=max_tokens, temperature=temperature)
-                # Finally generate_single()
-                if hasattr(gemini_mod, "generate_single"):
-                    return gemini_mod.generate_single(prompt, max_output_tokens=max_tokens, temperature=temperature)
-                raise RuntimeError("No usable Gemini entrypoint found")
-            return await asyncio.to_thread(sync_call)
-
-        client = {
-            "type": "gemini",
-            "call": _gemini_generate,
-            "instance": gemini_instance   # keep for potential close()
-        }
-        # Only retry on timeout (or a specific Gemini exception if defined)
+        adapter = ProviderAdapter(provider, gemini_module=gemini_mod, gemini_instance=gemini_instance)
+        # Only retry on timeout for Gemini (or other exceptions if we detect)
         gemini_retry_exc = (asyncio.TimeoutError,)
-        # Optionally, if gemini_mod has a known exception class, include it:
-        # gemini_exc = getattr(gemini_mod, "GeminiError", None)
-        # if gemini_exc:
-        #     gemini_retry_exc = (asyncio.TimeoutError, gemini_exc)
-        return ProviderAdapter(client, provider), gemini_retry_exc
+        return adapter, gemini_retry_exc
 
     else:
         logger.warning("Unsupported provider %s - skipping.", provider)
@@ -735,6 +1086,8 @@ async def health_check() -> str:
 
 async def close_client():
     """Close all underlying provider clients gracefully."""
+    await close_all_clients()
+    # Close adapters (Gemini instance if any)
     for adapter in _adapters.values():
         await adapter.close()
     logger.info("Cloud client shutdown complete")

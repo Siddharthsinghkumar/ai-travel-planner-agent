@@ -7,7 +7,7 @@ import inspect
 from typing import Optional, Union, AsyncGenerator, Dict, Any
 
 # Import async clients (assumed to be fully async, with health checks and streaming)
-from agents.ollama_client import OllamaClient, OllamaError
+from agents.ollama_client import OLLAMA_TIMEOUT, OllamaClient, OllamaError
 from agents.cloud_llm import CloudLLMClient, CloudLLMError
 # Import dynamic mode/priority from orchestrator
 from core.llm_mode import get_llm_mode_and_priority
@@ -47,7 +47,7 @@ class ProviderAsyncGen:
 
 
 # Environment configuration
-LOCAL_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "30"))
+LOCAL_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", str(OLLAMA_TIMEOUT)))
 CLOUD_TIMEOUT = float(os.getenv("CLOUD_LLM_TIMEOUT", "60"))
 ROUTER_TIMEOUT = float(os.getenv("ROUTER_TIMEOUT", "90"))   # global timeout for entire generate call
 

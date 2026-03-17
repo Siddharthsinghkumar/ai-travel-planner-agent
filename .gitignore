@@ -23,4 +23,4 @@ chromium137/
 # Old / experimental requirements
 requirements_clean.txt
 requirements-now-dev-only.txt
-full_validation.sh
+

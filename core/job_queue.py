@@ -88,6 +88,13 @@ async def _process_job(job_id: str, payload: dict):
             if q:
                 await q.put({"type": "result", "message": agen_or_result})
 
+            # Treat this as the final result and mark job done immediately
+            _jobs[job_id]["result"] = agen_or_result
+            _jobs[job_id]["status"] = "done"
+            if q:
+                await q.put({"type": "done", "message": agen_or_result})
+            return
+
         # Finalize: if we didn't receive final dict yet, call non-streaming plan for final structured result
         if _jobs[job_id]["result"] is None:
             try:
