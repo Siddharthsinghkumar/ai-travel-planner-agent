@@ -40,84 +40,89 @@ async def stop_worker():
 async def _process_job(job_id: str, payload: dict):
     # Use `planner_agent` to process the payload. If streaming available, forward tokens to event queue.
     from agents import planner_agent
+    from core.llm_mode import llm_routing_context
     q = _job_event_queues.get(job_id)
     try:
         _jobs[job_id]["status"] = "running"
         if q:
             await q.put({"type": "running", "message": "job started"})
 
-        # Prefer streaming plan if available to forward progress events:
-        agen_or_result = await planner_agent.plan_trip(
-            origin=payload.get("origin"),
-            destination=payload.get("destination"),
-            date=payload.get("date"),
-            user_query=payload.get("user_query"),
-            trip_type=payload.get("trip_type"),
-            stream=True,
-        )
+        with llm_routing_context(
+            llm_mode=payload.get("llm_mode"),
+            cloud_provider=payload.get("cloud_provider"),
+        ):
+            # Prefer streaming plan if available to forward progress events:
+            agen_or_result = await planner_agent.plan_trip(
+                origin=payload.get("origin"),
+                destination=payload.get("destination"),
+                date=payload.get("date"),
+                user_query=payload.get("user_query"),
+                trip_type=payload.get("trip_type"),
+                stream=True,
+            )
 
-        # If we received an async generator, forward tokens; else, we got final result
-        if hasattr(agen_or_result, "__aiter__"):
-            final_found = False
-            final_payload = None
-            async for token in agen_or_result:
+            # If we received an async generator, forward tokens; else, we got final result
+            if hasattr(agen_or_result, "__aiter__"):
+                final_found = False
+                final_payload = None
+                async for token in agen_or_result:
+                    if q:
+                        await q.put({"type": "token", "message": token})
+
+                    # tokens from planner may contain the final JSON prefixed with [DONE_JSON]
+                    if isinstance(token, str) and token.startswith("[DONE_JSON]"):
+                        json_part = token[len("[DONE_JSON]"):]
+                        try:
+                            parsed = json.loads(json_part)
+                            final_payload = parsed
+                            final_found = True
+                            # push final 'done' event immediately
+                            if q:
+                                await q.put({"type": "done", "message": parsed})
+                        except Exception as e:
+                            if q:
+                                await q.put({"type": "error", "message": f"failed to parse DONE_JSON: {e}"})
+                        # usually generator ends after DONE_JSON; but continue just in case
+                # If we found final payload from stream, store it and skip non-stream call
+                if final_found and final_payload is not None:
+                    _jobs[job_id]["result"] = final_payload
+                    _jobs[job_id]["status"] = "done"
+                    return
+            else:
+                # non-stream return value (final) — push as final event
                 if q:
-                    await q.put({"type": "token", "message": token})
+                    await q.put({"type": "result", "message": agen_or_result})
 
-                # tokens from planner may contain the final JSON prefixed with [DONE_JSON]
-                if isinstance(token, str) and token.startswith("[DONE_JSON]"):
-                    json_part = token[len("[DONE_JSON]"):]
-                    try:
-                        parsed = json.loads(json_part)
-                        final_payload = parsed
-                        final_found = True
-                        # push final 'done' event immediately
-                        if q:
-                            await q.put({"type": "done", "message": parsed})
-                    except Exception as e:
-                        if q:
-                            await q.put({"type": "error", "message": f"failed to parse DONE_JSON: {e}"})
-                    # usually generator ends after DONE_JSON; but continue just in case
-            # If we found final payload from stream, store it and skip non-stream call
-            if final_found and final_payload is not None:
-                _jobs[job_id]["result"] = final_payload
+                # Treat this as the final result and mark job done immediately
+                _jobs[job_id]["result"] = agen_or_result
                 _jobs[job_id]["status"] = "done"
+                if q:
+                    await q.put({"type": "done", "message": agen_or_result})
                 return
-        else:
-            # non-stream return value (final) — push as final event
-            if q:
-                await q.put({"type": "result", "message": agen_or_result})
 
-            # Treat this as the final result and mark job done immediately
-            _jobs[job_id]["result"] = agen_or_result
-            _jobs[job_id]["status"] = "done"
-            if q:
-                await q.put({"type": "done", "message": agen_or_result})
-            return
-
-        # Finalize: if we didn't receive final dict yet, call non-streaming plan for final structured result
-        if _jobs[job_id]["result"] is None:
-            try:
-                # ensure final structured result is available (non-stream)
-                final = await planner_agent.plan_trip(
-                    origin=payload.get("origin"),
-                    destination=payload.get("destination"),
-                    date=payload.get("date"),
-                    user_query=payload.get("user_query"),
-                    trip_type=payload.get("trip_type"),
-                    stream=False,
-                )
-                _jobs[job_id]["result"] = final
-                _jobs[job_id]["status"] = "done"
-                if q:
-                    await q.put({"type": "done", "message": final})
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                _jobs[job_id]["status"] = "error"
-                _jobs[job_id]["error"] = str(e)
-                if q:
-                    await q.put({"type": "error", "message": str(e)})
+            # Finalize: if we didn't receive final dict yet, call non-streaming plan for final structured result
+            if _jobs[job_id]["result"] is None:
+                try:
+                    # ensure final structured result is available (non-stream)
+                    final = await planner_agent.plan_trip(
+                        origin=payload.get("origin"),
+                        destination=payload.get("destination"),
+                        date=payload.get("date"),
+                        user_query=payload.get("user_query"),
+                        trip_type=payload.get("trip_type"),
+                        stream=False,
+                    )
+                    _jobs[job_id]["result"] = final
+                    _jobs[job_id]["status"] = "done"
+                    if q:
+                        await q.put({"type": "done", "message": final})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["error"] = str(e)
+                    if q:
+                        await q.put({"type": "error", "message": str(e)})
         return
 
     except asyncio.CancelledError:

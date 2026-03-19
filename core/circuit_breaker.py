@@ -256,7 +256,9 @@ class AsyncCircuitBreaker:
     # ----------------------------------------------------------------------
 
     async def run_generator_protected(
-        self, agen_factory: Callable[[], AsyncGenerator]
+        self,
+        agen_factory: Callable[[], AsyncGenerator],
+        non_failure_exceptions: tuple[type[BaseException], ...] = (),
     ) -> AsyncGenerator:
         """
         Protect an async generator produced by `agen_factory()`.
@@ -279,16 +281,13 @@ class AsyncCircuitBreaker:
             async for item in agen:
                 yield item
         except asyncio.CancelledError:
-            # Treat cancellation as failure, record it, then re-raise
-            async with self._lock:
-                await self._record_failure()
-                self._emit_metric("circuit.failure", {"cancel": True})
-            self._logger.info(
-                "Circuit breaker recorded cancellation as failure",
-                extra={"event": "breaker_cancelled"}
-            )
+            # Treat caller cancellation as a neutral outcome; do not poison breaker state.
+            self._emit_metric("circuit.cancelled", {"cancel": True})
+            self._logger.info("Circuit breaker observed cancellation", extra={"event": "breaker_cancelled"})
             raise
-        except Exception:
+        except Exception as exc:
+            if non_failure_exceptions and isinstance(exc, non_failure_exceptions):
+                raise
             async with self._lock:
                 await self._record_failure()
                 self._emit_metric("circuit.failure")

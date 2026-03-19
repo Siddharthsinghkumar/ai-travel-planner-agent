@@ -13,7 +13,6 @@
 #   - Accurate end-to-end latency measurement
 # Metrics are NOT added to lower-level transport methods to avoid
 # double-counting retries or internal fallback attempts.
-import os
 import time
 import asyncio
 import logging
@@ -27,29 +26,39 @@ from core.retry import retry_async, RetryConfig
 from core.circuit_breaker import get_circuit_breaker, CircuitBreakerOpenError, is_open as circuit_is_open
 from core.request_context import get_request_id
 from core.api_key_manager import key_manager
+from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, parse_csv_env
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Environment configuration (no longer used directly for API keys)
-CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "openai").lower()
-CLOUD_PROVIDER_CHAIN = os.getenv("CLOUD_PROVIDER_CHAIN")
-DEFAULT_MODEL = os.getenv("CLOUD_LLM_MODEL", "gpt-4o-mini")
-DEFAULT_TIMEOUT = float(os.getenv("CLOUD_LLM_TIMEOUT", "30"))
-DEFAULT_TEMPERATURE = float(os.getenv("CLOUD_LLM_TEMPERATURE", "0.7"))
-DEFAULT_MAX_TOKENS = int(os.getenv("CLOUD_LLM_MAX_TOKENS", "1024"))
-COST_PER_1K_TOKENS = float(os.getenv("CLOUD_LLM_COST_PER_1K_TOKENS", "0.0"))
-MAX_COST_PER_REQUEST = float(os.getenv("CLOUD_LLM_MAX_COST", "0"))  # 0 = disabled
-FALLBACK_MODELS = [m.strip() for m in os.getenv("CLOUD_LLM_FALLBACK_MODELS", "").split(",") if m.strip()]
-STREAM_CHUNK_TIMEOUT = float(os.getenv("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", "5.0"))
+CLOUD_PROVIDER = (get_env_str("CLOUD_PROVIDER", "gemini") or "gemini").lower()
+CLOUD_PROVIDER_CHAIN = get_env_str("CLOUD_PROVIDER_CHAIN")
+DEFAULT_MODEL = get_env_str("CLOUD_LLM_MODEL", "gpt-4o-mini")
+DEFAULT_TIMEOUT = get_env_float("CLOUD_LLM_TIMEOUT", 30.0)
+DEFAULT_TEMPERATURE = get_env_float("CLOUD_LLM_TEMPERATURE", 0.7)
+DEFAULT_MAX_TOKENS = get_env_int("CLOUD_LLM_MAX_TOKENS", 1024)
+COST_PER_1K_TOKENS = get_env_float("CLOUD_LLM_COST_PER_1K_TOKENS", 0.0)
+MAX_COST_PER_REQUEST = get_env_float("CLOUD_LLM_MAX_COST", 0.0)  # 0 = disabled
+FALLBACK_MODELS = parse_csv_env("CLOUD_LLM_FALLBACK_MODELS")
+STREAM_CHUNK_TIMEOUT = get_env_float("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", 5.0)
 
 # ---- Cooldown globals for health check ----
-PROVIDER_FAIL_COOLDOWN = int(os.getenv("PROVIDER_FAIL_COOLDOWN", "300"))  # seconds
+PROVIDER_FAIL_COOLDOWN = get_env_int("PROVIDER_FAIL_COOLDOWN", 300)  # seconds
 _PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we skip health checks
 # --------------------------------------------------
 
 # ---- Cloud enablement flag ----
-USE_CLOUD_LLM = os.getenv("USE_CLOUD_LLM", "1") == "1"
+def is_cloud_admin_enabled() -> bool:
+    """
+    Administrative cloud enablement switch.
+    USE_CLOUD_LLM=0 disables cloud routing even when provider keys are usable.
+    """
+    return get_env_bool("USE_CLOUD_LLM", default=True)
+
+
+# Backward-compatible snapshot retained for legacy log/debug surfaces.
+USE_CLOUD_LLM = is_cloud_admin_enabled()
 # --------------------------------------------------
 
 # Lazy imports for optional provider SDKs
@@ -390,7 +399,7 @@ class ProviderAdapter:
         provider = self.provider
 
         if provider == "openai":
-            async with key_manager.reserve_key("openai") as (idx, key):
+            async with _reserve_provider_key("openai") as (idx, key):
                 async with get_client(provider, idx, key) as client:
                     try:
                         raw = await asyncio.wait_for(
@@ -417,7 +426,7 @@ class ProviderAdapter:
                         raise
 
         elif provider == "anthropic":
-            async with key_manager.reserve_key("anthropic") as (idx, key):
+            async with _reserve_provider_key("anthropic") as (idx, key):
                 async with get_client(provider, idx, key) as client:
                     # Convert messages to Anthropic prompt format (simplified)
                     system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
@@ -461,7 +470,7 @@ class ProviderAdapter:
             # Use the Gemini helper module stored during init
             if self.gemini_module is None:
                 raise CloudLLMError("Gemini helper not available")
-            async with key_manager.reserve_key("gemini") as (idx, key):
+            async with _reserve_provider_key("gemini") as (idx, key):
                 # Build a prompt from messages
                 system_part = ""
                 user_part = ""
@@ -514,7 +523,7 @@ class ProviderAdapter:
 
         if provider == "openai":
             async def _stream_generator():
-                async with key_manager.reserve_key("openai") as (idx, key):
+                async with _reserve_provider_key("openai") as (idx, key):
                     async with get_client(provider, idx, key) as client:
                         try:
                             stream = await asyncio.wait_for(
@@ -546,7 +555,7 @@ class ProviderAdapter:
 
         elif provider == "anthropic":
             async def _stream_generator():
-                async with key_manager.reserve_key("anthropic") as (idx, key):
+                async with _reserve_provider_key("anthropic") as (idx, key):
                     async with get_client(provider, idx, key) as client:
                         system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
                         user_msgs = [m["content"] for m in messages if m["role"] == "user"]
@@ -592,7 +601,7 @@ class ProviderAdapter:
         elif provider == "gemini":
             # Gemini streaming not natively supported; fallback to non-streaming
             async def _stream_generator():
-                async with key_manager.reserve_key("gemini") as (idx, key):
+                async with _reserve_provider_key("gemini") as (idx, key):
                     # Build prompt
                     system_part = ""
                     user_part = ""
@@ -740,6 +749,136 @@ class CloudLLMError(Exception):
     pass
 
 
+class CloudProviderUnavailableError(CloudLLMError):
+    """Raised when a cloud provider has no currently available keys."""
+    pass
+
+
+def _is_no_available_keys_error(exc: Exception) -> bool:
+    return "no available keys for service" in str(exc).lower()
+
+
+@asynccontextmanager
+async def _reserve_provider_key(service: str):
+    try:
+        async with key_manager.reserve_key(service) as reservation:
+            yield reservation
+    except RuntimeError as exc:
+        if _is_no_available_keys_error(exc):
+            raise CloudProviderUnavailableError(str(exc)) from exc
+        raise
+
+
+def _resolve_provider_entries(
+    selected_provider: Optional[str],
+    allow_provider_fallback: bool,
+) -> List[Tuple[str, "ProviderAdapter", Tuple]]:
+    entries = list(provider_chain)
+    if not entries:
+        return []
+
+    if not selected_provider:
+        return entries
+
+    normalized = selected_provider.strip().lower()
+    prioritized = [entry for entry in entries if entry[0] == normalized]
+    if not prioritized:
+        available = ", ".join(name for name, _, _ in entries)
+        raise CloudLLMError(
+            f"Selected cloud provider '{selected_provider}' is not configured. "
+            f"Available providers: {available or '(none)'}"
+        )
+
+    if not allow_provider_fallback:
+        return prioritized
+
+    remainder = [entry for entry in entries if entry[0] != normalized]
+    return prioritized + remainder
+
+
+def get_available_providers() -> List[str]:
+    return [name for name, _, _ in provider_chain]
+
+
+_PROVIDER_KEY_SERVICE_MAP = {
+    "openai": "openai",
+    "gemini": "gemini",
+    "anthropic": "anthropic",
+}
+
+
+def _is_key_entry_usable(entry: Any, now_ts: float) -> bool:
+    if isinstance(entry, str):
+        return entry.strip().lower() == "active"
+
+    if not isinstance(entry, dict):
+        return False
+
+    if bool(entry.get("pending_clear", False) or entry.get("_pending_clear", False)):
+        return False
+
+    if "active" in entry and not bool(entry.get("active")):
+        return False
+
+    exhausted_until = entry.get("exhausted_until")
+    if exhausted_until in (None, ""):
+        return True
+
+    try:
+        if isinstance(exhausted_until, (int, float)):
+            return float(exhausted_until) <= now_ts
+    except Exception:
+        return False
+
+    # When exhausted_until is already ISO text, key_manager.status() has typically
+    # already folded this into `active`; if active==True we treat it as usable.
+    return "active" in entry and bool(entry.get("active"))
+
+
+async def get_provider_usability() -> Dict[str, bool]:
+    providers = get_available_providers()
+    if not providers:
+        return {}
+
+    try:
+        status = await key_manager.get_status()
+    except Exception:
+        logger.exception("provider_usability_status_failed")
+        return {provider: False for provider in providers}
+
+    now_ts = time.time()
+    usability: Dict[str, bool] = {}
+
+    for provider in providers:
+        service = _PROVIDER_KEY_SERVICE_MAP.get(provider)
+        if not service:
+            usability[provider] = False
+            continue
+
+        entries = (status or {}).get(service, [])
+        if isinstance(entries, dict):
+            iterable = list(entries.values())
+        elif isinstance(entries, list):
+            iterable = entries
+        else:
+            iterable = []
+
+        usability[provider] = any(_is_key_entry_usable(entry, now_ts) for entry in iterable)
+
+    return usability
+
+
+async def get_usable_providers() -> List[str]:
+    usability = await get_provider_usability()
+    return [provider for provider in get_available_providers() if usability.get(provider, False)]
+
+
+async def cloud_backend_is_usable(*, respect_admin_flag: bool = True) -> bool:
+    if respect_admin_flag and not is_cloud_admin_enabled():
+        return False
+    return bool(await get_usable_providers())
+
+
 async def _check_circuit_breaker(provider: str):
     """Raise CloudLLMError if circuit breaker for this provider is open."""
     if await circuit_is_open(f"cloud_llm_{provider}"):
@@ -829,11 +968,16 @@ async def generate(
     temperature: float | None = None,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    cloud_provider: str | None = None,
+    allow_provider_fallback: bool = True,
 ) -> str:
     """
     Generate a non‑streaming completion with provider‑level and model‑level fallback,
     and cost guardrail.
     """
+    if not is_cloud_admin_enabled():
+        raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
+
     # Handle defaults
     primary_model = DEFAULT_MODEL if model is None else model
     temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
@@ -845,9 +989,13 @@ async def generate(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    provider_entries = _resolve_provider_entries(cloud_provider, allow_provider_fallback)
+    if not provider_entries:
+        raise CloudLLMError("No cloud providers available")
+
     # For each provider in chain
     last_exception = None
-    for prov_name, adapter, retry_exc in provider_chain:
+    for prov_name, adapter, retry_exc in provider_entries:
         # Check circuit breaker for this provider
         try:
             await _check_circuit_breaker(prov_name)
@@ -890,6 +1038,13 @@ async def generate(
 
             except Exception as e:
                 last_exception = e
+                if _is_no_available_keys_error(e):
+                    logger.info(
+                        "Provider %s unavailable due to key exhaustion/unavailability",
+                        prov_name,
+                        extra={"provider": prov_name},
+                    )
+                    break
                 logger.warning("Provider %s model %s failed, trying next fallback", prov_name, attempt_model, exc_info=True)
                 continue
 
@@ -907,11 +1062,16 @@ async def generate_stream(
     temperature: float | None = None,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    cloud_provider: str | None = None,
+    allow_provider_fallback: bool = True,
 ):
     """
     Generate a streaming completion with provider‑level and model‑level fallback
     (before first token) and cost guardrail.
     """
+    if not is_cloud_admin_enabled():
+        raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
+
     primary_model = DEFAULT_MODEL if model is None else model
     temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
     timeout = DEFAULT_TIMEOUT if timeout is None else timeout
@@ -926,7 +1086,11 @@ async def generate_stream(
     start_time = time.monotonic()
     request_id = get_request_id()
 
-    for prov_name, adapter, retry_exc in provider_chain:
+    provider_entries = _resolve_provider_entries(cloud_provider, allow_provider_fallback)
+    if not provider_entries:
+        raise CloudLLMError("No cloud providers available")
+
+    for prov_name, adapter, retry_exc in provider_entries:
         # Check circuit breaker for this provider
         try:
             await _check_circuit_breaker(prov_name)
@@ -969,7 +1133,10 @@ async def generate_stream(
                 estimated_tokens = 0
                 first_token = True
 
-                async for chunk in breaker.run_generator_protected(_stream_generator_factory):
+                async for chunk in breaker.run_generator_protected(
+                    _stream_generator_factory,
+                    non_failure_exceptions=(CloudProviderUnavailableError,),
+                ):
                     # ----- defensive delta extraction -----
                     choice0 = getattr(chunk, "choices", [None])[0]
                     if not choice0:
@@ -1041,6 +1208,13 @@ async def generate_stream(
 
                 # Otherwise (failure before first token) – try next model in this provider
                 last_exception = e
+                if _is_no_available_keys_error(e):
+                    logger.info(
+                        "Stream skipped provider %s due to unavailable keys",
+                        prov_name,
+                        extra={"provider": prov_name},
+                    )
+                    break
                 logger.warning("Stream open failed for provider %s model %s, trying next model", prov_name, attempt_model, exc_info=True)
                 continue
 
@@ -1054,16 +1228,24 @@ async def generate_stream(
 async def health_check() -> str:
     """
     Cloud health check.
-    - If USE_CLOUD_LLM=0 → cloud is optional → return "ok"
-    - If USE_CLOUD_LLM=1 → require at least one provider healthy
+    - If USE_CLOUD_LLM=0 → cloud is administratively disabled → return "disabled"
+    - If USE_CLOUD_LLM=1 with no usable provider keys → return "unavailable"
+    - If USE_CLOUD_LLM=1 with usable providers → require at least one provider ping healthy
     """
-    if not USE_CLOUD_LLM:
-        logger.info("Cloud LLM disabled via USE_CLOUD_LLM=0; skipping health enforcement.")
-        return "ok"
+    if not is_cloud_admin_enabled():
+        logger.info("Cloud LLM disabled via USE_CLOUD_LLM=0; skipping cloud health probe.")
+        return "disabled"
+
+    usable_providers = await get_usable_providers()
+    if not usable_providers:
+        logger.info("Cloud LLM enabled but no usable cloud providers available.")
+        return "unavailable"
 
     now = time.time()
 
     for prov_name, adapter, _ in provider_chain:
+        if prov_name not in usable_providers:
+            continue
         if adapter is None:
             continue
 
@@ -1106,18 +1288,33 @@ class CloudLLMClient:
         model: Optional[str] = None,
         stream: bool = False,
         request_id: Optional[str] = None,
+        cloud_provider: Optional[str] = None,
+        allow_provider_fallback: bool = True,
     ):
         if stream:
             return generate_stream(
                 prompt=prompt,
                 system=system or "",
                 model=model,
+                cloud_provider=cloud_provider,
+                allow_provider_fallback=allow_provider_fallback,
             )
         return await generate(
             prompt=prompt,
             system=system or "",
             model=model,
+            cloud_provider=cloud_provider,
+            allow_provider_fallback=allow_provider_fallback,
         )
 
     async def health_check(self) -> bool:
         return await health_check() == "ok"
+
+    async def get_provider_usability(self) -> Dict[str, bool]:
+        return await get_provider_usability()
+
+    async def get_usable_providers(self) -> List[str]:
+        return await get_usable_providers()
+
+    async def has_usable_provider(self) -> bool:
+        return await cloud_backend_is_usable(respect_admin_flag=True)

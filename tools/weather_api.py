@@ -63,6 +63,26 @@ RATE_LIMIT_SECONDS = float(os.getenv("WEATHER_RATE_LIMIT_SECONDS", "1.0"))
 MAX_RETRIES = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+
+def _empty_weather_response(location: Optional[str] = None) -> Dict[str, Any]:
+    """Graceful fallback payload for weather-unavailable scenarios."""
+    return {
+        "location": location,
+        "forecast_date": None,
+        "condition": None,
+        "temperature_c": None,
+        "feels_like_c": None,
+        "humidity": None,
+        "wind_kph": None,
+        "air_quality_index": None,
+        "timestamp": None,
+        "temp_min_c": None,
+        "temp_max_c": None,
+        "has_rain": None,
+        "has_snow": None,
+        "precipitation_chance": None,
+    }
+
 # Geocoding cache with TTL (city.lower() -> (lat, lon, timestamp))
 # Using a dict that maintains insertion order (Python 3.7+)
 _geocode_cache: Dict[str, Tuple[float, float, float]] = {}
@@ -198,12 +218,16 @@ async def _make_request_raw(
     overall_start = time.monotonic()
     # request_id is automatically added to logs by logging configuration
 
+    unauthorized_seen = 0
+
     for attempt in range(MAX_RETRIES):
         # Reserve a key for the duration of this attempt so it isn't rotated out.
         try:
             async with key_manager.reserve_key("weather") as (idx, key):
                 if not key:
                     raise WeatherAPIError("Weather provider keys exhausted (service unavailable)")
+
+                logger.info("[WEATHER] using key index: %s", idx)
 
                 # Add API key to params
                 params_with_key = dict(params)
@@ -226,6 +250,7 @@ async def _make_request_raw(
                             "key_idx": idx,
                         },
                     )
+                    logger.info("[WEATHER] response status: %s (key index: %s)", resp.status_code, idx)
 
                     # SUCCESS
                     if resp.status_code == 200:
@@ -240,16 +265,18 @@ async def _make_request_raw(
                             }
                         )
                         # ----------------------------------
-                        # --- textual quota detection ---
+                        # Handle OpenWeather payload-level errors that may still arrive with HTTP 200.
                         if isinstance(data, dict):
+                            cod = str(data.get("cod", "")).strip().lower()
                             msg = (data.get("message") or "").lower()
-                            if "invalid api key" in msg or "unauthorized" in msg:
-                                reset_ts = int((datetime.now() + timedelta(days=30)).timestamp())
-                                details = (data.get("message") or "")[:1000]
-                                await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason=f"unauthorized | {details}")
-                                logger.warning("Weather key unauthorized (text) — marked exhausted", extra={"key_idx": idx})
-                                continue  # try next key
-                            if "limit" in msg or "quota" in msg:
+                            if cod in {"401", "403"} or "invalid api key" in msg or "unauthorized" in msg:
+                                unauthorized_seen += 1
+                                logger.warning(
+                                    "Weather key unauthorized (likely not activated or invalid) — skipping key",
+                                    extra={"key_idx": idx},
+                                )
+                                continue
+                            if cod == "429" or "limit" in msg or "quota" in msg:
                                 reset_ts = int((datetime.now() + timedelta(days=1)).timestamp())
                                 details = (data.get("message") or "")[:1000]
                                 await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason=f"quota | {details}")
@@ -271,13 +298,13 @@ async def _make_request_raw(
                         WEATHER_ATTEMPTS.observe(attempt + 1)
                         return data
 
-                    # UNAUTHORIZED / FORBIDDEN -> mark key exhausted and try another key
+                    # UNAUTHORIZED / FORBIDDEN -> do NOT exhaust; skip key and try another key
                     if resp.status_code in (401, 403):
-                        # mark exhausted (30 days by default for invalid/rotated keys)
-                        reset_ts = int((datetime.now() + timedelta(days=30)).timestamp())
-                        await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason="unauthorized")
-                        logger.warning("Weather key unauthorized — marked exhausted", extra={"key_idx": idx})
-                        # continue to outer loop to reserve/try another key
+                        unauthorized_seen += 1
+                        logger.warning(
+                            "Weather key unauthorized (likely not activated or invalid) — skipping key",
+                            extra={"key_idx": idx},
+                        )
                         continue
 
                     # RATE LIMIT / PAYMENT / QUOTA -> attempt to detect reset, else mark with default
@@ -349,6 +376,8 @@ async def _make_request_raw(
             raise WeatherAPIError("All weather keys exhausted or failed") from e
 
     # If we exit the attempts loop without success
+    if unauthorized_seen:
+        raise WeatherAPIError("All weather keys unauthorized or pending activation")
     raise WeatherAPIError(f"Max retries exceeded, last error: {last_exception}")
 
 # ----------------------------------------------------------------------
@@ -483,7 +512,7 @@ async def get_current_weather(
     location: str,
     units: str = "metric",
 ) -> Weather:
-    """Fetch current weather conditions using OneCall API."""
+    """Fetch current weather conditions using free-tier /data/2.5/weather."""
     start = time.monotonic()
 
     # TESTING bypass — return deterministic Weather object (no network)
@@ -509,24 +538,21 @@ async def get_current_weather(
 
         lat, lon = await _get_coordinates(location)
 
-        data = await _get_onecall(
-            lat,
-            lon,
-            units=units,
-            exclude="minutely,hourly,daily,alerts",
+        data = await _make_request(
+            "GET",
+            CURRENT_URL,
+            {"lat": lat, "lon": lon, "units": units},
         )
 
-        cur = data["current"]
-
-        # Convert wind speed to kph if needed (OneCall returns m/s in metric, mph in imperial)
-        wind_speed = cur.get("wind_speed", 0.0)
+        # Convert wind speed to kph if needed (/weather returns m/s in metric, mph in imperial)
+        wind_speed = data.get("wind", {}).get("speed", 0.0)
         if units == "metric":
             wind_kph = wind_speed * 3.6
         else:
             wind_kph = wind_speed * 1.60934
 
         # Determine weather condition
-        weather_list = cur.get("weather", [])
+        weather_list = data.get("weather", [])
         if not weather_list:
             raise WeatherAPIError("Missing 'weather' in current response")
         condition = weather_list[0].get("description", "Unknown").capitalize()
@@ -537,25 +563,27 @@ async def get_current_weather(
         has_rain = condition_id < 700 and condition_id >= 200 and "snow" not in condition_main
         has_snow = "snow" in condition_main or (600 <= condition_id < 700)
 
-        temp = cur["temp"]
+        main = data.get("main", {})
+        temp = main.get("temp")
+        if temp is None:
+            raise WeatherAPIError("Missing 'main.temp' in current response")
 
-        # For current weather, we don't have min/max; fallback to current temp
-        # (explicit fallback as requested)
-        temp_min = cur.get("temp", temp)
-        temp_max = cur.get("temp", temp)
+        temp_min = main.get("temp_min", temp)
+        temp_max = main.get("temp_max", temp)
 
         result = Weather(
             location=location,
             condition=condition,
             temperature_c=temp,
-            feels_like_c=cur["feels_like"],
-            humidity=cur["humidity"],
+            feels_like_c=main.get("feels_like", temp),
+            humidity=main.get("humidity", 0),
             wind_kph=round(wind_kph, 1),
-            timestamp=cur["dt"],
+            timestamp=data.get("dt"),
             temp_min_c=temp_min,
             temp_max_c=temp_max,
             has_rain=has_rain,
             has_snow=has_snow,
+            forecast_date=datetime.utcfromtimestamp(data.get("dt", int(time.time()))).strftime("%Y-%m-%d"),
         )
 
         # Fetch air quality separately (OneCall doesn't include it)
@@ -592,7 +620,7 @@ async def get_forecast(
     units: str = "metric",
 ) -> List[Weather]:
     """
-    Return weather forecast using OneCall daily forecast.
+    Return weather forecast using free-tier /data/2.5/forecast.
     Returns one Weather object per day.
     """
     start = time.monotonic()
@@ -630,53 +658,100 @@ async def get_forecast(
 
         lat, lon = await _get_coordinates(location)
 
-        data = await _get_onecall(
-            lat,
-            lon,
-            units=units,
-            exclude="minutely,hourly,current,alerts",
+        data = await _make_request(
+            "GET",
+            FORECAST_URL,
+            {"lat": lat, "lon": lon, "units": units},
         )
 
-        daily_list = data.get("daily", [])
-        if not daily_list:
-            raise WeatherAPIError("Missing 'daily' in OneCall response")
+        entries = data.get("list", [])
+        if not entries:
+            raise WeatherAPIError("Missing 'list' in forecast response")
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for item in entries:
+            ts = item.get("dt")
+            if ts:
+                day_key = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            else:
+                dt_txt = item.get("dt_txt")
+                if not dt_txt or len(dt_txt) < 10:
+                    continue
+                day_key = dt_txt[:10]
+            grouped.setdefault(day_key, []).append(item)
 
         daily_forecasts = []
-        for day in daily_list[:days]:
-            # Convert wind speed
-            wind_speed = day.get("wind_speed", 0.0)
+        for forecast_date in sorted(grouped.keys())[:days]:
+            day_items = grouped[forecast_date]
+            if not day_items:
+                continue
+
+            # Choose entry closest to local midday for condition/timestamp.
+            def _hour_dist(it: Dict[str, Any]) -> int:
+                dt_txt = it.get("dt_txt", "")
+                if len(dt_txt) >= 13:
+                    try:
+                        hour = int(dt_txt[11:13])
+                        return abs(hour - 12)
+                    except Exception:
+                        return 99
+                return 99
+
+            representative = min(day_items, key=_hour_dist)
+
+            temps = [i.get("main", {}).get("temp") for i in day_items if i.get("main", {}).get("temp") is not None]
+            temp_mins = [i.get("main", {}).get("temp_min") for i in day_items if i.get("main", {}).get("temp_min") is not None]
+            temp_maxs = [i.get("main", {}).get("temp_max") for i in day_items if i.get("main", {}).get("temp_max") is not None]
+            humidities = [i.get("main", {}).get("humidity") for i in day_items if i.get("main", {}).get("humidity") is not None]
+            feels = [i.get("main", {}).get("feels_like") for i in day_items if i.get("main", {}).get("feels_like") is not None]
+            winds = [i.get("wind", {}).get("speed") for i in day_items if i.get("wind", {}).get("speed") is not None]
+
+            weather_items = []
+            for i in day_items:
+                weather_items.extend(i.get("weather", []))
+            weather_entry = weather_items[0] if weather_items else {}
+            condition = weather_entry.get("description", "Unknown").capitalize()
+            condition_id = weather_entry.get("id", 0)
+            condition_main = weather_entry.get("main", "").lower()
+
+            has_snow = any(
+                ("snow" in str(w.get("main", "")).lower()) or (600 <= int(w.get("id", 0)) < 700)
+                for w in weather_items
+            )
+            has_rain = any(
+                (200 <= int(w.get("id", 0)) < 700) and ("snow" not in str(w.get("main", "")).lower())
+                for w in weather_items
+            ) or any((i.get("pop", 0) or 0) > 0 for i in day_items)
+
+            pop_values = [float(i.get("pop", 0) or 0) for i in day_items]
+            precipitation_chance = int(round(max(pop_values) * 100)) if pop_values else 0
+
+            wind_speed = (sum(winds) / len(winds)) if winds else 0.0
             if units == "metric":
                 wind_kph = wind_speed * 3.6
             else:
                 wind_kph = wind_speed * 1.60934
 
-            weather_entry = day["weather"][0] if day.get("weather") else {}
-            condition = weather_entry.get("description", "Unknown").capitalize()
-            condition_id = weather_entry.get("id", 0)
-            condition_main = weather_entry.get("main", "").lower()
+            base_temp = (sum(temps) / len(temps)) if temps else 0.0
+            temp_min = min(temp_mins) if temp_mins else base_temp
+            temp_max = max(temp_maxs) if temp_maxs else base_temp
+            feels_like = (sum(feels) / len(feels)) if feels else base_temp
+            humidity = int(round(sum(humidities) / len(humidities))) if humidities else 0
 
-            # Rain/snow detection
-            has_rain = condition_id < 700 and condition_id >= 200 and "snow" not in condition_main
-            has_snow = "snow" in condition_main or (600 <= condition_id < 700)
-
-            # Probability of precipitation (pop) — 0.0 to 1.0
-            pop_raw = day.get("pop", 0)
-            precipitation_chance = int(round(float(pop_raw) * 100))
-
-            # Date from timestamp
-            timestamp = day.get("dt")
-            forecast_date = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d") if timestamp else None
+            # Keep fallback condition if weather list was sparse.
+            if condition == "Unknown" and condition_id:
+                condition = str(condition_main or "Unknown").capitalize()
 
             w = Weather(
                 location=location,
                 condition=condition,
-                temperature_c=day["temp"]["day"],
-                feels_like_c=day.get("feels_like", {}).get("day", day["temp"]["day"]),
-                humidity=day["humidity"],
+                temperature_c=base_temp,
+                feels_like_c=feels_like,
+                humidity=humidity,
                 wind_kph=round(wind_kph, 1),
-                timestamp=timestamp,
-                temp_min_c=day["temp"]["min"],
-                temp_max_c=day["temp"]["max"],
+                timestamp=representative.get("dt"),
+                temp_min_c=temp_min,
+                temp_max_c=temp_max,
                 has_rain=has_rain,
                 has_snow=has_snow,
                 precipitation_chance=precipitation_chance,
@@ -706,7 +781,7 @@ async def get_forecast_for_date(
     location: str,
     travel_date: str,
     units: str = "metric",
-) -> Weather:
+) -> Any:
     """
     Return the forecast Weather for a specific travel date (YYYY-MM-DD).
 
@@ -722,16 +797,24 @@ async def get_forecast_for_date(
     Returns:
         Weather object enriched with temp_min_c, temp_max_c, has_rain, has_snow,
         precipitation_chance, and forecast_date fields.
+        If weather is unavailable across all keys, returns a structured empty dict.
     """
     try:
         forecasts = await get_forecast(location=location, days=5, units=units)
     except Exception as e:
-        # Catch any unexpected error (e.g., geocoding failure)
+        # Catch any unexpected error (e.g., all keys unauthorized, geocoding failure)
         logger.warning(
-            "get_forecast_for_date: unexpected error, falling back to current weather",
+            "get_forecast_for_date: forecast unavailable, falling back to current weather",
             extra={"error": str(e), "location": location}
         )
-        return await get_current_weather(location, units)
+        try:
+            return await get_current_weather(location, units)
+        except Exception as current_e:
+            logger.warning(
+                "get_forecast_for_date: current weather unavailable, returning empty weather response",
+                extra={"error": str(current_e), "location": location},
+            )
+            return _empty_weather_response(location)
 
     # AQI enrichment is optional to avoid duplicate API calls on every request.
     include_aqi = os.getenv("WEATHER_INCLUDE_AQI_IN_FORECAST", "0").lower() in ("1", "true", "yes", "on")
@@ -745,7 +828,14 @@ async def get_forecast_for_date(
 
     if not forecasts:
         logger.warning("get_forecast_for_date: no forecast entries returned, using current weather")
-        return await get_current_weather(location, units)
+        try:
+            return await get_current_weather(location, units)
+        except Exception as current_e:
+            logger.warning(
+                "get_forecast_for_date: no forecast and current weather unavailable, returning empty weather response",
+                extra={"error": str(current_e), "location": location},
+            )
+            return _empty_weather_response(location)
 
     try:
         target = datetime.strptime(travel_date, "%Y-%m-%d").date()

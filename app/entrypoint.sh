@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Optional pre-start actions:
-if [ "${LLM_PREWARM:-0}" = "1" ]; then
-  echo "Prewarming LLM..."
-  # Call local prewarm endpoint if your app exposes one
-  curl -sS "http://127.0.0.1:${PORT:-8000}/internal/prewarm" || true
+# Legacy note:
+# - LLM_PREWARM is deprecated and this script is not the primary runtime path
+#   for Docker images in this repository.
+# - Active prewarm behavior is controlled by PLANNER_PREWARM in api/app.py lifespan.
+if [ -n "${LLM_PREWARM:-}" ]; then
+  echo "Warning: LLM_PREWARM is deprecated; use PLANNER_PREWARM in backend runtime config." >&2
 fi
 
 # Exec the CMD (gunicorn) as PID 1

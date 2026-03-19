@@ -7,7 +7,6 @@
 #   - Improves testability and reuse outside FastAPI
 # Logging configuration still injects ContextVar request_id automatically
 # if set, but manual propagation guarantees consistency.
-import os
 import asyncio
 import logging
 import json
@@ -33,13 +32,14 @@ from core.circuit_breaker import AsyncCircuitBreaker, CircuitBreakerOpenError
 from core.retry import RetryConfig, async_retry
 from core.exceptions import LLMError
 from core.metrics import increment_llm_success, increment_llm_failure, increment_llm_cancelled
+from core.env_config import get_env_float, get_env_str
 
 # ----------------------------------------------------------------------
 # Environment and defaults
 # ----------------------------------------------------------------------
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "openhermes")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30.0"))   # default timeout in seconds
+OLLAMA_BASE_URL = get_env_str("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = get_env_str("OLLAMA_MODEL", "openhermes")
+OLLAMA_TIMEOUT = get_env_float("OLLAMA_TIMEOUT", 30.0)   # default timeout in seconds
 
 if not OLLAMA_MODEL:
     raise RuntimeError("OLLAMA_MODEL not configured")
@@ -589,7 +589,7 @@ async def generate(
 # Health check
 # ----------------------------------------------------------------------
 async def health_check() -> str:
-    print("HEALTH CHECK FILE:", __file__)
+    logger.debug("Ollama health check invoked")
     """
     Check if Ollama is reachable AND configured model exists.
     """

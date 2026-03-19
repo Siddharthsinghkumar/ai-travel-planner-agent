@@ -46,6 +46,7 @@ from core.circuit_breaker import AsyncCircuitBreaker as CircuitBreaker
 from core.metrics import LLM_REQUESTS, LLM_LATENCY, increment as _increment_metric
 
 logger = logging.getLogger(__name__)
+_legacy_runtime_notice_logged = False
 
 # Custom exceptions for better error handling
 class CircuitOpenError(Exception):
@@ -101,18 +102,27 @@ _init_lock = asyncio.Lock()
 async def init_llm_client() -> "AsyncLLMClient":
     """
     Async‑safe singleton initializer. Returns the global LLM client instance.
+    Legacy compatibility initializer.
+
     Reads configuration from environment variables:
         CLOUD_PROVIDER      - "openai", "anthropic", etc. (default "openai")
         OPENAI_API_KEY      - required if CLOUD_PROVIDER == "openai"
         ANTHROPIC_API_KEY   - required if CLOUD_PROVIDER == "anthropic"
-        fucking add gemini from the job v2 project to support multi key rotation so no pay 
+        (modern runtime path uses key-manager pools and provider adapters instead)
         CLOUD_BASE_URL      - optional base URL override for cloud API
         OLLAMA_BASE_URL     - required (local Ollama endpoint)
     Raises ValueError if required variables are missing.
     """
-    global _client_instance
+    global _client_instance, _legacy_runtime_notice_logged
     async with _init_lock:
-        if _client_instance is None:
+            if _client_instance is None:
+                if not _legacy_runtime_notice_logged:
+                    logger.info(
+                        "legacy_async_llm_client_enabled: compatibility initializer active; "
+                        "modern request routing remains router + cloud adapters + key-manager pools."
+                    )
+                    _legacy_runtime_notice_logged = True
+
             # Read provider and keys
             cloud_provider = os.getenv("CLOUD_PROVIDER", "openai").lower()
             ollama_base_url = os.getenv("OLLAMA_BASE_URL")

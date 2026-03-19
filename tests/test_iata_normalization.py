@@ -23,7 +23,12 @@ def test_parse_intent_iata_codes():
     assert intent.destination_iata == "BOM"
 
 @pytest.mark.asyncio
-async def test_origin_override():
+async def test_origin_override(monkeypatch):
+    async def fake_handoff_url(*args, **kwargs):
+        return "https://example.com/checkout"
+
+    monkeypatch.setattr("agents.planner_agent._build_booking_handoff_url_safe", fake_handoff_url)
+
     # Create a minimal fake flight result that matches the real Flight model.
     fake_flight = Flight(
         flight_no="XX123",
@@ -35,7 +40,7 @@ async def test_origin_override():
         stops=0,
         layover_info="",
         baggage="Check airline",
-        booking_token="fake_token",
+        booking_token=None,
         shareable_link="https://google.com",
         carbon_emissions_g=50000
     )

@@ -89,7 +89,7 @@ async def fetch_booking_options(booking_token: str) -> Optional[List[Dict[str, A
                 "gl": "in",
                 "currency": "INR",
             }
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=2.0) as client:
                 resp = await client.get(SERPAPI_BOOKING_ENDPOINT, params=params)
 
             if resp.status_code != 200:
@@ -218,7 +218,7 @@ async def build_booking_handoff_url(
         if resolved:
             logger.info("Handoff URL resolved via SerpAPI booking_token (cheapest option)")
             return resolved
-        logger.warning("booking_token present but resolution failed; falling through to shareable_link")
+        logger.info("booking_token resolution unavailable; falling through to shareable_link/google fallback")
 
     # ── Priority 2: shareable_link ───────────────────────────────────────
     shareable_link = flight.get("shareable_link")

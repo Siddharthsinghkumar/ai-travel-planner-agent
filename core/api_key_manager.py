@@ -18,16 +18,17 @@ from datetime import datetime, UTC, timedelta
 from pathlib import Path
 from dotenv import dotenv_values, find_dotenv
 from typing import Dict, List, Optional, Tuple, Any, Callable, Awaitable, Union
+from core.env_config import get_env_int, get_env_str
 
 logger = logging.getLogger(__name__)
 
 # File path (override with env if you want)
-STATE_FILE = Path(os.getenv("KEY_STATE_FILE", "data/api_key_state.json"))
-RELOAD_INTERVAL_SECONDS = int(os.getenv("API_KEY_RELOAD_INTERVAL", "86400"))  # 24h (for full env reload)
+STATE_FILE = Path(get_env_str("KEY_STATE_FILE", "data/api_key_state.json"))
+RELOAD_INTERVAL_SECONDS = get_env_int("API_KEY_RELOAD_INTERVAL", 86400)  # 24h (for full env reload)
 # How often to refresh environment variables in the background
-REFRESH_INTERVAL = int(os.getenv("KEY_REFRESH_INTERVAL", "30"))  # seconds
+REFRESH_INTERVAL = get_env_int("KEY_REFRESH_INTERVAL", 30)  # seconds
 # Lockfile path for multi‑process safety (override via env)
-LOCKFILE_PATH = os.getenv("KEY_REFRESH_LOCKFILE", "/tmp/llm_key_refresh.lock")
+LOCKFILE_PATH = get_env_str("KEY_REFRESH_LOCKFILE", "/tmp/llm_key_refresh.lock")
 
 # policy mapping for fallback exhaustion durations
 POLICIES = {

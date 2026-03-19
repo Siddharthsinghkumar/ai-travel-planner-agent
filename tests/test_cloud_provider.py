@@ -4,6 +4,12 @@ import types
 
 import agents.cloud_llm as cloud_llm
 
+
+@pytest.fixture(autouse=True)
+def _enable_cloud_by_default(monkeypatch):
+    monkeypatch.setenv("USE_CLOUD_LLM", "1")
+
+
 class FakeAdapter:
     def __init__(self, name, response=None, raise_on_call=False):
         self.provider = name
@@ -65,3 +71,70 @@ async def test_generate_stream_fallback_before_first_token():
         collected.append(chunk)
     joined = "".join(collected)
     assert "openai-stream" in joined
+
+
+@pytest.mark.asyncio
+async def test_provider_usability_gemini_only(monkeypatch):
+    gem = FakeAdapter("gemini", response="ok")
+    oai = FakeAdapter("openai", response="ok")
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("gemini", gem, (Exception,)), ("openai", oai, (Exception,))])
+
+    async def fake_status():
+        return {
+            "gemini": [{"active": True, "pending_clear": False, "exhausted_until": None}],
+            "openai": [{"active": False, "pending_clear": False, "exhausted_until": None}],
+        }
+
+    monkeypatch.setattr(cloud_llm.key_manager, "get_status", fake_status)
+
+    usability = await cloud_llm.get_provider_usability()
+    usable = await cloud_llm.get_usable_providers()
+    assert usability["gemini"] is True
+    assert usability["openai"] is False
+    assert usable == ["gemini"]
+
+
+@pytest.mark.asyncio
+async def test_provider_usability_none_available(monkeypatch):
+    gem = FakeAdapter("gemini", response="ok")
+    oai = FakeAdapter("openai", response="ok")
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("gemini", gem, (Exception,)), ("openai", oai, (Exception,))])
+
+    async def fake_status():
+        return {
+            "gemini": [{"active": False, "pending_clear": False, "exhausted_until": None}],
+            "openai": [{"active": False, "pending_clear": False, "exhausted_until": None}],
+        }
+
+    monkeypatch.setattr(cloud_llm.key_manager, "get_status", fake_status)
+
+    assert await cloud_llm.get_usable_providers() == []
+    assert await cloud_llm.cloud_backend_is_usable() is False
+
+
+@pytest.mark.asyncio
+async def test_cloud_backend_usability_respects_admin_flag(monkeypatch):
+    gem = FakeAdapter("gemini", response="ok")
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("gemini", gem, (Exception,))])
+
+    async def fake_status():
+        return {
+            "gemini": [{"active": True, "pending_clear": False, "exhausted_until": None}],
+        }
+
+    monkeypatch.setattr(cloud_llm.key_manager, "get_status", fake_status)
+    monkeypatch.setenv("USE_CLOUD_LLM", "0")
+
+    assert await cloud_llm.cloud_backend_is_usable() is False
+    assert await cloud_llm.cloud_backend_is_usable(respect_admin_flag=False) is True
+
+
+def test_cloud_admin_enablement_default_and_override(monkeypatch):
+    monkeypatch.delenv("USE_CLOUD_LLM", raising=False)
+    assert cloud_llm.is_cloud_admin_enabled() is True
+
+    monkeypatch.setenv("USE_CLOUD_LLM", "0")
+    assert cloud_llm.is_cloud_admin_enabled() is False
+
+    monkeypatch.setenv("USE_CLOUD_LLM", "true")
+    assert cloud_llm.is_cloud_admin_enabled() is True

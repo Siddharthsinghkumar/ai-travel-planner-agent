@@ -4,13 +4,20 @@ import time
 import uuid
 import asyncio
 import inspect
-from typing import Optional, Union, AsyncGenerator, Dict, Any
+from typing import Optional, Union, AsyncGenerator, Dict, Any, List
 
 # Import async clients (assumed to be fully async, with health checks and streaming)
 from agents.ollama_client import OLLAMA_TIMEOUT, OllamaClient, OllamaError
 from agents.cloud_llm import CloudLLMClient, CloudLLMError
 # Import dynamic mode/priority from orchestrator
-from core.llm_mode import get_llm_mode_and_priority
+from core.llm_mode import (
+    get_effective_cloud_provider,
+    get_llm_mode_and_priority,
+    LLM_MODE_CLOUD_FIRST,
+    LLM_MODE_CLOUD_ONLY,
+    LLM_MODE_OLLAMA_FIRST,
+    LLM_MODE_OLLAMA_ONLY,
+)
 # Import metrics system (if available; otherwise replace with no-op)
 try:
     import core.metrics as metrics
@@ -47,16 +54,37 @@ class ProviderAsyncGen:
 
 
 # Environment configuration
-LOCAL_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", str(OLLAMA_TIMEOUT)))
-CLOUD_TIMEOUT = float(os.getenv("CLOUD_LLM_TIMEOUT", "60"))
-ROUTER_TIMEOUT = float(os.getenv("ROUTER_TIMEOUT", "90"))   # global timeout for entire generate call
+LOCAL_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", str(OLLAMA_TIMEOUT)))  # seconds
+CLOUD_TIMEOUT = float(os.getenv("CLOUD_LLM_TIMEOUT", "60"))  # seconds
+ROUTER_TIMEOUT = float(os.getenv("ROUTER_TIMEOUT", "90"))  # seconds; routing stage budget
 
 # Module logger
 logger = logging.getLogger(__name__)
 
 class AllBackendsFailed(Exception):
     """Raised when no LLM backend can successfully generate a response."""
-    pass
+    def __init__(
+        self,
+        message: str = "All LLM backends failed",
+        *,
+        mode: Optional[str] = None,
+        effective_mode: Optional[str] = None,
+        cloud_provider: Optional[str] = None,
+        failures: Optional[List[Dict[str, str]]] = None,
+    ):
+        super().__init__(message)
+        self.mode = mode
+        self.effective_mode = effective_mode
+        self.cloud_provider = cloud_provider
+        self.failures = failures or []
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "effective_mode": self.effective_mode,
+            "cloud_provider": self.cloud_provider,
+            "failures": self.failures,
+        }
 
 class LLMRouter:
     """
@@ -72,6 +100,45 @@ class LLMRouter:
     def __init__(self, ollama_client: OllamaClient, cloud_client: Optional[CloudLLMClient] = None):
         self.ollama = ollama_client
         self.cloud = cloud_client
+
+    @staticmethod
+    def derive_effective_mode(requested_mode: str, cloud_available: bool, ollama_available: bool) -> str:
+        mode = (requested_mode or LLM_MODE_OLLAMA_FIRST).lower()
+        if cloud_available and not ollama_available:
+            return LLM_MODE_CLOUD_ONLY
+        if ollama_available and not cloud_available:
+            return LLM_MODE_OLLAMA_ONLY
+        return mode
+
+    async def _is_cloud_available(self) -> bool:
+        if self.cloud is None:
+            return False
+        has_usable_provider = getattr(self.cloud, "has_usable_provider", None)
+        if callable(has_usable_provider):
+            try:
+                probe = has_usable_provider()
+                if inspect.isawaitable(probe):
+                    return bool(await asyncio.wait_for(probe, timeout=1.0))
+                return bool(probe)
+            except Exception:
+                logger.debug("Cloud provider usability probe failed", exc_info=True)
+                return False
+        return True
+
+    async def _is_ollama_available(self) -> bool:
+        if self.ollama is None:
+            return False
+        health_check = getattr(self.ollama, "health_check", None)
+        if callable(health_check):
+            try:
+                probe = health_check()
+                if inspect.isawaitable(probe):
+                    return bool(await asyncio.wait_for(probe, timeout=1.0))
+                return bool(probe)
+            except Exception:
+                logger.debug("Ollama availability probe failed", exc_info=True)
+                return False
+        return True
 
     async def generate(
         self,
@@ -136,21 +203,29 @@ class LLMRouter:
         """Internal routing logic."""
         # Get mode and priority once at the beginning
         mode, priority = await get_llm_mode_and_priority()
-        # Normalize for internal use
-        mode = (mode or "hybrid").lower()
+        requested_mode = (mode or LLM_MODE_OLLAMA_FIRST).lower()
         priority = (priority or "local-first").lower()
+        selected_cloud_provider = get_effective_cloud_provider()
+
+        cloud_available, ollama_available = await asyncio.gather(
+            self._is_cloud_available(),
+            self._is_ollama_available(),
+        )
+        mode = self.derive_effective_mode(requested_mode, cloud_available, ollama_available)
 
         # Define backend order based on current mode/priority
         backends = self._get_backend_order(mode, priority)
+        allow_cloud_provider_fallback = self._allow_cloud_provider_fallback(mode)
 
         # Explicitly check if mode requires a backend that is not configured
-        if mode == "cloud" and self.cloud is None:
+        if mode == LLM_MODE_CLOUD_ONLY and self.cloud is None:
             raise RuntimeError("LLM_MODE=cloud but cloud client not configured")
-        if mode == "local" and self.ollama is None:
+        if mode == LLM_MODE_OLLAMA_ONLY and self.ollama is None:
             raise RuntimeError("LLM_MODE=local but local client not configured")
 
         # Attempt backends in order
         last_error = None
+        failure_details: List[Dict[str, str]] = []
         for idx, backend_name in enumerate(backends):
             if backend_name == "local":
                 client = self.ollama
@@ -169,19 +244,36 @@ class LLMRouter:
 
             # No explicit health check; rely on client's circuit breaker and retries
 
-            # Attempt the call with timeout
+                # Attempt the call with timeout
             try:
                 start = time.monotonic()
                 # The client's generate method should already be wrapped with circuit breaker and retries
                 if stream:
                     # Get the async generator from client
-                    gen_candidate = client.generate(prompt, system=system, model=backend_model, stream=True)
+                    if backend_name == "cloud":
+                        gen_candidate = client.generate(
+                            prompt,
+                            system=system,
+                            model=backend_model,
+                            stream=True,
+                            cloud_provider=selected_cloud_provider,
+                            allow_provider_fallback=allow_cloud_provider_fallback,
+                        )
+                    else:
+                        gen_candidate = client.generate(
+                            prompt,
+                            system=system,
+                            model=backend_model,
+                            stream=True,
+                        )
 
                     # If the client returned a coroutine (most clients that `return agen`
                     # inside an `async def` will do this), await it to get the async generator.
                     if inspect.iscoroutine(gen_candidate):
                         try:
                             gen = await gen_candidate
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as e:
                             logger.warning(f"First chunk from {backend_label} failed (couldn't get generator)", extra={
                                 "backend": backend_label,
@@ -191,6 +283,9 @@ class LLMRouter:
                             metrics.increment("llm.backend.first_chunk_failure", tags={"backend": backend_label})
                             metrics.increment("llm.router.stream_failure", tags={"backend": backend_label})
                             last_error = e
+                            failure_details.append(
+                                self._build_failure_detail(backend_label, e, "stream_init")
+                            )
                             continue
                     else:
                         gen = gen_candidate
@@ -198,6 +293,8 @@ class LLMRouter:
                     # gen should now be an async generator. Try to get the first chunk.
                     try:
                         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+                    except asyncio.CancelledError:
+                        raise
                     except (asyncio.TimeoutError, Exception) as e:
                         logger.warning(f"First chunk from {backend_label} failed", extra={
                             "backend": backend_label,
@@ -207,6 +304,9 @@ class LLMRouter:
                         metrics.increment("llm.backend.first_chunk_failure", tags={"backend": backend_label})
                         metrics.increment("llm.router.stream_failure", tags={"backend": backend_label})
                         last_error = e
+                        failure_details.append(
+                            self._build_failure_detail(backend_label, e, "stream_first_chunk")
+                        )
                         # Close the generator to avoid leaks
                         try:
                             await gen.aclose()
@@ -237,10 +337,23 @@ class LLMRouter:
 
                 else:
                     # Non-streaming: wait for full response with timeout
-                    result = await asyncio.wait_for(
-                        client.generate(prompt, system=system, model=backend_model, stream=False),
-                        timeout=timeout
-                    )
+                    if backend_name == "cloud":
+                        generate_call = client.generate(
+                            prompt,
+                            system=system,
+                            model=backend_model,
+                            stream=False,
+                            cloud_provider=selected_cloud_provider,
+                            allow_provider_fallback=allow_cloud_provider_fallback,
+                        )
+                    else:
+                        generate_call = client.generate(
+                            prompt,
+                            system=system,
+                            model=backend_model,
+                            stream=False,
+                        )
+                    result = await asyncio.wait_for(generate_call, timeout=timeout)
                     latency = time.monotonic() - start
                     logger.info("LLM backend success", extra={
                         "backend": backend_label,
@@ -253,12 +366,20 @@ class LLMRouter:
                         return {
                             "response": result,
                             "backend": backend_label,
-                            "mode": mode,
+                            "mode": requested_mode,
+                            "effective_mode": mode,
+                            "cloud_provider": selected_cloud_provider if backend_label == "cloud" else None,
                             "escalated": (idx > 0),  # True if not first attempted backend
                             "request_id": request_id
                         }
                     return result
 
+            except asyncio.CancelledError:
+                logger.info(
+                    "LLM request cancelled",
+                    extra={"backend": backend_label, "request_id": request_id}
+                )
+                raise
             except asyncio.TimeoutError:
                 logger.warning("LLM backend timeout", extra={
                     "backend": backend_label,
@@ -267,6 +388,9 @@ class LLMRouter:
                 })
                 metrics.increment("llm.backend.timeout", tags={"backend": backend_label})
                 last_error = TimeoutError(f"{backend_label} timeout after {timeout}s")
+                failure_details.append(
+                    self._build_failure_detail(backend_label, last_error, "timeout")
+                )
                 continue
             except (OllamaError, CloudLLMError) as e:
                 # These are expected errors from the clients (already include circuit breaker failures)
@@ -277,6 +401,7 @@ class LLMRouter:
                 })
                 metrics.increment("llm.backend.error", tags={"backend": backend_label})
                 last_error = e
+                failure_details.append(self._build_failure_detail(backend_label, e, "backend_error"))
                 continue
             except Exception as e:
                 # Unexpected errors
@@ -287,12 +412,19 @@ class LLMRouter:
                 })
                 metrics.increment("llm.backend.unexpected_error", tags={"backend": backend_label})
                 last_error = e
+                failure_details.append(self._build_failure_detail(backend_label, e, "unexpected"))
                 continue
 
         if stream:
             metrics.increment("llm.router.stream_failure", tags={"reason": "all_backends_failed"})
         # If we get here, all backends failed
-        raise AllBackendsFailed("All LLM backends failed") from last_error
+        raise AllBackendsFailed(
+            "All LLM backends failed",
+            mode=requested_mode,
+            effective_mode=mode,
+            cloud_provider=selected_cloud_provider,
+            failures=failure_details,
+        ) from last_error
 
     def _get_backend_order(self, mode: str, priority: str) -> list:
         """
@@ -301,15 +433,82 @@ class LLMRouter:
             mode: normalized mode ("local", "cloud", or "hybrid")
             priority: normalized priority ("local-first" or "cloud-first")
         """
-        if mode == "cloud":
+        if mode == LLM_MODE_CLOUD_ONLY:
             return ["cloud"]
-        if mode == "local":
+        if mode == LLM_MODE_OLLAMA_ONLY:
             return ["local"]
-        # hybrid mode
-        if priority == "cloud-first":
+        if mode == LLM_MODE_CLOUD_FIRST or priority == "cloud-first":
             return ["cloud", "local"]
-        # default: local-first
         return ["local", "cloud"]
+
+    @staticmethod
+    def _allow_cloud_provider_fallback(mode: str) -> bool:
+        if mode == LLM_MODE_CLOUD_ONLY:
+            return os.getenv("CLOUD_ONLY_ALLOW_PROVIDER_FALLBACK", "1") == "1"
+        return True
+
+    @staticmethod
+    def _classify_error(error: Exception) -> str:
+        if isinstance(error, TimeoutError) or isinstance(error, asyncio.TimeoutError):
+            return "timeout"
+
+        message = str(error).lower()
+
+        if "no available keys for service" in message or "no usable keys for provider" in message:
+            return "provider_no_active_key"
+
+        if (
+            "insufficient_quota" in message
+            or "quota exceeded" in message
+            or "quota has been exceeded" in message
+            or "quota" in message
+        ):
+            return "provider_quota_exhausted"
+
+        if (
+            "billing" in message
+            or "hard limit" in message
+            or "credit" in message
+            or "payment required" in message
+            or "account not active" in message
+        ):
+            return "provider_billing_blocked"
+
+        if "rate limit" in message or "too many requests" in message or "429" in message:
+            return "provider_rate_limited"
+
+        if (
+            "authentication" in message
+            or "unauthorized" in message
+            or "invalid api key" in message
+            or "permission denied" in message
+            or "forbidden" in message
+        ):
+            return "provider_auth_failed"
+
+        if (
+            "connection" in message
+            or "unreachable" in message
+            or "name resolution" in message
+            or "dns" in message
+            or "network" in message
+            or "temporarily unavailable" in message
+        ):
+            return "provider_unreachable"
+
+        if "circuit breaker open" in message or "circuit breaker is open" in message:
+            return "circuit_open"
+        if "cancel" in message:
+            return "cancelled"
+        return "routing_failed"
+
+    def _build_failure_detail(self, backend: str, error: Exception, stage: str) -> Dict[str, str]:
+        return {
+            "backend": backend,
+            "stage": stage,
+            "reason": self._classify_error(error),
+            "error": str(error),
+        }
 
     async def _stream_with_timeout(
         self,

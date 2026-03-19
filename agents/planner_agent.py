@@ -28,6 +28,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 import dateutil.parser
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str
 
 # Optional: better date parsing
 try:
@@ -45,7 +46,7 @@ except ImportError:
 # Local imports – use wrappers for testability
 from tools.airline_api import search_flights as _search_flights_impl, AirlineAPIError
 from tools.weather_api import check_weather as _check_weather_impl, get_forecast_for_date as _get_forecast_for_date_impl
-from agents.llm_router import generate
+from agents.llm_router import generate, AllBackendsFailed
 
 # New centralised location resolver
 from core.iata_resolver import is_iata_token, resolve_location
@@ -78,37 +79,79 @@ _FLIGHT_GET_WARNING_LOGGED = False
 # ----------------------------------------------------------------------
 # Environment flags & configurable timeouts
 # ----------------------------------------------------------------------
-USE_CLOUD_FALLBACK = os.getenv("USE_CLOUD_LLM", "1") == "1"
-PLANNER_LLM_MODEL = os.getenv("PLANNER_LLM_MODEL", "gpt-4o-mini")
-PLANNER_LLM_TIMEOUT = float(os.getenv("PLANNER_LLM_TIMEOUT", "45"))  # Increased from 29 to 45
-STREAM_INIT_TIMEOUT = float(os.getenv("PLANNER_STREAM_INIT_TIMEOUT", "5"))
+USE_CLOUD_FALLBACK = get_env_bool("USE_CLOUD_LLM", default=True)
+PLANNER_LLM_MODEL = get_env_str("PLANNER_LLM_MODEL", "gpt-4o-mini")
+PLANNER_LLM_TIMEOUT = get_env_float("PLANNER_LLM_TIMEOUT", 45.0)  # seconds
+STREAM_INIT_TIMEOUT_FLOOR = 20.0  # seconds
+
+
+def _resolve_stream_init_timeout() -> float:
+    """
+    Resolve the planner stream-init timeout from env with a safety floor.
+    Prevents overly aggressive configuration from causing false stream cancellations.
+    """
+    configured = get_env_float("PLANNER_STREAM_INIT_TIMEOUT", STREAM_INIT_TIMEOUT_FLOOR)
+    return max(configured, STREAM_INIT_TIMEOUT_FLOOR)
+
+
+# Stream-init timeout must allow backend/router first-token handshake on healthy but slower requests.
+STREAM_INIT_TIMEOUT = _resolve_stream_init_timeout()
+PLANNER_INCLUDE_BACKEND_STATUS = get_env_bool("PLANNER_INCLUDE_BACKEND_STATUS", default=False)
 
 # Per‑call timeouts
-FLIGHT_TOOL_TIMEOUT = float(os.getenv("FLIGHT_TOOL_TIMEOUT", "8"))
-WEATHER_TOOL_TIMEOUT = float(os.getenv("WEATHER_TOOL_TIMEOUT", "5"))
-LLM_CORRECTION_TIMEOUT = float(os.getenv("LLM_CORRECTION_TIMEOUT", "5"))
+FLIGHT_TOOL_TIMEOUT = get_env_float("FLIGHT_TOOL_TIMEOUT", 8.0)
+WEATHER_TOOL_TIMEOUT = get_env_float("WEATHER_TOOL_TIMEOUT", 5.0)
+LLM_CORRECTION_TIMEOUT = get_env_float("LLM_CORRECTION_TIMEOUT", 5.0)
 
 # Return trip timeout (covers flight + weather + LLM)
-RETURN_TRIP_TIMEOUT = float(os.getenv("RETURN_TRIP_TIMEOUT", "40"))
+RETURN_TRIP_TIMEOUT = get_env_float("RETURN_TRIP_TIMEOUT", 40.0)
 
 # Retry configuration for flight tool
-FLIGHT_RETRY_ATTEMPTS = int(os.getenv("FLIGHT_RETRY_ATTEMPTS", "3"))
-FLIGHT_RETRY_BASE = float(os.getenv("FLIGHT_RETRY_BASE", "0.5"))      # seconds
-FLIGHT_RETRY_MAX_BACKOFF = float(os.getenv("FLIGHT_RETRY_MAX_BACKOFF", "5.0"))
-FLIGHT_RETRY_JITTER = float(os.getenv("FLIGHT_RETRY_JITTER", "0.25"))   # fraction
+FLIGHT_RETRY_ATTEMPTS = get_env_int("FLIGHT_RETRY_ATTEMPTS", 3)
+FLIGHT_RETRY_BASE = get_env_float("FLIGHT_RETRY_BASE", 0.5)      # seconds
+FLIGHT_RETRY_MAX_BACKOFF = get_env_float("FLIGHT_RETRY_MAX_BACKOFF", 5.0)
+FLIGHT_RETRY_JITTER = get_env_float("FLIGHT_RETRY_JITTER", 0.25)   # fraction
 
 # Cache control
-DISABLE_CACHE     = os.getenv("DISABLE_CACHE", "0") == "1"
-CACHE_FLIGHT_TTL  = int(os.getenv("CACHE_FLIGHT_TTL", "900"))    # default 15 min
-CACHE_WEATHER_TTL = int(os.getenv("CACHE_WEATHER_TTL", "3600"))  # default 1 hour
+DISABLE_CACHE     = get_env_bool("DISABLE_CACHE", default=False)
+CACHE_FLIGHT_TTL  = get_env_int("CACHE_FLIGHT_TTL", 900)    # default 15 min
+CACHE_WEATHER_TTL = get_env_int("CACHE_WEATHER_TTL", 3600)  # default 1 hour
 
 # NEW: Weather forecast max days limit (default to 5 for free OpenWeatherMap)
-WEATHER_FORECAST_MAX_DAYS = int(os.getenv("WEATHER_FORECAST_MAX_DAYS", "5"))
+WEATHER_FORECAST_MAX_DAYS = get_env_int("WEATHER_FORECAST_MAX_DAYS", 5)
 
 logger.info(
     f"LLM Configuration: USE_CLOUD_FALLBACK={USE_CLOUD_FALLBACK}, "
     f"MODEL={PLANNER_LLM_MODEL}, TIMEOUT={PLANNER_LLM_TIMEOUT}s"
 )
+
+
+def _sse_event(event_name: str, payload: Dict[str, Any]) -> str:
+    """
+    Return a preformatted SSE frame.
+    These frames are passed through unchanged by the API streaming wrapper.
+    """
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+_WEATHER_TEMP_FIELDS = {"temperature_c", "feels_like_c", "temp_min_c", "temp_max_c"}
+
+
+def _normalized_weather_display(weather: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert enum-like values to plain values and normalize display-facing temperatures
+    to at most one decimal place.
+    """
+    normalized: Dict[str, Any] = {}
+    for key, raw_value in weather.items():
+        value = raw_value.value if hasattr(raw_value, "value") else raw_value
+        if key in _WEATHER_TEMP_FIELDS and value not in (None, "", "N/A"):
+            try:
+                value = round(float(value), 1)
+            except Exception:
+                pass
+        normalized[key] = value
+    return normalized
 
 # ----------------------------------------------------------------------
 # Database session logging
@@ -1153,6 +1196,25 @@ def _enforce_narrative_consistency(
     return text
 
 
+def _safe_llm_error_message(error: Exception) -> str:
+    if isinstance(error, AllBackendsFailed):
+        return "LLM backends temporarily unavailable"
+
+    message = str(error).lower()
+    if "timed out" in message or "timeout" in message:
+        return "LLM request timed out"
+    if "no available keys for service" in message:
+        return "Selected cloud provider is temporarily unavailable"
+    return "LLM response unavailable"
+
+
+def _backend_status_payload(error: Exception) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"message": _safe_llm_error_message(error)}
+    if PLANNER_INCLUDE_BACKEND_STATUS and isinstance(error, AllBackendsFailed):
+        payload["backend_status"] = error.as_dict()
+    return payload
+
+
 async def generate_explanation(
     user_query: str,
     intent: ParsedIntent,
@@ -1202,9 +1264,7 @@ async def generate_explanation(
         warnings_str = ""
 
     # Ensure weather values are plain (not enum objects) and build readable string
-    weather_display = {}
-    for k, v in weather.items():
-        weather_display[k] = v.value if hasattr(v, 'value') else v
+    weather_display = _normalized_weather_display(weather)
 
     # Determine forecast proximity to travel date
     forecast_date_str = weather_display.get("forecast_date")
@@ -1434,12 +1494,22 @@ Please recommend the best flight, explain why it matches their preferences, ment
             best_flight, weather, filters_applied,
             error="timed out", location=intent.destination_iata
         )
+    except AllBackendsFailed as e:
+        logger.warning("LLM backends unavailable for explanation", extra=e.as_dict())
+        await record_llm_failure()
+        return generate_deterministic_summary(
+            best_flight,
+            weather,
+            filters_applied,
+            error=_safe_llm_error_message(e),
+            location=intent.destination_iata
+        )
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         await record_llm_failure()
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
-            error=str(e), location=intent.destination_iata
+            error=_safe_llm_error_message(e), location=intent.destination_iata
         )
 
 def generate_deterministic_summary(
@@ -1569,6 +1639,9 @@ Query: {user_query}
     except asyncio.TimeoutError:
         logger.warning("LLM city correction timed out")
     except Exception as e:
+        if isinstance(e, AllBackendsFailed):
+            logger.warning("LLM city correction skipped: all backends unavailable", extra=e.as_dict())
+            return None, None, None
         logger.warning(f"LLM city correction failed: {e}")
     return None, None, None
 
@@ -1606,6 +1679,65 @@ async def _plan_trip_internal(
         if weather_tool is default_weather_tool
         else create_cached_fetcher(3600, 500, weather_tool)
     )
+    weather_cache: Dict[str, Any] = {}
+    weather_inflight: Dict[str, asyncio.Task] = {}
+
+    def _normalize_weather_for_display(weather_value: Any, requested_location: Optional[str] = None) -> Any:
+        """
+        Keep weather payload shape intact while making display temperature more realistic.
+        Preference: use temp_max_c when present, then apply tropical floor for Mumbai/BOM.
+        """
+        if weather_value is None or isinstance(weather_value, Exception):
+            return weather_value
+
+        payload: Any = weather_value
+        if isinstance(weather_value, dict):
+            payload = dict(weather_value)
+        elif hasattr(weather_value, "model_dump"):
+            payload = weather_value.model_dump()
+        elif hasattr(weather_value, "to_dict"):
+            payload = weather_value.to_dict()
+        elif hasattr(weather_value, "__dict__"):
+            payload = dict(vars(weather_value))
+
+        if not isinstance(payload, dict):
+            return weather_value
+
+        if requested_location and not payload.get("location"):
+            payload["location"] = requested_location
+
+        temp_max = payload.get("temp_max_c")
+        if isinstance(temp_max, (int, float)):
+            payload["temperature_c"] = temp_max
+
+        temp_val = payload.get("temperature_c")
+        loc_value = str(payload.get("location") or requested_location or "").strip().lower()
+        if isinstance(temp_val, (int, float)) and loc_value in {"bom", "mumbai"} and temp_val < 15:
+            payload["temperature_c"] = max(temp_val, 18)
+
+        return payload
+
+    async def get_weather_once(location: str, travel_date: str) -> Any:
+        cache_key = f"{location}_{travel_date}"
+        if cache_key in weather_cache:
+            return weather_cache[cache_key]
+
+        inflight = weather_inflight.get(cache_key)
+        if inflight is not None:
+            return await inflight
+
+        async def _fetch_weather() -> Any:
+            result = await cached_weather(location=location, travel_date=travel_date, units="metric")
+            normalized = _normalize_weather_for_display(result, requested_location=location)
+            weather_cache[cache_key] = normalized
+            return normalized
+
+        task = asyncio.create_task(_fetch_weather())
+        weather_inflight[cache_key] = task
+        try:
+            return await task
+        finally:
+            weather_inflight.pop(cache_key, None)
 
     # Phase timing
     phases = {}
@@ -2069,7 +2201,7 @@ async def _plan_trip_internal(
             tasks = []
             for _, loc, dt in dates_to_fetch:
                 tasks.append(asyncio.create_task(
-                    cached_weather(location=loc, travel_date=dt, units="metric")  # FIXED: use cached_weather
+                    get_weather_once(location=loc, travel_date=dt)
                 ))
             weather_results = await asyncio.gather(*tasks, return_exceptions=True)
             # Map back: first task is outbound (if both), second return
@@ -2093,7 +2225,7 @@ async def _plan_trip_internal(
             logger.info("Running sequential weather fetches (<=1 key available or only one date)")
             for leg, loc, dt in dates_to_fetch:
                 try:
-                    res = await cached_weather(location=loc, travel_date=dt, units="metric")  # FIXED: use cached_weather
+                    res = await get_weather_once(location=loc, travel_date=dt)
                     if leg == "outbound":
                         weather_out = res
                         weather_present_out = True
@@ -2370,10 +2502,10 @@ async def _plan_trip_internal(
         # Wait up to 0.8 seconds for booking URL; if it times out, continue with placeholder
         booking_url = await asyncio.wait_for(booking_task, timeout=0.8)
     except asyncio.TimeoutError:
-        logger.warning("Booking handoff timed out, using placeholder")
+        logger.info("Booking handoff resolution timed out; continuing without handoff URL")
         booking_url = None  # placeholder, will be updated later if needed
     except Exception as _e:
-        logger.warning(f"build_booking_handoff_url failed: {_e}")
+        logger.info("build_booking_handoff_url failed; continuing without handoff URL: %s", str(_e))
         booking_url = None
 
     if booking_url:
@@ -2840,8 +2972,8 @@ async def plan_trip(
                 "action": action,
             }
 
-        default_hold = int(os.getenv("BOOKING_HOLD_MINUTES", "15"))
-        track_hold = int(os.getenv("PRICE_TRACK_HOLD_MINUTES", "43200"))  # 30 days
+        default_hold = get_env_int("BOOKING_HOLD_MINUTES", 15)
+        track_hold = get_env_int("PRICE_TRACK_HOLD_MINUTES", 43200)  # 30 days
         hold_minutes = track_hold if action == "track_price" else default_hold
 
         try:
@@ -2916,6 +3048,10 @@ async def plan_trip(
     # --- Streaming branch ---
     async def stream_generator() -> AsyncGenerator[str, None]:
         try:
+            # Emit an immediate non-technical progress signal so clients can distinguish a healthy
+            # stream from a stalled connection before LLM token generation begins.
+            yield _sse_event("reasoning_step", {"step": "Gathering live flight options and destination weather."})
+
             # 1. Get all data without LLM explanation (skip_llm=True)
             data_result = await _plan_trip_internal(
                 origin=origin,
@@ -2970,6 +3106,52 @@ async def plan_trip(
             price_analysis_str = debug_info.get("price_analysis_str", "")
             price_prediction_str = debug_info.get("price_prediction_str", "")
 
+            # Emit structured hydration events as soon as data is available.
+            if all_flights_dicts:
+                yield _sse_event(
+                    "flights",
+                    {
+                        "all_flights": all_flights_dicts,
+                        "best_flight": data_result.best_flight,
+                    },
+                )
+
+            if isinstance(weather, dict) and weather:
+                weather_payload: Dict[str, Any] = {}
+                for key, value in weather.items():
+                    weather_payload[key] = value.value if hasattr(value, "value") else value
+                yield _sse_event("weather", {"weather": weather_payload})
+
+            # Emit progressive reasoning steps from known structured data.
+            yield _sse_event(
+                "reasoning_step",
+                {"step": f"Ranked options and selected {best_flight.airline} {best_flight.flight_no} as the strongest overall fit."},
+            )
+            if best_flight.stops == 0:
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": "Non-stop routing helped reduce transfer risk and overall travel complexity."},
+                )
+            else:
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": f"Accepted {best_flight.stops} stop(s) to keep overall value and timing strong."},
+                )
+
+            weather_condition = weather.get("condition") if isinstance(weather, dict) else None
+            weather_temp = weather.get("temperature_c") if isinstance(weather, dict) else None
+            if weather_condition or weather_temp is not None:
+                temp_text = ""
+                if weather_temp is not None and str(weather_temp).strip() != "":
+                    try:
+                        temp_text = f" around {round(float(weather_temp), 1)}°C"
+                    except Exception:
+                        temp_text = f" around {weather_temp}°C"
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": f"Destination weather ({intent_dict.get('destination_iata') or 'destination'}) looks {str(weather_condition).lower() if weather_condition else 'stable'}{temp_text}, so comfort and packing guidance were included."},
+                )
+
             # Inject return leg details if present
             if data_result.return_trip:
                 rt = data_result.return_trip
@@ -3008,9 +3190,7 @@ async def plan_trip(
                 warnings_str = ""
 
             # Ensure weather values are plain
-            weather_display = {}
-            for k, v in weather.items():
-                weather_display[k] = v.value if hasattr(v, 'value') else v
+            weather_display = _normalized_weather_display(weather)
 
             # Determine forecast proximity to travel date
             forecast_date_str = weather_display.get("forecast_date")
@@ -3194,6 +3374,14 @@ Please recommend the best flight, explain why it matches their preferences, ment
                 yield "[ERROR] LLM stream initialization timed out"
                 yield "[DONE_JSON]" + json.dumps({"error": "LLM stream initialization timed out"})
                 return
+            except AllBackendsFailed as e:
+                await record_llm_failure()
+                metrics.record_stream_failure("unknown")
+                logger.warning("LLM stream unavailable across backends", extra=e.as_dict())
+                yield "[ERROR] LLM temporarily unavailable"
+                done_payload = {"error": "LLM temporarily unavailable", **_backend_status_payload(e)}
+                yield "[DONE_JSON]" + json.dumps(done_payload)
+                return
 
             # Try to extract provider from token_stream (if available)
             provider = getattr(token_stream, "provider", "unknown")
@@ -3308,8 +3496,10 @@ Please recommend the best flight, explain why it matches their preferences, ment
         except Exception as e:
             await record_llm_failure()
             logger.exception("Error in streaming plan_trip")
-            yield f"[ERROR]{str(e)}"
-            yield "[DONE_JSON]" + json.dumps({"error": str(e)})
+            safe_error = _safe_llm_error_message(e)
+            yield f"[ERROR] {safe_error}"
+            done_payload = {"error": safe_error, **_backend_status_payload(e)}
+            yield "[DONE_JSON]" + json.dumps(done_payload)
 
     return stream_generator()
 

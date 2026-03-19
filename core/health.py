@@ -3,7 +3,6 @@
 import asyncio
 import importlib
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Callable, Awaitable
 
@@ -11,7 +10,8 @@ from fastapi import APIRouter, Query, Header, Depends, HTTPException
 
 # Local imports (adjust if needed)
 from core.api_key_manager import key_manager
-from agents.cloud_llm import clear_client_cache
+from core.env_config import get_env_str
+from agents.cloud_llm import clear_client_cache, is_cloud_admin_enabled, get_usable_providers
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,9 @@ _HEALTH_PROVIDERS = {
 PROVIDER_KEYMAP = {
     "airline": ["serpapi", "openai"],  # example: airline health depends on serpapi/openai keys
     "weather": ["weather"],
-    "openai": ["openai"],
+    # "openai" health dependency points to agents.cloud_llm (shared cloud path).
+    # Treat either OpenAI or Gemini usable keys as satisfying cloud-key availability.
+    "openai": ["openai", "gemini"],
     "ollama": [],  # local model, no external key
 }
 
@@ -61,13 +63,32 @@ def is_key_active(entry) -> bool:
         return entry == "active"
 
     if isinstance(entry, dict):
-        # Active if not pending clear and not exhausted
-        if entry.get("_pending_clear"):
+        pending_clear = bool(entry.get("pending_clear", False) or entry.get("_pending_clear", False))
+        if pending_clear:
             return False
-        if entry.get("exhausted_until"):
+
+        if "active" in entry:
+            return bool(entry.get("active"))
+
+        exhausted_until = entry.get("exhausted_until")
+        if exhausted_until in (None, ""):
+            return True
+
+        # Numeric timestamp support.
+        try:
+            if isinstance(exhausted_until, (int, float)):
+                return float(exhausted_until) <= datetime.now(timezone.utc).timestamp()
+        except Exception:
             return False
-        # If no explicit flags, assume active (backward compatibility)
-        return True
+
+        # ISO timestamp support.
+        try:
+            dt = datetime.fromisoformat(str(exhausted_until))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp() <= datetime.now(timezone.utc).timestamp()
+        except Exception:
+            return False
 
     return False
 
@@ -75,7 +96,7 @@ def is_key_active(entry) -> bool:
 def is_key_pending_clear(entry) -> bool:
     """Return True if the key entry indicates it is pending clear."""
     if isinstance(entry, dict):
-        return entry.get("_pending_clear", False)
+        return bool(entry.get("pending_clear", False) or entry.get("_pending_clear", False))
     return False
 
 
@@ -188,7 +209,15 @@ async def full_health_check() -> Dict[str, Any]:
     """
     results = {}
     messages: Dict[str, str] = {}  # still collected for logging, but not returned
-    use_cloud_llm = os.getenv("USE_CLOUD_LLM", "0") == "1"
+    cloud_admin_enabled = is_cloud_admin_enabled()
+    cloud_usable_providers = []
+    if cloud_admin_enabled:
+        try:
+            cloud_usable_providers = await get_usable_providers()
+        except Exception:
+            logger.exception("Failed to fetch cloud provider usability during health check")
+            cloud_usable_providers = []
+    cloud_usable = bool(cloud_usable_providers)
 
     # Fetch live key status
     try:
@@ -203,8 +232,14 @@ async def full_health_check() -> Dict[str, Any]:
 
     for name, module_path in _HEALTH_PROVIDERS.items():
         try:
-            if name == "openai" and not use_cloud_llm:
-                results[name] = "ok"
+            if name == "openai" and not cloud_admin_enabled:
+                results[name] = "disabled"
+                messages[name] = "Cloud LLM disabled by configuration (USE_CLOUD_LLM=0)."
+                continue
+
+            if name == "openai" and not cloud_usable:
+                results[name] = "unavailable"
+                messages[name] = "Cloud LLM enabled but no usable cloud provider keys are currently active."
                 continue
 
             mapped_services = PROVIDER_KEYMAP.get(name, [name])
@@ -213,6 +248,7 @@ async def full_health_check() -> Dict[str, Any]:
 
             if mapped_services:
                 provider_has_active = False
+                strict_missing_status = name == "openai"
                 for svc in mapped_services:
                     svc_status = key_status.get(svc, {})
 
@@ -220,10 +256,15 @@ async def full_health_check() -> Dict[str, Any]:
                     # assume the service has an active key (backwards-compatible for test envs where keys
                     # aren't provided). This prevents missing key info from causing a readiness failure.
                     if not svc_status:
-                        logger.debug(
-                            "No key status info for %s — assuming active for readiness check", svc
-                        )
-                        provider_has_active = True
+                        if strict_missing_status:
+                            logger.debug(
+                                "No key status info for %s (strict cloud readiness mode)", svc
+                            )
+                        else:
+                            logger.debug(
+                                "No key status info for %s — assuming active for readiness check", svc
+                            )
+                            provider_has_active = True
                         continue
 
                     # Handle both list and dict formats
@@ -317,7 +358,7 @@ async def full_health_check_verbose() -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 
 def require_admin_token(x_admin_token: str = Header(...)):
-    expected = os.getenv("ADMIN_TOKEN")
+    expected = get_env_str("ADMIN_TOKEN")
     if not expected or x_admin_token != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 

@@ -38,11 +38,113 @@ from core.request_context import set_request_id
 from core.logging_config import setup_logging
 from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
+from core.env_config import get_env_bool, get_env_int, get_env_str, is_env_set
+from core.llm_mode import (
+    llm_routing_context,
+    normalize_cloud_provider,
+    normalize_llm_mode,
+    get_configured_cloud_providers,
+    get_default_cloud_provider,
+    get_llm_mode_default,
+    LLM_MODE_CLOUD_ONLY,
+    LLM_MODE_OLLAMA_ONLY,
+    VALID_LLM_MODES,
+)
 from core import job_queue                     # background job worker
 from core.api_key_manager import key_manager    # key rotation manager
-from agents.cloud_llm import on_key_event       # callback for key changes
+from agents.cloud_llm import (
+    on_key_event,
+    get_available_providers,
+    get_provider_usability,
+    get_usable_providers,
+    is_cloud_admin_enabled,
+)  # callback for key changes
+from agents import ollama_client
 
 logger = logging.getLogger(__name__)
+
+# Deprecated configuration variables that are still tolerated for backward compatibility.
+_DEPRECATED_ENV_GUIDANCE = {
+    "OPENAI_API_KEY": {
+        "replacement": "OPENAI_KEY_n",
+        "note": "Legacy async client path only; modern cloud routing uses key-manager numbered keys.",
+    },
+    "ANTHROPIC_API_KEY": {
+        "replacement": "provider-specific numbered key pool (not OPENAI_API_KEY style)",
+        "note": "Legacy async client path only; modern runtime routes through cloud provider chain and key manager.",
+    },
+    "CLOUD_BASE_URL": {
+        "replacement": "CLOUD_PROVIDER_CHAIN/CLOUD_PROVIDER with provider adapters",
+        "note": "Only legacy async client init reads CLOUD_BASE_URL directly.",
+    },
+    "LLM_PRIORITY": {
+        "replacement": "LLM_MODE",
+        "note": "LLM_PRIORITY is kept only for legacy hybrid alias mapping.",
+    },
+}
+
+
+def _is_env_set(var_name: str) -> bool:
+    return is_env_set(var_name)
+
+
+def _emit_deprecated_config_warnings() -> list[str]:
+    warned: list[str] = []
+    for var_name, guidance in _DEPRECATED_ENV_GUIDANCE.items():
+        if not _is_env_set(var_name):
+            continue
+        warned.append(var_name)
+        logger.warning(
+            "Config deprecation: %s is deprecated. Use %s instead. %s Compatibility support remains active for now.",
+            var_name,
+            guidance["replacement"],
+            guidance["note"],
+        )
+    return warned
+
+
+async def _log_startup_config_summary(*, deprecated_env_detected: list[str]) -> None:
+    """
+    Log a one-time non-secret startup config summary for operational visibility.
+    This intentionally avoids logging any API keys or secret values.
+    """
+    configured_chain = get_configured_cloud_providers()
+    default_provider = get_default_cloud_provider()
+    llm_mode = get_llm_mode_default()
+    cloud_enabled = is_cloud_admin_enabled()
+    planner_prewarm_enabled = get_env_bool("PLANNER_PREWARM", default=False)
+    ollama_base_url = get_env_str("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model = get_env_str("OLLAMA_MODEL", "openhermes")
+
+    usable_providers: list[str] = []
+    if cloud_enabled:
+        try:
+            usable_providers = await get_usable_providers()
+        except Exception:
+            logger.warning("startup_config_summary_cloud_usability_unavailable")
+
+    deprecated_text = ",".join(sorted(deprecated_env_detected)) if deprecated_env_detected else "none"
+    usable_text = ",".join(usable_providers) if usable_providers else "none"
+    chain_text = ",".join(configured_chain) if configured_chain else "none"
+
+    logger.info(
+        (
+            "Startup config summary | llm_mode=%s | cloud_enabled=%s | cloud_default_provider=%s "
+            "| cloud_provider_chain=%s | cloud_usable_providers=%s | ollama_base_url=%s | ollama_model=%s "
+            "| key_manager_lock_backend=%s | planner_prewarm=%s | deprecated_env_detected=%s"
+        ),
+        llm_mode,
+        cloud_enabled,
+        default_provider,
+        chain_text,
+        usable_text,
+        ollama_base_url,
+        ollama_model,
+        KEY_MANAGER_LOCK_BACKEND,
+        planner_prewarm_enabled,
+        deprecated_text,
+    )
+
 
 # --- Pluggable lock helpers (file-based default, redis optional) ---
 try:
@@ -50,11 +152,11 @@ try:
 except ImportError:
     redis_async = None
 
-KEY_MANAGER_LOCK_BACKEND = os.getenv("KEY_MANAGER_LOCK_BACKEND", "file").lower()
-KEY_MANAGER_REDIS_URL = os.getenv("KEY_MANAGER_REDIS_URL", "redis://localhost:6379/0")
-KEY_MANAGER_LOCK_NAME = os.getenv("KEY_MANAGER_LOCK_NAME", "llm:key_refresh_lock")
-KEY_MANAGER_LOCK_TTL = int(os.getenv("KEY_MANAGER_LOCK_TTL_SECONDS", "60"))  # lock TTL for redis
-KEY_MANAGER_LOCK_PATH = os.getenv("KEY_MANAGER_LOCK_PATH", "/tmp/llm_key_refresh.lock")
+KEY_MANAGER_LOCK_BACKEND = (get_env_str("KEY_MANAGER_LOCK_BACKEND", "file") or "file").lower()
+KEY_MANAGER_REDIS_URL = get_env_str("KEY_MANAGER_REDIS_URL", "redis://localhost:6379/0")
+KEY_MANAGER_LOCK_NAME = get_env_str("KEY_MANAGER_LOCK_NAME", "llm:key_refresh_lock")
+KEY_MANAGER_LOCK_TTL = get_env_int("KEY_MANAGER_LOCK_TTL_SECONDS", 60)  # lock TTL for redis
+KEY_MANAGER_LOCK_PATH = get_env_str("KEY_MANAGER_LOCK_PATH", "/tmp/llm_key_refresh.lock")
 
 
 def _acquire_process_lock(path: str) -> Optional[int]:
@@ -126,8 +228,8 @@ async def prewarm_llm():
     from agents import ollama_client
     from agents.ollama_client import OllamaError
 
-    timeout = int(os.getenv("OLLAMA_PREWARM_TIMEOUT", "60"))
-    max_retries = int(os.getenv("OLLAMA_PREWARM_RETRIES", "3"))
+    timeout = get_env_int("OLLAMA_PREWARM_TIMEOUT", 60)
+    max_retries = get_env_int("OLLAMA_PREWARM_RETRIES", 3)
     backoff = 1
 
     for attempt in range(1, max_retries + 1):
@@ -165,7 +267,7 @@ async def prewarm_llm():
 
 def require_admin_token(x_admin_token: str = Header(...)):
     """Dependency to protect admin endpoints with a token from environment."""
-    expected = os.getenv("ADMIN_TOKEN")
+    expected = get_env_str("ADMIN_TOKEN")
     if not expected or x_admin_token != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -176,15 +278,24 @@ async def lifespan(app: FastAPI):
 
     # Startup: configure structured JSON logging
     setup_logging()
+    deprecated_env_detected = _emit_deprecated_config_warnings()
 
-    # Initialize shared LLM client
-    await init_llm_client()
+    # Initialize legacy shared LLM client (best-effort; router/cloud_llm path remains authoritative).
+    try:
+        await init_llm_client()
+    except Exception as e:
+        logger.info("legacy_llm_client_init_skipped: %s", str(e))
 
     # Load API keys from environment into the key manager
     try:
         await key_manager.load_env_keys()
     except Exception:
         logger.exception("key_manager_load_failed")
+
+    try:
+        await _log_startup_config_summary(deprecated_env_detected=deprecated_env_detected)
+    except Exception:
+        logger.exception("startup_config_summary_failed")
 
     # ---- Register key event listener early (idempotent) ----
     try:
@@ -216,7 +327,7 @@ async def lifespan(app: FastAPI):
     should_run_refresh = lock_handle is not None
 
     # Fallback: env var override (useful for containers where you set one replica manually)
-    if not should_run_refresh and os.getenv("RUN_KEY_REFRESH", "").lower() in ("1", "true"):
+    if not should_run_refresh and get_env_bool("RUN_KEY_REFRESH", default=False):
         logger.warning(
             "RUN_KEY_REFRESH=true but lock not acquired; starting refresh loop anyway. "
             "Ensure only one replica has this variable set."
@@ -230,7 +341,7 @@ async def lifespan(app: FastAPI):
         app.state.key_manager_lock_handle = lock_handle
 
         # Start the key manager's background refresh loop (interval configurable)
-        refresh_interval = int(os.getenv("KEY_ENV_MONITOR_TICK", "60"))
+        refresh_interval = get_env_int("KEY_ENV_MONITOR_TICK", 60)
         # start_refresh_loop is synchronous; it creates an internal task.
         key_manager.start_refresh_loop(
             interval_seconds=refresh_interval,
@@ -248,7 +359,7 @@ async def lifespan(app: FastAPI):
     app.state.job_worker = asyncio.create_task(job_queue.worker_loop())
 
     # Optional prewarm (non‑blocking)
-    if os.getenv("PLANNER_PREWARM") == "1":
+    if get_env_bool("PLANNER_PREWARM", default=False):
         async def background_prewarm():
             try:
                 await prewarm_llm()
@@ -329,7 +440,10 @@ app = FastAPI(
 
 # Add CORS middleware – now configurable via environment variable
 # Read production origins from environment, fallback to localhost for dev
-env_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173")
+env_origins = get_env_str(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+)
 allowed_origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
 
 app.add_middleware(
@@ -379,6 +493,8 @@ class AskRequest(BaseModel):
     date: Optional[str] = None
     user_query: Optional[str] = None
     trip_type: Optional[str] = None          # now optional, planner may default to "Business"
+    llm_mode: Optional[str] = None
+    cloud_provider: Optional[str] = None
 
     @field_validator("date")
     @classmethod
@@ -401,6 +517,14 @@ class AskRequest(BaseModel):
         self.date = self.date.strip() if self.date else None
         self.user_query = self.user_query.strip() if self.user_query else None
         self.trip_type = self.trip_type.strip() if self.trip_type else None
+        self.llm_mode = self.llm_mode.strip() if self.llm_mode else None
+        self.cloud_provider = self.cloud_provider.strip() if self.cloud_provider else None
+
+        if self.llm_mode:
+            self.llm_mode = normalize_llm_mode(self.llm_mode)
+
+        if self.cloud_provider:
+            self.cloud_provider = normalize_cloud_provider(self.cloud_provider)
 
         origin = self.origin
         destination = self.destination
@@ -436,11 +560,13 @@ async def ask(
         - If `stream=true`, returns a Server‑Sent Events (SSE) stream of tokens.
     """
     # Define global timeout early so it's available in exception handlers
-    GLOBAL_TIMEOUT = int(os.getenv("PLANNER_GLOBAL_TIMEOUT", "60"))
+    GLOBAL_TIMEOUT = get_env_int("PLANNER_GLOBAL_TIMEOUT", 60)
 
     # Use the already normalized values from the model
     origin = req.origin
     destination = req.destination
+    llm_mode = req.llm_mode
+    cloud_provider = req.cloud_provider
     # Detect structured‑only mode (no user query, both origin/destination present, date missing)
     is_structured_only = (
         not req.user_query
@@ -450,9 +576,7 @@ async def ask(
     )
 
     # Compute effective date (structured default rule applies to all branches)
-    DEFAULT_STRUCTURED_OFFSET_DAYS = int(
-        os.getenv("DEFAULT_STRUCTURED_OFFSET_DAYS", "15")
-    )
+    DEFAULT_STRUCTURED_OFFSET_DAYS = get_env_int("DEFAULT_STRUCTURED_OFFSET_DAYS", 15)
     effective_date = req.date
 
     if is_structured_only:
@@ -468,6 +592,24 @@ async def ask(
         planner_user_query = req.user_query or ""
 
     try:
+        def _to_sse_data_frame(payload: str) -> str:
+            """
+            Format a payload as a valid SSE data frame.
+            Each logical line must be prefixed with `data:` to preserve embedded newlines.
+            """
+            text = str(payload).replace("\r\n", "\n").replace("\r", "\n")
+            lines = text.split("\n")
+            return "".join(f"data: {line}\n" for line in lines) + "\n"
+
+        def _is_preformatted_sse_frame(payload: str) -> bool:
+            """
+            Detect whether payload is already a fully formatted SSE frame.
+            This enables planner-emitted typed events (event: ... / data: ...) to pass through unchanged.
+            """
+            if not isinstance(payload, str):
+                return False
+            return payload.startswith("event: ") and payload.endswith("\n\n")
+
         # Background job branch
         if async_job:
             from core.job_queue import enqueue_job
@@ -488,41 +630,45 @@ async def ask(
         if stream:
             # Streaming branch: call planner with stream=True
             # No outer timeout – planner handles streaming timeouts internally
-            agen_or_result = await planner_agent.plan_trip(
-                origin=origin,
-                destination=destination,
-                date=effective_date,
-                user_query=planner_user_query,
-                trip_type=req.trip_type,
-                stream=True
-            )
 
             async def event_stream():
-                # If the planner returns an async generator, iterate and yield SSE frames
-                if hasattr(agen_or_result, "__aiter__"):
-                    async for chunk in agen_or_result:
-                        # Basic SSE framing; newlines in chunk should be escaped if needed
-                        yield f"data: {chunk}\n\n"
-                    # Final done event
-                    yield "event: done\ndata: \n\n"
-                else:
-                    # Fallback: if planner returned a dict (non‑streaming), send it as one event
-                    yield f"data: {json.dumps(agen_or_result)}\n\n"
-                    yield "event: done\ndata: \n\n"
+                with llm_routing_context(llm_mode=llm_mode, cloud_provider=cloud_provider):
+                    agen_or_result = await planner_agent.plan_trip(
+                        origin=origin,
+                        destination=destination,
+                        date=effective_date,
+                        user_query=planner_user_query,
+                        trip_type=req.trip_type,
+                        stream=True
+                    )
+                    # If the planner returns an async generator, iterate and yield SSE frames
+                    if hasattr(agen_or_result, "__aiter__"):
+                        async for chunk in agen_or_result:
+                            if _is_preformatted_sse_frame(chunk):
+                                yield chunk
+                            else:
+                                yield _to_sse_data_frame(chunk)
+                        # Final done event
+                        yield "event: done\ndata: \n\n"
+                    else:
+                        # Fallback: if planner returned a dict (non‑streaming), send it as one event
+                        yield _to_sse_data_frame(json.dumps(agen_or_result))
+                        yield "event: done\ndata: \n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         # Non‑streaming branch: apply global timeout
-        result = await asyncio.wait_for(
-            planner_agent.plan_trip(
-                origin=origin,
-                destination=destination,
-                date=effective_date,
-                user_query=planner_user_query,
-                trip_type=req.trip_type,
-            ),
-            timeout=GLOBAL_TIMEOUT
-        )
+        with llm_routing_context(llm_mode=llm_mode, cloud_provider=cloud_provider):
+            result = await asyncio.wait_for(
+                planner_agent.plan_trip(
+                    origin=origin,
+                    destination=destination,
+                    date=effective_date,
+                    user_query=planner_user_query,
+                    trip_type=req.trip_type,
+                ),
+                timeout=GLOBAL_TIMEOUT
+            )
 
         # If the planner returns a dict with an "error" key, treat it as a client error.
         if isinstance(result, dict) and result.get("error"):
@@ -679,24 +825,13 @@ async def health():
                 db.close()
 
         try:
-            await asyncio.wait_for(asyncio.to_thread(_ping_db), timeout=0.2)
+            await asyncio.wait_for(asyncio.to_thread(_ping_db), timeout=1.0)
             return "ok"
+        except asyncio.TimeoutError:
+            logger.warning("lightweight_health_database_degraded_timeout")
+            return "degraded"
         except Exception:
-            logger.exception("lightweight_health_database_failed")
-            return "fail"
-
-    async def _check_ollama() -> str:
-        # Optional lightweight check. Do not fail overall status if this fails.
-        try:
-            from agents.ollama_client import health_check as ollama_health_check
-        except Exception:
-            return "unavailable"
-
-        try:
-            res = await asyncio.wait_for(ollama_health_check(), timeout=0.05)
-            return "ok" if res == "ok" else "fail"
-        except Exception:
-            logger.warning("lightweight_health_ollama_failed", exc_info=True)
+            logger.warning("lightweight_health_database_degraded")
             return "fail"
 
     dependencies = {
@@ -706,20 +841,101 @@ async def health():
         "ollama": "unavailable",
     }
 
-    key_manager_status, database_status, ollama_status = await asyncio.gather(
+    key_manager_status, database_status = await asyncio.gather(
         _check_key_manager(),
         _check_database(),
-        _check_ollama(),
     )
     dependencies["key_manager"] = key_manager_status
     dependencies["database"] = database_status
-    dependencies["ollama"] = ollama_status
 
     # /health should remain stable and avoid external-API-triggered failures.
-    hard_fail_fields = ("app", "key_manager", "database")
+    hard_fail_fields = ("app", "key_manager")
     status = "fail" if any(dependencies[f] == "fail" for f in hard_fail_fields) else "ok"
 
     return {"status": status, "dependencies": dependencies}
+
+
+async def _check_ollama_availability_for_options() -> bool:
+    try:
+        status = await asyncio.wait_for(ollama_client.health_check(), timeout=1.0)
+        if isinstance(status, bool):
+            return status
+        return str(status).lower() == "ok"
+    except Exception:
+        return False
+
+
+def _derive_effective_mode_for_options(
+    requested_mode: str,
+    *,
+    cloud_available: bool,
+    ollama_available: bool,
+) -> str:
+    mode = (requested_mode or get_llm_mode_default()).lower()
+    if cloud_available and not ollama_available:
+        return LLM_MODE_CLOUD_ONLY
+    if ollama_available and not cloud_available:
+        return LLM_MODE_OLLAMA_ONLY
+    return mode
+
+
+@app.get("/llm/options")
+async def llm_options():
+    configured_providers = get_configured_cloud_providers()
+    available_providers = get_available_providers()
+    usable_providers = await get_usable_providers()
+    provider_usability = await get_provider_usability()
+
+    providers = [p for p in configured_providers if p in available_providers]
+    if not providers:
+        providers = available_providers or configured_providers
+
+    cloud_enabled_by_config = is_cloud_admin_enabled()
+    cloud_usable = cloud_enabled_by_config and len(usable_providers) > 0
+    provider_switch_enabled = cloud_enabled_by_config and len(usable_providers) > 1
+    requested_mode = get_llm_mode_default()
+    ollama_available = await _check_ollama_availability_for_options()
+    effective_mode = _derive_effective_mode_for_options(
+        requested_mode,
+        cloud_available=cloud_usable,
+        ollama_available=ollama_available,
+    )
+
+    default_provider = get_default_cloud_provider()
+    effective_default_provider = (
+        default_provider
+        if provider_usability.get(default_provider, False)
+        else (usable_providers[0] if usable_providers else default_provider)
+    )
+
+    provider_status = {
+        provider: {
+            "configured": provider in configured_providers,
+            "initialized": provider in available_providers,
+            "usable": provider in usable_providers,
+        }
+        for provider in sorted(set(configured_providers + available_providers))
+    }
+
+    return {
+        "llm_modes": list(VALID_LLM_MODES),
+        "cloud_providers": providers,
+        "defaults": {
+            "llm_mode": requested_mode,
+            "cloud_provider": default_provider,
+        },
+        "provider_status": provider_status,
+        "usable_cloud_providers": usable_providers,
+        "cloud_usable": cloud_usable,
+        "cloud_enabled_by_config": cloud_enabled_by_config,
+        "provider_switch_enabled": provider_switch_enabled,
+        "effective_default_provider": effective_default_provider,
+        "effective_mode": effective_mode,
+        "backend_availability": {
+            "cloud": cloud_usable,
+            "ollama": ollama_available,
+        },
+    }
 
 
 @app.get("/health/deep")
@@ -805,6 +1021,6 @@ async def version():
     - timestamp: last modification time of this file
     """
     return {
-        "git_commit": os.getenv("GIT_COMMIT", "unknown"),
+        "git_commit": get_env_str("GIT_COMMIT", "unknown"),
         "file_mtime": os.path.getmtime(__file__)
     }

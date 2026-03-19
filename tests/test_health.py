@@ -20,12 +20,13 @@ async def test_health_fail_when_provider_fails(monkeypatch):
     async def fail():
         return "fail"
 
-    orig_get = health_module._get_health_func
+    async def ok():
+        return "ok"
 
     def fake_get(path):
         if path == "tools.weather_api":
             return fail
-        return orig_get(path)
+        return ok
 
     monkeypatch.setattr(health_module, "_get_health_func", fake_get)
     result = await full_health_check()
@@ -63,3 +64,54 @@ async def test_health_degraded_when_pending_clear(monkeypatch):
 
     result = await full_health_check()
     assert result["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_health_marks_cloud_disabled_when_admin_flag_off(monkeypatch):
+    async def ok():
+        return "ok"
+
+    monkeypatch.setattr(health_module, "_get_health_func", lambda path: ok)
+    monkeypatch.setattr(health_module, "is_cloud_admin_enabled", lambda: False)
+
+    async def fake_usable():
+        return ["gemini"]
+
+    monkeypatch.setattr(health_module, "get_usable_providers", fake_usable)
+
+    result = await full_health_check()
+    assert result["dependencies"]["openai"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_health_marks_cloud_unavailable_when_enabled_without_usable_provider(monkeypatch):
+    async def ok():
+        return "ok"
+
+    monkeypatch.setattr(health_module, "_get_health_func", lambda path: ok)
+    monkeypatch.setattr(health_module, "is_cloud_admin_enabled", lambda: True)
+
+    async def fake_usable():
+        return []
+
+    monkeypatch.setattr(health_module, "get_usable_providers", fake_usable)
+
+    result = await full_health_check()
+    assert result["dependencies"]["openai"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_health_runs_cloud_probe_when_enabled_and_usable(monkeypatch):
+    async def ok():
+        return "ok"
+
+    monkeypatch.setattr(health_module, "_get_health_func", lambda path: ok)
+    monkeypatch.setattr(health_module, "is_cloud_admin_enabled", lambda: True)
+
+    async def fake_usable():
+        return ["gemini"]
+
+    monkeypatch.setattr(health_module, "get_usable_providers", fake_usable)
+
+    result = await full_health_check()
+    assert result["dependencies"]["openai"] == "ok"

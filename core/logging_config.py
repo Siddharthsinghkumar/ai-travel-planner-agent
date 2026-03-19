@@ -1,20 +1,17 @@
 # core/logging_config.py
 
-import os
 import logging
 import logging.config
+from core.env_config import get_env_bool, get_env_str
 
 
 def _parse_log_level() -> str:
-    level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
+    level = (get_env_str("LOG_LEVEL", "INFO") or "INFO").upper()
     return level if level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"} else "INFO"
 
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return get_env_bool(name, default=default)
 
 
 def setup_logging():

@@ -1,7 +1,6 @@
 # tests/test_prewarm.py
-import time
+import asyncio
 import pytest
-from fastapi.testclient import TestClient
 from api.app import app
 
 @pytest.fixture(autouse=True)
@@ -10,7 +9,8 @@ def env_set(monkeypatch):
     monkeypatch.setenv("PLANNER_PREWARM", "1")
     yield
 
-def test_prewarm_invoked(monkeypatch):
+@pytest.mark.asyncio
+async def test_prewarm_invoked(monkeypatch):
     called = {"count": 0}
 
     async def fake_generate(*args, **kwargs):
@@ -20,9 +20,7 @@ def test_prewarm_invoked(monkeypatch):
     # patch the ollama_client.generate used by api.app.prewarm_llm
     monkeypatch.setattr("agents.ollama_client.generate", fake_generate)
 
-    # Starting the TestClient will run lifespan() and should call prewarm task
-    with TestClient(app) as client:
-        # give the background prewarm tiny time to run (it should be scheduled immediately)
-        time.sleep(0.01)  # allow loop scheduling (TestClient waits for startup)
-        # Now assert our fake generate was called at least once
+    # Enter lifespan context directly and allow the background prewarm task to run.
+    async with app.router.lifespan_context(app):
+        await asyncio.sleep(0.01)
         assert called["count"] >= 1
