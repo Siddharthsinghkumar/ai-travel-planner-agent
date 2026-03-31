@@ -9,6 +9,27 @@ from prometheus_client import Counter as PromCounter
 
 logger = logging.getLogger(__name__)
 
+# ----------------------------
+# HTTP Request Metrics
+# ----------------------------
+
+HTTP_REQUESTS = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["route", "method", "status_class"]
+)
+
+HTTP_REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["route", "method"]
+)
+
+HTTP_INFLIGHT = Gauge(
+    "http_inflight_requests",
+    "In-flight HTTP requests"
+)
+
 # Airline API metrics
 AIRLINE_RETRIES = Counter(
     "airline_retries_total",
@@ -92,6 +113,54 @@ STREAM_LATENCY = Histogram(
     ["provider"]
 )
 
+STREAM_INIT_TIMEOUTS = Counter(
+    "stream_init_timeout_total",
+    "Total stream initialization timeouts",
+    ["provider"]
+)
+
+STREAM_CANCELLATIONS = Counter(
+    "stream_cancellations_total",
+    "Total stream cancellations",
+    ["provider", "stage"]
+)
+
+STREAM_FALLBACKS = Counter(
+    "stream_fallback_total",
+    "Total streaming fallbacks by reason",
+    ["reason", "provider"]
+)
+
+LLM_ROUTE_USAGE = Counter(
+    "llm_route_usage_total",
+    "LLM route usage by mode/effective mode/serving backend and stream flag",
+    ["mode", "effective_mode", "provider", "stream"]
+)
+
+LLM_FIRST_TOKEN_LATENCY = Histogram(
+    "llm_first_token_latency_seconds",
+    "Latency from LLM request start to first token",
+    ["provider"]
+)
+
+LLM_FULL_RESPONSE_LATENCY = Histogram(
+    "llm_full_response_latency_seconds",
+    "Full LLM response latency",
+    ["provider", "stream"]
+)
+
+STREAM_DONE_JSON = Counter(
+    "stream_done_json_total",
+    "Total [DONE_JSON] emissions in streaming responses",
+    ["status"]
+)
+
+ROUTER_STREAM_FAILURES = Counter(
+    "llm_router_stream_failures_total",
+    "Router-level stream failures by cause",
+    ["cause"]
+)
+
 # ----------------------------
 # Job Queue Metrics
 # ----------------------------
@@ -155,6 +224,61 @@ def record_stream_success(provider: str, duration_sec: float) -> None:
 def record_stream_failure(provider: str) -> None:
     """Record a failed streaming request."""
     STREAM_REQUESTS.labels(provider=provider, status="error").inc()
+
+
+def record_http_request(route: str, method: str, status_code: int, duration_sec: float) -> None:
+    status_class = f"{int(status_code) // 100}xx"
+    HTTP_REQUESTS.labels(route=route, method=method, status_class=status_class).inc()
+    HTTP_REQUEST_DURATION.labels(route=route, method=method).observe(duration_sec)
+
+
+def inc_http_inflight() -> None:
+    HTTP_INFLIGHT.inc()
+
+
+def dec_http_inflight() -> None:
+    HTTP_INFLIGHT.dec()
+
+
+def record_stream_init_timeout(provider: str) -> None:
+    STREAM_INIT_TIMEOUTS.labels(provider=provider).inc()
+
+
+def record_stream_cancellation(provider: str, stage: str) -> None:
+    STREAM_CANCELLATIONS.labels(provider=provider, stage=stage).inc()
+
+
+def record_stream_fallback(reason: str, provider: str) -> None:
+    STREAM_FALLBACKS.labels(reason=reason, provider=provider).inc()
+
+
+def record_llm_route_usage(mode: str, effective_mode: str, provider: str, stream: bool) -> None:
+    # provider is the backend that actually served the request (for example: ollama/cloud),
+    # not the requested cloud provider name.
+    stream_value = "true" if stream else "false"
+    LLM_ROUTE_USAGE.labels(
+        mode=mode or "unknown",
+        effective_mode=effective_mode or "unknown",
+        provider=provider or "unknown",
+        stream=stream_value,
+    ).inc()
+
+
+def observe_llm_first_token(provider: str, duration_sec: float) -> None:
+    LLM_FIRST_TOKEN_LATENCY.labels(provider=provider).observe(duration_sec)
+
+
+def observe_llm_full_response(provider: str, stream: bool, duration_sec: float) -> None:
+    stream_value = "true" if stream else "false"
+    LLM_FULL_RESPONSE_LATENCY.labels(provider=provider, stream=stream_value).observe(duration_sec)
+
+
+def record_stream_done_json(status: str) -> None:
+    STREAM_DONE_JSON.labels(status=status or "unknown").inc()
+
+
+def record_router_stream_failure(cause: str) -> None:
+    ROUTER_STREAM_FAILURES.labels(cause=cause or "unknown").inc()
 
 
 # --- sanitization helpers for dynamic metrics ---

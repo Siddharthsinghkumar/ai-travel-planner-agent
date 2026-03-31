@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+import api.app as api_app
 from api.app import app
 
 
@@ -47,6 +48,9 @@ async def test_llm_options_back_compatible_with_extended_metadata(monkeypatch):
     assert body["backend_availability"] == {"cloud": True, "ollama": True}
     assert body["provider_status"]["gemini"]["usable"] is True
     assert body["provider_status"]["openai"]["usable"] is True
+    assert body["config_authority"]["llm_mode"]["mode"] == "ollama_first"
+    assert body["config_authority"]["mode_dependency"]["mode"] == "ollama_first"
+    assert "effective_timeouts" in body["config_authority"]
 
 
 @pytest.mark.asyncio
@@ -150,3 +154,51 @@ async def test_llm_options_reports_cloud_disabled_by_config(monkeypatch):
     assert body["cloud_usable"] is False
     assert body["provider_switch_enabled"] is False
     assert body["usable_cloud_providers"] == ["gemini", "openai"]
+
+
+def test_llm_options_effective_mode_keeps_strict_modes():
+    assert (
+        api_app._derive_effective_mode_for_options(
+            "ollama_only",
+            cloud_available=True,
+            ollama_available=False,
+        )
+        == "ollama_only"
+    )
+    assert (
+        api_app._derive_effective_mode_for_options(
+            "cloud_only",
+            cloud_available=False,
+            ollama_available=True,
+        )
+        == "cloud_only"
+    )
+
+
+def test_request_timeout_uses_explicit_global_timeout(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PLANNER_GLOBAL_TIMEOUT", "75")
+    monkeypatch.setenv("ROUTER_TIMEOUT", "40")
+
+    assert api_app._resolve_request_timeout() == 75
+    assert api_app._request_timeout_source() == "PLANNER_GLOBAL_TIMEOUT"
+
+
+def test_request_timeout_derives_from_router_and_reports_ownership(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("PLANNER_GLOBAL_TIMEOUT", raising=False)
+    monkeypatch.setenv("ROUTER_TIMEOUT", "80")
+
+    assert api_app._resolve_request_timeout() == 110
+    assert api_app._request_timeout_source() == "derived_from_ROUTER_TIMEOUT_plus_30s"
+    ownership = api_app._timeout_ownership_map()
+    assert ownership["non_stream_explanation"]["owner"] == "llm_router_backend_timeout"
+    assert ownership["stream_first_token"]["owner"] == "llm_router_first_chunk_timeout"
+    assert ownership["request_guardrail_non_stream"]["driver"] == "derived_from_ROUTER_TIMEOUT_plus_30s"
+
+
+def test_request_timeout_clamps_low_explicit_global_timeout(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PLANNER_GLOBAL_TIMEOUT", "40")
+    monkeypatch.setenv("ROUTER_TIMEOUT", "50")
+
+    # Clamp floor is router + 10s.
+    assert api_app._resolve_request_timeout() == 60
+    assert api_app._request_timeout_source() == "PLANNER_GLOBAL_TIMEOUT_clamped_to_ROUTER_TIMEOUT_plus_10s"

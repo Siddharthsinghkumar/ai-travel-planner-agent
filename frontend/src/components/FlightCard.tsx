@@ -2,18 +2,24 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import type { Flight } from "../lib/types";
 import { formatPriceINR } from "../lib/format";
+import { resolveApiUrl } from "../lib/api";
 
 export default function FlightCard({
   flight,
-  isBest = false
+  isBest = false,
+  rank,
+  total,
 }: {
   flight: Flight;
   isBest?: boolean;
+  rank?: number;
+  total?: number;
 }) {
   const [copied, setCopied] = useState(false);
   const hasDate = typeof flight.date === "string" && flight.date.trim().length > 0;
   const hasEmissions = typeof flight.carbon_emissions_g === "number";
   const hasHandoff = typeof flight.handoff_url === "string" && flight.handoff_url.trim().length > 0;
+  const resolvedHandoffUrl = hasHandoff ? resolveApiUrl(flight.handoff_url as string) : "";
   const stopLabel = Number(flight.stops) === 0 ? "Direct" : String(flight.stops);
   const routeInfo = flight.layover_info
     ? `Layover: ${flight.layover_info}`
@@ -42,6 +48,21 @@ export default function FlightCard({
     >
       <div className="airline-ico">{airlineCode}</div>
       <div className="fl-info">
+        <div className="flight-item__topline">
+          <span className={`flight-rank ${isBest ? "flight-rank--best" : ""}`}>
+            {isBest ? "Top pick" : typeof rank === "number" ? `#${rank}` : "Candidate"}
+            {typeof total === "number" && total > 1 ? ` of ${total}` : ""}
+          </span>
+          {isBest && (
+            <span className="flight-reco-pill" aria-label="AI recommended flight">
+              <span className="flight-reco-pill__star" aria-hidden="true">✦</span>
+              AI recommended
+            </span>
+          )}
+          <span className="flight-proof-note">
+            {hasHandoff ? "Booking handoff ready" : "Handoff available on supported providers"}
+          </span>
+        </div>
         <p className="fl-route break-words">
           {flight.flight_no} · {flight.departure_time} → {flight.arrival_time}
         </p>
@@ -55,22 +76,26 @@ export default function FlightCard({
         </p>
         <div className="flight-card__actions">
           {hasHandoff && (
-            <a
-              href={flight.handoff_url}
-              target="_blank"
-              rel="noreferrer"
-              className="flight-card__link"
-            >
-              Open Booking
-            </a>
+            <>
+              <a
+                href={resolvedHandoffUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="flight-card__link flight-card__link--primary"
+                title="Secure booking handoff link"
+              >
+                Book now
+              </a>
+              <span className="fl-meta">Provider handoff opens a secure booking flow in a new tab.</span>
+            </>
           )}
           <button
             onClick={handleCopy}
-            className="flight-card__copy"
-            aria-label="Copy flight details"
+            className="flight-card__copy flight-card__copy--secondary"
+            aria-label="Copy itinerary details"
           >
             <span aria-hidden="true" className="flight-card__copy-icon">⧉</span>
-            {copied ? "Copied" : "Copy details"}
+            {copied ? "Copied" : "Copy itinerary"}
           </button>
         </div>
       </div>

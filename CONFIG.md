@@ -5,6 +5,7 @@
 - Frontend local runtime (Vite): edit `frontend/.env` (start from `frontend/.env.example`).
 - Docker validation/runtime variant in this repo: `.env.laptopdocker` (only for that deployment path).
 - One-off validator generated environment: `.env.tmp` (created by `full_validation.py`; do not treat as canonical).
+- For operator-facing endpoint/startup/topology command examples, see `docs/operator-sheet.md` and `docs/demo-sheet.md`.
 
 ## 1. Purpose
 This project has multiple configuration surfaces:

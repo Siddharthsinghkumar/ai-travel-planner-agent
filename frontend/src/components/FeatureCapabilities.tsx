@@ -7,16 +7,16 @@ type Props = {
 
 function getPreviewDescription(item: FeatureCapability) {
   const map: Record<string, string> = {
-    "flight-search": "Search and compare relevant flight options in seconds.",
-    "weather-forecast": "Check destination weather guidance while planning your trip.",
+    "flight-search": "Search and compare live flight options; response time varies by provider availability.",
+    "weather-forecast": "Check destination weather guidance when forecast data is available.",
     streaming: "Follow live planning updates as recommendations are prepared.",
     "booking-handoff": "Open booking links when a provider handoff is available.",
-    "booking-actions": "Use chat prompts to update booking-related steps.",
-    "price-tracking-chat": "Ask the planner to monitor pricing through chat guidance.",
+    "booking-actions": "Use explicit chat phrases for basic confirm/cancel/hold actions.",
+    "price-tracking-chat": "Start tracking via natural-language chat prompts; dedicated alert controls are still limited.",
     "full-itinerary": "Expanded day-by-day trip planning is on the way.",
     "price-alerts-ui": "Dedicated alert management is being designed.",
     "advanced-metrics": "Advanced per-flight insights are planned for a future release.",
-    "rich-multi-city-streaming": "Richer multi-city planning views are coming soon.",
+    "rich-multi-city-streaming": "Basic two-leg via-stopover planning is available, with richer live leg-by-leg detail still in progress.",
     "mid-stream-failover": "More resilient live updates are being built.",
   };
 
@@ -25,7 +25,7 @@ function getPreviewDescription(item: FeatureCapability) {
 
 function getStatusLabel(status: FeatureCapability["status"]) {
   if (status === "live") return "Live";
-  if (status === "partial") return "Partial";
+  if (status === "partial") return "Live (guided)";
   return "Coming soon";
 }
 
@@ -42,12 +42,12 @@ export default function FeatureCapabilities({ items }: Props) {
   return (
     <section className="capabilities-section section-center">
       <div className="reveal">
-        <p className="section-label">{IS_PREVIEW_UI ? "What you can do" : "What we offer"}</p>
-        <h2 className="section-title">{IS_PREVIEW_UI ? "Travel planning features" : "Planner capabilities"}</h2>
+        <p className="section-label">{IS_PREVIEW_UI ? "What you can do" : "Capabilities"}</p>
+        <h2 className="section-title">{IS_PREVIEW_UI ? "Travel planning features" : "What this travel planner handles today"}</h2>
         <p className="section-sub">
           {IS_PREVIEW_UI
-            ? "From search to shortlist, plan with real-time insights and clear next steps."
-            : "Built for clear planning: live essentials now, advanced capabilities rolling out."}
+            ? "From search to shortlist, plan with live route intelligence and clear next steps."
+            : "These cards reflect the current product surface, including chat-led capabilities and features still in progress."}
         </p>
       </div>
 
@@ -63,8 +63,7 @@ export default function FeatureCapabilities({ items }: Props) {
                 {getStatusLabel(item.status)}
               </div>
               <h3 className="feat-title">{item.title}</h3>
-              <p className="feat-desc">{IS_PREVIEW_UI ? getPreviewDescription(item) : item.description}</p>
-              {!IS_PREVIEW_UI && item.note && <p className="cap-note">{item.note}</p>}
+              <p className="feat-desc">{getPreviewDescription(item)}</p>
             </article>
           );
         })}
@@ -72,7 +71,7 @@ export default function FeatureCapabilities({ items }: Props) {
 
       {!IS_PREVIEW_UI && comingSoonItems.length > 0 && (
         <div className="coming-soon-row reveal">
-          <div className="cs-label">Planned features</div>
+          <div className="cs-label">What&apos;s coming</div>
           <div className="cs-chips">
             {comingSoonItems.map((item) => (
               <div key={item.id} className="cs-chip">

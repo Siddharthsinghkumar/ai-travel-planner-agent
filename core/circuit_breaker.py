@@ -215,7 +215,12 @@ class AsyncCircuitBreaker:
     # Core `call()` method (for coroutines)
     # ----------------------------------------------------------------------
 
-    async def call(self, func: Callable[[], Awaitable[T]]) -> T:
+    async def call(
+        self,
+        func: Callable[[], Awaitable[T]],
+        *,
+        treat_cancelled_as_failure: bool = False,
+    ) -> T:
         """
         Execute the provided async function under circuit breaker protection.
 
@@ -238,6 +243,22 @@ class AsyncCircuitBreaker:
         # Execute the protected function outside the lock to avoid holding it during I/O
         try:
             result = await func()
+        except asyncio.CancelledError:
+            if treat_cancelled_as_failure:
+                async with self._lock:
+                    await self._record_failure()
+                    self._emit_metric("circuit.failure", {"cancelled": True})
+                self._logger.warning(
+                    "Circuit breaker recorded cancellation as failure",
+                    extra={"event": "breaker_cancelled_failure"},
+                )
+            else:
+                self._emit_metric("circuit.cancelled", {"cancelled": True})
+                self._logger.info(
+                    "Circuit breaker observed cancellation (neutral)",
+                    extra={"event": "breaker_cancelled"},
+                )
+            raise
         except Exception:
             # Failure path
             async with self._lock:
@@ -259,6 +280,7 @@ class AsyncCircuitBreaker:
         self,
         agen_factory: Callable[[], AsyncGenerator],
         non_failure_exceptions: tuple[type[BaseException], ...] = (),
+        treat_cancelled_as_failure: bool = False,
     ) -> AsyncGenerator:
         """
         Protect an async generator produced by `agen_factory()`.
@@ -281,9 +303,18 @@ class AsyncCircuitBreaker:
             async for item in agen:
                 yield item
         except asyncio.CancelledError:
-            # Treat caller cancellation as a neutral outcome; do not poison breaker state.
-            self._emit_metric("circuit.cancelled", {"cancel": True})
-            self._logger.info("Circuit breaker observed cancellation", extra={"event": "breaker_cancelled"})
+            if treat_cancelled_as_failure:
+                async with self._lock:
+                    await self._record_failure()
+                    self._emit_metric("circuit.failure", {"cancelled": True})
+                self._logger.warning(
+                    "Circuit breaker recorded generator cancellation as failure",
+                    extra={"event": "breaker_cancelled_failure"},
+                )
+            else:
+                # Treat caller cancellation as a neutral outcome unless explicitly configured.
+                self._emit_metric("circuit.cancelled", {"cancel": True})
+                self._logger.info("Circuit breaker observed cancellation", extra={"event": "breaker_cancelled"})
             raise
         except Exception as exc:
             if non_failure_exceptions and isinstance(exc, non_failure_exceptions):

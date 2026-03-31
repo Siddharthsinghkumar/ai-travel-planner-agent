@@ -73,6 +73,22 @@ def _mark_checked(token: str, now: float) -> None:
         _last_checked.popitem(last=False)  # remove least recently used
 
 
+def _coerce_flights_result(result: Any) -> list:
+    """
+    Normalize airline search results to a list of flight-like objects.
+    Supports:
+    - list[Flight]
+    - tuple/list payload where first item is list[Flight]
+    """
+    if isinstance(result, list):
+        return result
+    if isinstance(result, tuple) and result:
+        flights = result[0]
+        if isinstance(flights, list):
+            return flights
+    return []
+
+
 # ----------------------------------------------------------------------
 # Database model
 # ----------------------------------------------------------------------
@@ -554,7 +570,10 @@ async def check_held_booking_prices() -> list[dict]:
             if now - last < CHECK_COOLDOWN_SECONDS:
                 logger.debug(
                     "Skipping booking token due to cooldown",
-                    extra={"booking_token": booking_token, "seconds_left": CHECK_COOLDOWN_SECONDS - (now - last)}
+                    extra={
+                        "booking_token_present": True,
+                        "seconds_left": CHECK_COOLDOWN_SECONDS - (now - last),
+                    }
                 )
                 continue
 
@@ -573,12 +592,13 @@ async def check_held_booking_prices() -> list[dict]:
                 _mark_checked(booking_token, now)   # update throttle cache
             else:
                 # Fallback to generic search
-                new_flights = await search_flights(
+                new_search_result = await search_flights(
                     departure=origin,
                     arrival=destination,
                     date=travel_date,
                     max_results=5,
                 )
+                new_flights = _coerce_flights_result(new_search_result)
                 if new_flights:
                     new_flight = min(new_flights, key=lambda f: f.price_inr)
         except AirlineAPIError as e:

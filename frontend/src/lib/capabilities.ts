@@ -4,35 +4,36 @@ export const FEATURE_CAPABILITIES: FeatureCapability[] = [
   {
     id: "flight-search",
     title: "Real-time flight search",
-    description: "Live flight search with ranking, filtering, and best-option selection.",
-    status: "live",
+    description:
+      "Flight search and best-option ranking are available. Basic route controls are in the form; advanced constraints can be added in chat.",
+    status: "partial",
   },
   {
     id: "weather-forecast",
     title: "Destination weather forecast",
     description:
-      "Weather guidance is included for in-range travel dates; distant dates can return estimated fallback guidance.",
+      "Weather guidance is included for forecastable travel dates; farther dates may show limited placeholder guidance.",
     status: "partial",
   },
   {
     id: "streaming",
     title: "Streaming AI responses",
     description:
-      "Live response updates are available, with automatic continuity fallback if connection quality drops.",
+      "Live response updates are available, with non-stream retry for recoverable interruptions.",
     status: "partial",
   },
   {
     id: "booking-handoff",
     title: "Booking handoff links",
     description:
-      "Booking handoff is available for supported results, with fallback links used when direct resolution is unavailable.",
+      "Booking handoff links appear for supported results when a booking URL is available.",
     status: "partial",
   },
   {
     id: "booking-actions",
     title: "Booking actions in chat",
     description:
-      "Action requests can be handled in chat language today; dedicated in-product controls are still evolving.",
+      "Basic confirm/cancel/hold actions are available through explicit natural-language prompts in the query box; dedicated action buttons are not yet available.",
     status: "partial",
     note: "Chat-driven flow for now.",
   },
@@ -40,7 +41,7 @@ export const FEATURE_CAPABILITIES: FeatureCapability[] = [
     id: "price-tracking-chat",
     title: "Price tracking in chat",
     description:
-      "Price monitoring can be started in chat, while alert management UI remains limited.",
+      "Price tracking can be initiated with natural-language prompts in the query box; alert management remains limited and is not yet a dedicated guided UI flow.",
     status: "partial",
     note: "Setup is currently chat-led.",
   },
@@ -68,9 +69,9 @@ export const FEATURE_CAPABILITIES: FeatureCapability[] = [
   {
     id: "rich-multi-city-streaming",
     title: "Rich multi-city streaming",
-    description: "Multi-city live planning is available in limited form and is being expanded.",
-    status: "coming-soon",
-    note: "Under development",
+    description: "Basic two-leg via-stopover itineraries are available now; richer per-leg live streaming is still under development.",
+    status: "partial",
+    note: "Included in limited form.",
   },
   {
     id: "mid-stream-failover",

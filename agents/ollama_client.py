@@ -32,7 +32,7 @@ from core.circuit_breaker import AsyncCircuitBreaker, CircuitBreakerOpenError
 from core.retry import RetryConfig, async_retry
 from core.exceptions import LLMError
 from core.metrics import increment_llm_success, increment_llm_failure, increment_llm_cancelled
-from core.env_config import get_env_float, get_env_str
+from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str
 
 # ----------------------------------------------------------------------
 # Environment and defaults
@@ -40,15 +40,41 @@ from core.env_config import get_env_float, get_env_str
 OLLAMA_BASE_URL = get_env_str("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = get_env_str("OLLAMA_MODEL", "openhermes")
 OLLAMA_TIMEOUT = get_env_float("OLLAMA_TIMEOUT", 30.0)   # default timeout in seconds
+OLLAMA_BREAKER_FAILURE_THRESHOLD = max(1, get_env_int("OLLAMA_BREAKER_FAILURE_THRESHOLD", 5))
+OLLAMA_BREAKER_RECOVERY_TIMEOUT = max(5, get_env_int("OLLAMA_BREAKER_RECOVERY_TIMEOUT", 60))
 
-if not OLLAMA_MODEL:
-    raise RuntimeError("OLLAMA_MODEL not configured")
+def _resolve_ollama_model() -> str:
+    model = (get_env_str("OLLAMA_MODEL", OLLAMA_MODEL) or OLLAMA_MODEL).strip()
+    if not model:
+        raise RuntimeError("OLLAMA_MODEL not configured")
+    return model
 
-# Validate base URL using httpx.URL (catches malformed URLs)
-try:
-    httpx.URL(OLLAMA_BASE_URL)
-except Exception as e:
-    raise RuntimeError(f"Invalid OLLAMA_BASE_URL: {OLLAMA_BASE_URL}") from e
+
+def _resolve_ollama_base_url() -> str:
+    base_url = (get_env_str("OLLAMA_BASE_URL", OLLAMA_BASE_URL) or OLLAMA_BASE_URL).strip()
+    try:
+        httpx.URL(base_url)
+    except Exception as e:
+        raise RuntimeError(f"Invalid OLLAMA_BASE_URL: {base_url}") from e
+    return base_url
+
+
+def _resolve_ollama_timeout() -> float:
+    return max(1.0, get_env_float("OLLAMA_TIMEOUT", OLLAMA_TIMEOUT))
+
+
+def _resolve_ollama_thinking_mode() -> str:
+    """
+    Controls whether to explicitly request model-side reasoning/thinking output.
+    Supported values:
+      - auto: do not set model think option (default)
+      - disable: send think=False when supported by model/runtime
+      - force: send think=True when supported by model/runtime
+    """
+    raw = (get_env_str("OLLAMA_THINKING_MODE", "auto") or "auto").strip().lower()
+    if raw in {"disable", "force", "auto"}:
+        return raw
+    return "auto"
 
 # ----------------------------------------------------------------------
 # Logging setup
@@ -116,8 +142,8 @@ class RateLimitError(OllamaError):
 # Circuit breaker instance for Ollama
 # ----------------------------------------------------------------------
 ollama_breaker = AsyncCircuitBreaker(
-    failure_threshold=5,
-    recovery_timeout=60
+    failure_threshold=OLLAMA_BREAKER_FAILURE_THRESHOLD,
+    recovery_timeout=OLLAMA_BREAKER_RECOVERY_TIMEOUT,
 )
 
 # ----------------------------------------------------------------------
@@ -151,6 +177,44 @@ retry_cfg = RetryConfig(
     )
 )
 
+
+def _extract_stream_token_or_heartbeat(data: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Normalize stream chunk payloads across Ollama/model variants.
+
+    Returns:
+      (token, kind)
+      - token: visible text token, heartbeat empty string, or None
+      - kind: "visible", "thinking_heartbeat", or None
+    """
+    message = data.get("message")
+    token: Optional[str] = None
+
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            token = content
+
+    if token is None:
+        response_text = data.get("response")
+        if isinstance(response_text, str):
+            token = response_text
+
+    if isinstance(token, str) and token:
+        return token, "visible"
+
+    thinking = data.get("thinking")
+    if not isinstance(thinking, str) and isinstance(message, dict):
+        maybe_nested_thinking = message.get("thinking")
+        if isinstance(maybe_nested_thinking, str):
+            thinking = maybe_nested_thinking
+    if isinstance(thinking, str) and thinking.strip():
+        # Heartbeat: upstream is actively producing reasoning tokens even before
+        # user-visible answer text appears.
+        return "", "thinking_heartbeat"
+
+    return None, None
+
 # ----------------------------------------------------------------------
 # Internal unprotected streaming generator (actual HTTP logic)
 # ----------------------------------------------------------------------
@@ -177,11 +241,13 @@ async def _streaming_call_internal(
     # Counter to limit JSON decode error logging
     bad_json_count = 0
     max_bad_json_log = 5
+    visible_chunk_count = 0
+    thinking_heartbeat_count = 0
 
     try:
         async with client.stream(
             "POST",
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{_resolve_ollama_base_url()}/api/chat",
             json=payload,
             headers=headers,
             timeout=timeout_obj
@@ -242,10 +308,25 @@ async def _streaming_call_internal(
                             extra={"line": line, "request_id": request_id}
                         )
                     continue
-                token = data.get("message", {}).get("content", "")
-                if token:
-                    yield token
+                token, token_kind = _extract_stream_token_or_heartbeat(data)
+                if token_kind == "visible":
+                    visible_chunk_count += 1
+                    yield token  # type: ignore[arg-type]
+                elif token_kind == "thinking_heartbeat":
+                    thinking_heartbeat_count += 1
+                    # Yield an empty heartbeat so router/planner can mark the stream as alive
+                    # without exposing internal reasoning text.
+                    yield ""
                 if data.get("done"):
+                    logger.debug(
+                        "ollama_stream_chunk_profile",
+                        extra={
+                            "request_id": request_id,
+                            "visible_chunks": visible_chunk_count,
+                            "thinking_heartbeat_chunks": thinking_heartbeat_count,
+                            "model": payload.get("model"),
+                        },
+                    )
                     break
     except asyncio.CancelledError:
         # Do NOT increment metric here; let the outer `generate()` handle cancellation metrics.
@@ -298,14 +379,14 @@ async def _streaming_call(
     try:
         async for token in ollama_breaker.run_generator_protected(agen_factory):
             yield token
-    except CircuitBreakerOpenError:
+    except CircuitBreakerOpenError as exc:
         logger.warning(
             "Ollama circuit open, rejecting streaming request",
             extra={"request_id": request_id}
         )
         # Optional: increment a metric for circuit open events
         increment_llm_failure("ollama.circuit_open")
-        raise
+        raise OllamaError("Circuit breaker is open for ollama backend") from exc
 
 # ----------------------------------------------------------------------
 # Protected non‑streaming call (with circuit breaker + retry)
@@ -333,7 +414,7 @@ async def _non_streaming_call_impl(
 
     try:
         response = await client.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{_resolve_ollama_base_url()}/api/chat",
             json=payload,
             headers=headers,
             timeout=timeout_obj
@@ -396,9 +477,19 @@ async def _non_streaming_call_impl(
         except json.JSONDecodeError as e:
             raise OllamaError(f"Invalid JSON from Ollama: {e}") from e
 
-        if "message" not in data or "content" not in data["message"]:
-            raise OllamaError("Malformed response: missing message.content")
-        return data["message"]["content"]
+        content: Optional[str] = None
+        message_obj = data.get("message")
+        if isinstance(message_obj, dict):
+            maybe_content = message_obj.get("content")
+            if isinstance(maybe_content, str):
+                content = maybe_content
+        if content is None:
+            maybe_response = data.get("response")
+            if isinstance(maybe_response, str):
+                content = maybe_response
+        if content is None:
+            raise OllamaError("Malformed response: missing message.content/response")
+        return content
     except httpx.HTTPStatusError as exc:
         # Use body_bytes from above if available, else read again carefully
         status = exc.response.status_code
@@ -443,7 +534,51 @@ async def _non_streaming_call(
     IMPORTANT: The breaker's call() must also treat asyncio.CancelledError as a failure
     and record it; otherwise timeouts (which cancel the task) won't open the circuit.
     """
-    return await ollama_breaker.call(lambda: _non_streaming_call_impl(payload, request_id, timeout))
+    try:
+        count_cancelled_as_failure = get_env_bool(
+            "OLLAMA_BREAKER_COUNT_CANCELLED_AS_FAILURE",
+            default=False,
+        )
+        return await ollama_breaker.call(
+            lambda: _non_streaming_call_impl(payload, request_id, timeout),
+            treat_cancelled_as_failure=count_cancelled_as_failure,
+        )
+    except CircuitBreakerOpenError as exc:
+        logger.warning(
+            "Ollama circuit open, rejecting non-streaming request",
+            extra={"request_id": request_id, "model": payload.get("model")},
+        )
+        increment_llm_failure("ollama.circuit_open")
+        raise OllamaError("Circuit breaker is open for ollama backend") from exc
+
+
+async def prewarm(
+    *,
+    model: Optional[str] = None,
+    timeout: Optional[float] = None,
+    request_id: Optional[str] = None,
+) -> str:
+    """
+    Best-effort warmup call for model load.
+    Uses the retried non-streaming transport directly (without planner/router breaker coupling)
+    so startup prewarm failures do not poison runtime circuit state.
+    """
+    warm_model = (model or _resolve_ollama_model()).strip()
+    resolved_timeout = _resolve_ollama_timeout() if timeout is None else max(1.0, float(timeout))
+    payload = {
+        "model": warm_model,
+        "messages": [
+            {"role": "system", "content": "Respond with OK only."},
+            {"role": "user", "content": "ok"},
+        ],
+        "options": {"temperature": 0.0},
+        "stream": False,
+    }
+    try:
+        # Prewarm should exercise actual transport timeout behavior (no duplicate outer timeout).
+        return await _non_streaming_call_impl(payload, request_id=request_id, timeout=resolved_timeout)
+    except Exception as e:
+        raise OllamaError(str(e)) from e
 
 # ----------------------------------------------------------------------
 # Public generate function
@@ -451,11 +586,11 @@ async def _non_streaming_call(
 async def generate(
     prompt: str,
     system: Optional[str] = None,
-    model: str = OLLAMA_MODEL,
+    model: Optional[str] = None,
     temperature: float = 0.2,
     stream: bool = False,
     request_id: Optional[str] = None,
-    timeout: float = OLLAMA_TIMEOUT   # use env var default
+    timeout: Optional[float] = None,   # use env var default
 ) -> Union[str, AsyncGenerator[str, None]]:
     """
     Generate a completion from Ollama using the chat API.
@@ -475,7 +610,10 @@ async def generate(
     # Input validation
     if not prompt:
         raise ValueError("Prompt cannot be empty")
-    if not model:
+    resolved_model = (model or _resolve_ollama_model()).strip()
+    resolved_timeout = _resolve_ollama_timeout() if timeout is None else max(1.0, float(timeout))
+
+    if not resolved_model:
         raise ValueError("Model must be provided")
     if temperature < 0 or temperature > 2:
         raise ValueError("Temperature must be between 0 and 2")
@@ -487,21 +625,25 @@ async def generate(
     messages.append({"role": "user", "content": prompt})
 
     payload = {
-        "model": model,
+        "model": resolved_model,
         "messages": messages,
-        "options": {
-            "temperature": temperature
-        },
+        "options": {"temperature": temperature},
         "stream": stream
     }
+    thinking_mode = _resolve_ollama_thinking_mode()
+    if thinking_mode == "disable":
+        payload["options"]["think"] = False
+    elif thinking_mode == "force":
+        payload["options"]["think"] = True
 
     logger.info(
         "Ollama request started",
         extra={
-            "model": model,
+            "model": resolved_model,
             "stream": stream,
             "request_id": request_id,
-            "temperature": temperature
+            "temperature": temperature,
+            "thinking_mode": thinking_mode,
         }
     )
 
@@ -512,34 +654,20 @@ async def generate(
         async def token_generator():
             success = False
             cancelled = False
-            stream_iter = _streaming_call(payload, request_id, timeout)
+            stream_iter = _streaming_call(payload, request_id, resolved_timeout)
             try:
-                # Use asyncio.timeout for total timeout enforcement (Python 3.11+)
-                async with asyncio.timeout(timeout):
-                    async for token in stream_iter:
-                        yield token
+                # Do not enforce an additional total stream timeout here.
+                # Router/planner layers already enforce stream-init/per-chunk/overall budgets.
+                # A duplicate total timeout at this layer can cause avoidable degradation
+                # even while chunks are flowing successfully.
+                async for token in stream_iter:
+                    yield token
                 success = True
             except asyncio.CancelledError:
                 cancelled = True
                 logger.info("ollama_stream_cancelled", extra={"request_id": request_id})
                 increment_llm_cancelled("ollama")
                 raise
-            except TimeoutError:
-                # Total timeout reached; ensure inner generator is closed & breaker records a failure
-                try:
-                    await stream_iter.aclose()
-                except Exception:
-                    logger.debug("failed to aclose stream_iter after timeout", exc_info=True)
-                try:
-                    await ollama_breaker.record_failure()
-                except Exception:
-                    logger.debug("failed to record breaker failure", exc_info=True)
-                logger.error(
-                    "Ollama streaming timed out",
-                    extra={"request_id": request_id, "timeout": timeout}
-                )
-                # Convert to well-defined public exception
-                raise OllamaError(f"Streaming timed out after {timeout}s")
             except Exception:
                 raise
             finally:
@@ -557,24 +685,15 @@ async def generate(
     else:
         # Non‑streaming branch – enforce overall SLA timeout and record failures on timeout
         try:
-            result = await asyncio.wait_for(
-                _non_streaming_call(payload, request_id, timeout),
-                timeout=timeout
-            )
+            result = await _non_streaming_call(payload, request_id, resolved_timeout)
         except asyncio.CancelledError:
             # Client cancelled – increment cancellation metric and re-raise
             logger.info("ollama_request_cancelled", extra={"request_id": request_id})
             increment_llm_cancelled("ollama")
             raise
-        except asyncio.TimeoutError:
-            logger.error(
-                "Ollama request timed out",
-                extra={"request_id": request_id, "timeout": timeout}
-            )
-            increment_llm_failure("ollama")
-            raise OllamaError(f"Request timed out after {timeout}s") from None
         except Exception:
-            # All other exceptions are already logged and counted by _non_streaming_call
+            # Record non-cancellation failure at the public API boundary.
+            increment_llm_failure("ollama")
             raise
         else:
             latency = time.monotonic() - start_time
@@ -604,7 +723,7 @@ async def health_check() -> str:
         )
 
         response = await client.get(
-            f"{OLLAMA_BASE_URL}/api/tags",
+            f"{_resolve_ollama_base_url()}/api/tags",
             timeout=timeout_obj
         )
 
@@ -620,18 +739,20 @@ async def health_check() -> str:
             if isinstance(m, dict)
         }
 
-        if OLLAMA_MODEL in model_names:
+        expected_model = _resolve_ollama_model()
+
+        if expected_model in model_names:
             return "ok"
 
         # Also allow prefix match (openhermes vs openhermes:latest)
-        prefix = OLLAMA_MODEL.split(":")[0]
+        prefix = expected_model.split(":")[0]
         for name in model_names:
             if name and name.startswith(prefix):
                 return "ok"
 
         logger.warning(
             "Ollama model not found",
-            extra={"expected": OLLAMA_MODEL, "available": list(model_names)}
+            extra={"expected": expected_model, "available": list(model_names)}
         )
 
         return "fail"
@@ -664,13 +785,15 @@ class OllamaClient:
         model: Optional[str] = None,
         stream: bool = False,
         request_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ):
         return await generate(
             prompt=prompt,
             system=system,
-            model=model or OLLAMA_MODEL,
+            model=model or _resolve_ollama_model(),
             stream=stream,
             request_id=request_id,
+            timeout=timeout,
         )
 
     async def health_check(self) -> bool:

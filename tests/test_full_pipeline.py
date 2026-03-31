@@ -96,9 +96,15 @@ async def test_metrics_endpoint():
     """Phase 4 metrics exposure"""
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # Prime HTTP metrics with non-/metrics traffic.
+        warm_resp = await client.post("/ask", json=payload)
+        assert warm_resp.status_code == 200
         resp = await client.get("/metrics")
     assert resp.status_code == 200
     text = resp.text
     assert "llm_requests_total" in text
     assert "stream_requests_total" in text
     assert "job_queue_size" in text
+    assert "http_requests_total" in text
+    assert "http_request_duration_seconds" in text
+    assert "http_inflight_requests" in text

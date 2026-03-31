@@ -10,6 +10,7 @@ type DevRoutingOverrides = {
 type Props = {
   onSubmit: (payload: AskPayload) => void;
   disabled: boolean;
+  resultVersion?: number;
   onRecentQueriesChange?: (queries: string[]) => void;
   devRoutingOverrides?: DevRoutingOverrides | null;
 };
@@ -17,14 +18,20 @@ type Props = {
 export default function QueryForm({
   onSubmit,
   disabled,
+  resultVersion = 0,
   onRecentQueriesChange,
   devRoutingOverrides = null,
 }: Props) {
   const [query, setQuery] = useState("Find cheap flight Delhi to Mumbai tomorrow");
   const [origin, setOrigin] = useState("");
   const [destination, setDestination] = useState("");
+  const [stopover, setStopover] = useState("");
   const [date, setDate] = useState("");
   const [tripType, setTripType] = useState<"one-way" | "round-trip" | "via-stopover">("one-way");
+  const [tabChoiceEverExplicit, setTabChoiceEverExplicit] = useState(false);
+  const [manualTabChangedSinceLastResult, setManualTabChangedSinceLastResult] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [recentQueries, setRecentQueries] = useState<string[]>(() => {
     if (typeof window === "undefined") return [];
     const saved = localStorage.getItem("recent_queries");
@@ -76,11 +83,65 @@ export default function QueryForm({
     el.style.overflowY = el.scrollHeight > QUERY_MAX_HEIGHT ? "auto" : "hidden";
   }, [query]);
 
+  useEffect(() => {
+    if (!disabled) setIsSubmitting(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    setManualTabChangedSinceLastResult(false);
+    setTabChoiceEverExplicit(false);
+  }, [resultVersion]);
+
+  function inferExplicitTripTypeFromQuery(queryText: string, stopoverText: string): "round-trip" | "via-stopover" | null {
+    const q = queryText.toLowerCase();
+    if (stopoverText.trim()) return "via-stopover";
+    if (/\b(via|stopover|stop over|through|connecting through|stop in)\b/i.test(q)) return "via-stopover";
+    if (/\b(round[- ]?trip|return(?:ing)?|come back)\b/i.test(q)) return "round-trip";
+    return null;
+  }
+
   function handleSubmit(e?: FormEvent) {
     if (e) e.preventDefault();
+    setIsSubmitting(true);
+    setFormError(null);
 
     const payload: AskPayload = {};
-    const finalQuery = query.trim();
+    let finalQuery = query.trim();
+    const queryDerivedTripType = inferExplicitTripTypeFromQuery(finalQuery, stopover);
+    const hasCommittedResult = resultVersion > 0;
+
+    let resolvedTripType: "one-way" | "round-trip" | "via-stopover";
+    if (hasCommittedResult && manualTabChangedSinceLastResult) {
+      resolvedTripType = tripType;
+    } else if (queryDerivedTripType) {
+      resolvedTripType = queryDerivedTripType;
+    } else if (tabChoiceEverExplicit) {
+      resolvedTripType = tripType;
+    } else {
+      resolvedTripType = "one-way";
+    }
+
+    if (tripType !== resolvedTripType) {
+      setTripType(resolvedTripType);
+    }
+
+    if (resolvedTripType === "via-stopover") {
+      const stopoverText = stopover.trim();
+      const hasViaInstruction = /\b(via|stopover|through)\b/i.test(finalQuery);
+      if (!hasViaInstruction && !stopoverText) {
+        setFormError("Enter a stopover city or IATA code to run a via-stopover search.");
+        setIsSubmitting(false);
+        return;
+      }
+      if (!hasViaInstruction && !finalQuery) {
+        const originText = origin.trim() || "origin";
+        const destinationText = destination.trim() || "destination";
+        const dateText = date.trim() ? ` on ${date.trim()}` : "";
+        finalQuery = `Flight ${originText} to ${destinationText} via ${stopoverText}${dateText}`;
+      } else if (!hasViaInstruction && stopoverText) {
+        finalQuery = `${finalQuery} via ${stopoverText}`.trim();
+      }
+    }
 
     if (finalQuery) {
       payload.user_query = finalQuery;
@@ -93,7 +154,7 @@ export default function QueryForm({
     if (origin.trim()) payload.origin = origin.trim();
     if (destination.trim()) payload.destination = destination.trim();
     if (date.trim()) payload.date = date;
-    if (tripType) payload.trip_type = tripType;
+    payload.trip_type = resolvedTripType;
 
     if (devRoutingOverrides?.llm_mode) {
       payload.llm_mode = devRoutingOverrides.llm_mode;
@@ -110,21 +171,33 @@ export default function QueryForm({
       <div className="trip-tabs">
         <button
           type="button"
-          onClick={() => setTripType("one-way")}
+          onClick={() => {
+            setTripType("one-way");
+            setTabChoiceEverExplicit(true);
+            if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
+          }}
           className={`trip-tab ${tripType === "one-way" ? "active" : ""}`}
         >
           One-way
         </button>
         <button
           type="button"
-          onClick={() => setTripType("round-trip")}
+          onClick={() => {
+            setTripType("round-trip");
+            setTabChoiceEverExplicit(true);
+            if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
+          }}
           className={`trip-tab ${tripType === "round-trip" ? "active" : ""}`}
         >
           Round-trip
         </button>
         <button
           type="button"
-          onClick={() => setTripType("via-stopover")}
+          onClick={() => {
+            setTripType("via-stopover");
+            setTabChoiceEverExplicit(true);
+            if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
+          }}
           className={`trip-tab ${tripType === "via-stopover" ? "active" : ""}`}
         >
           Via / Stopover
@@ -133,25 +206,32 @@ export default function QueryForm({
 
       <div className="nl-row">
         <span className="nl-icon" aria-hidden="true">↗</span>
-        <textarea
-          ref={textRef}
-          placeholder={
-            tripType === "via-stopover"
-              ? "E.g. Flight Delhi to Goa via Mumbai tomorrow..."
-              : tripType === "round-trip"
-                ? "E.g. Round-trip Delhi to Mumbai returning in 3 days..."
-                : "Find cheap flights Delhi to Mumbai tomorrow..."
-          }
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          rows={1}
-          className="nl-input"
-        />
+        <div className="nl-main">
+          <p className="planner-guidance">Primary input: describe your trip naturally</p>
+          <textarea
+            ref={textRef}
+            placeholder={
+              tripType === "via-stopover"
+                ? "E.g. Flight Delhi to Goa via Mumbai tomorrow..."
+                : tripType === "round-trip"
+                  ? "E.g. Round-trip Delhi to Mumbai returning in 3 days..."
+                  : "Find cheap flights Delhi to Mumbai tomorrow..."
+            }
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            rows={1}
+            className="nl-input"
+          />
+        </div>
         <button type="submit" className="nl-send" disabled={disabled} aria-label="Submit query">
-          →
+          <span className="nl-send__arrow" aria-hidden="true">→</span>
         </button>
       </div>
 
+      <div className="planner-structured-head">
+        <span className="planner-structured-label">Assistive fields</span>
+        <span className="planner-structured-note">Optional quick controls. We merge these with your natural-language prompt.</span>
+      </div>
       <div className="fields-row">
         <label className="field-group">
           <span className="field-label">Origin</span>
@@ -180,20 +260,34 @@ export default function QueryForm({
               type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
-              className="date-native"
+              className="date-native f-date"
               lang="en-GB"
             />
           </div>
         </label>
+        {tripType === "via-stopover" && (
+          <label className="field-group">
+            <span className="field-label">Stopover</span>
+            <input
+              placeholder="Mumbai (BOM)"
+              value={stopover}
+              onChange={(e) => setStopover(e.target.value)}
+              className="f-input"
+            />
+          </label>
+        )}
       </div>
+      {formError && <div className="notice notice--error notice--inline">{formError}</div>}
 
       <div className="card-footer min-w-0">
         <button
           type="submit"
-          disabled={disabled}
+          disabled={disabled || isSubmitting}
           className="plan-btn"
         >
-          Plan my trip →
+          <span className="plan-btn__content">
+            {isSubmitting || disabled ? "Planning your trip..." : "Plan my trip →"}
+          </span>
         </button>
       </div>
     </form>

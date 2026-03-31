@@ -53,3 +53,42 @@ def test_extracts_backend_status_tags_from_stream_done_json(monkeypatch):
     )
     tags = module._extract_structured_failure_tags(stream_body, is_stream=True)
     assert "provider_billing_blocked" in tags
+
+
+def test_stream_case_fails_when_done_json_missing(monkeypatch):
+    module = _load_full_validation_module(monkeypatch)
+
+    class FakeCurlProcess:
+        def __init__(self, cmd, stdout=None, stderr=None, text=None):
+            self.cmd = cmd
+            self.returncode = 0
+            out_path = None
+            if "-o" in cmd:
+                out_path = cmd[cmd.index("-o") + 1]
+            if out_path:
+                Path(out_path).write_text("data: token chunk only\n\n")
+
+        def communicate(self):
+            return "200", ""
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakeCurlProcess)
+    module.REPORT.clear()
+
+    status = module.run_and_log(
+        "streaming_test_machine",
+        [
+            "curl",
+            "-sS",
+            "-X",
+            "POST",
+            "http://127.0.0.1:8000/ask?stream=true",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            '{"user_query":"test"}',
+        ],
+        is_stream=True,
+    )
+
+    assert status == 124
+    assert module.REPORT[-1]["reason"] == "Stream missing DONE_JSON completion payload"

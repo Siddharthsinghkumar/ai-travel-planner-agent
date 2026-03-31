@@ -1,5 +1,8 @@
 #tests/test_price_tracker.py
+from types import SimpleNamespace
+
 import pytest
+import tools.price_tracker as price_tracker
 from tools.price_tracker import parse_price_insights, format_price_insights_for_llm
 
 def test_price_insights_parsing_and_formatting():
@@ -31,3 +34,57 @@ def test_price_insights_parsing_and_formatting():
     assert "₹5,500–₹7,200" in formatted_string
     assert "falling" in formatted_string
     assert "Recommend booking soon" in formatted_string
+
+
+@pytest.mark.asyncio
+async def test_check_held_booking_prices_fallback_accepts_search_flights_tuple(monkeypatch):
+    snapshot_calls = []
+
+    async def fake_search_with_booking_token(_token):
+        return []
+
+    async def fake_search_flights(**_kwargs):
+        return (
+            [
+                SimpleNamespace(
+                    price_inr=4200,
+                    flight_no="TA101",
+                    airline="TestAir",
+                    booking_token="tok_new",
+                )
+            ],
+            {"price_insights": {"price_level": "low"}},
+        )
+
+    def fake_get_active_held_bookings():
+        return [
+            {
+                "id": 123,
+                "flight": {
+                    "origin": "DEL",
+                    "destination": "BOM",
+                    "date": "2026-05-01",
+                    "price_inr": 6000,
+                    # No booking_token -> fallback branch uses search_flights()
+                },
+            }
+        ]
+
+    async def fake_build_booking_handoff_url(**_kwargs):
+        return "https://example.com/booking"
+
+    def fake_record_price_snapshot(**kwargs):
+        snapshot_calls.append(kwargs)
+
+    monkeypatch.setattr("tools.airline_api.search_with_booking_token", fake_search_with_booking_token)
+    monkeypatch.setattr("tools.airline_api.search_flights", fake_search_flights)
+    monkeypatch.setattr("tools.booking_handoff.get_active_held_bookings", fake_get_active_held_bookings)
+    monkeypatch.setattr("tools.booking_handoff.build_booking_handoff_url", fake_build_booking_handoff_url)
+    monkeypatch.setattr(price_tracker, "record_price_snapshot", fake_record_price_snapshot)
+    monkeypatch.setattr(price_tracker, "PRICE_DROP_ALERT_THRESHOLD_PCT", 999.0)
+
+    alerts = await price_tracker.check_held_booking_prices()
+
+    assert alerts == []
+    assert len(snapshot_calls) == 1
+    assert snapshot_calls[0]["price_inr"] == 4200.0

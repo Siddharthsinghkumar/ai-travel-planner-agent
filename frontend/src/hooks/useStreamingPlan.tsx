@@ -3,10 +3,83 @@ import { useCallback, useRef, useState } from "react";
 import { API_BASE } from "../lib/api";
 import type { AskPayload, Flight, TripPlan } from "../lib/types";
 
+type ResponseMeta = {
+  result_status?: string;
+  failure_reason?: string;
+  failure_domain?: string;
+  no_flights_reason?: string;
+  fallback_note?: string;
+  degradation_message?: string;
+  flight_counts?: Record<string, number> | null;
+};
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error.trim().length > 0) return error;
   return fallback;
+}
+
+function extractResponseErrorMessage(payload: unknown, fallback: string): string {
+  if (payload && typeof payload === "object") {
+    const data = payload as Record<string, unknown>;
+    if (typeof data.detail === "string" && data.detail.trim()) return data.detail.trim();
+    if (typeof data.error === "string" && data.error.trim()) return data.error.trim();
+    if (typeof data.warning === "string" && data.warning.trim()) return data.warning.trim();
+  }
+  return fallback;
+}
+
+function extractResponseMeta(payload: unknown): ResponseMeta | null {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload as Record<string, unknown>;
+  const degradation =
+    data.degradation && typeof data.degradation === "object"
+      ? (data.degradation as Record<string, unknown>)
+      : null;
+  const flightCounts =
+    data.flight_counts && typeof data.flight_counts === "object"
+      ? (data.flight_counts as Record<string, number>)
+      : null;
+
+  const meta: ResponseMeta = {
+    result_status: typeof data.result_status === "string" ? data.result_status : undefined,
+    failure_reason: typeof data.failure_reason === "string" ? data.failure_reason : undefined,
+    failure_domain: typeof data.failure_domain === "string" ? data.failure_domain : undefined,
+    no_flights_reason: typeof data.no_flights_reason === "string" ? data.no_flights_reason : undefined,
+    fallback_note: typeof data.fallback_note === "string" ? data.fallback_note : undefined,
+    degradation_message:
+      typeof degradation?.message === "string"
+        ? degradation.message
+        : undefined,
+    flight_counts: flightCounts,
+  };
+
+  if (
+    !meta.result_status &&
+    !meta.failure_reason &&
+    !meta.fallback_note &&
+    !meta.degradation_message &&
+    !meta.no_flights_reason
+  ) {
+    return null;
+  }
+  return meta;
+}
+
+function formatStructuredError(payload: unknown, fallback: string): string {
+  const base = extractResponseErrorMessage(payload, fallback);
+  if (!payload || typeof payload !== "object") return base;
+  const data = payload as Record<string, unknown>;
+  const reason = typeof data.failure_reason === "string" ? data.failure_reason : "";
+  const noFlightsReason = typeof data.no_flights_reason === "string" ? data.no_flights_reason : "";
+
+  if (reason === "no_flights") {
+    if (noFlightsReason === "filters_too_strict") {
+      return "No matching flights found for current constraints. Try relaxing filters or changing date/route.";
+    }
+    return "No matching flights found for this route/date. Try a nearby date or a different route.";
+  }
+  return base;
 }
 
 export function useStreamingPlan() {
@@ -19,6 +92,7 @@ export function useStreamingPlan() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isFallback, setIsFallback] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [responseMeta, setResponseMeta] = useState<ResponseMeta | null>(null);
   const [rawStream, setRawStream] = useState("");
 
   const controllerRef = useRef<AbortController | null>(null);
@@ -27,12 +101,24 @@ export function useStreamingPlan() {
   const cancelledRequestIdRef = useRef<number | null>(null);
   const fallbackRequestIdRef = useRef<number | null>(null);
 
+  const clearVisibleResultState = useCallback(() => {
+    setTokens("");
+    setFinalJson(null);
+    setPartialFlights(null);
+    setPartialBestFlight(null);
+    setPartialWeather(null);
+    setReasoningSteps([]);
+    setRawStream("");
+    setResponseMeta(null);
+  }, []);
+
   const isRecoverableStreamError = useCallback((message: string) => {
     const m = message.toLowerCase();
     return (
       m.includes("temporarily unavailable") ||
       m.includes("streaming timed out") ||
       m.includes("stream initialization timed out") ||
+      m.includes("interrupted before completion") ||
       m.includes("streaming unavailable") ||
       m.includes("circuit breaker open") ||
       m.includes("llm temporarily unavailable")
@@ -44,10 +130,14 @@ export function useStreamingPlan() {
       cancelledRequestIdRef.current = requestIdRef.current;
       controllerRef.current.abort();
     }
+    clearVisibleResultState();
+    setError("Request stopped before completion.");
+    setIsFallback(false);
     setIsStreaming(false);
-  }, []);
+  }, [clearVisibleResultState]);
 
-  const runFallbackRequest = useCallback(async (payload: AskPayload) => {
+  const runFallbackRequest = useCallback(async (requestId: number, payload: AskPayload) => {
+    if (requestIdRef.current !== requestId) return;
     try {
       const resp = await fetch(`${API_BASE}/ask`, {
         method: "POST",
@@ -55,12 +145,22 @@ export function useStreamingPlan() {
         body: JSON.stringify(payload),
       });
 
+      if (requestIdRef.current !== requestId) return;
+
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.detail || `HTTP Error ${resp.status}`);
+        setResponseMeta(extractResponseMeta(errData));
+        throw new Error(formatStructuredError(errData, `HTTP Error ${resp.status}`));
       }
 
       const j = await resp.json();
+      if (requestIdRef.current !== requestId) return;
+      if (typeof j?.error === "string" && j.error.trim().length > 0) {
+        throw new Error(j.error.trim());
+      }
+      if (typeof j?.warning === "string" && j.warning.trim().length > 0 && Boolean(j?.fallback)) {
+        throw new Error(j.warning.trim());
+      }
       const fallbackText =
         typeof j?.llm_response === "string"
           ? j.llm_response
@@ -71,28 +171,25 @@ export function useStreamingPlan() {
               : "";
       setTokens(fallbackText.trim().length > 0 ? fallbackText : "");
       setFinalJson(j);
+      setResponseMeta(extractResponseMeta(j));
       setIsFallback(false);
       setIsStreaming(false);
       console.info("[Analytics] Fallback completed successfully.");
     } catch (e: unknown) {
-      setError("Connection issue — please try again.");
+      if (requestIdRef.current !== requestId) return;
+      setError(getErrorMessage(e, "We couldn't complete your plan. Please try again."));
       setIsFallback(false);
       setIsStreaming(false);
     }
   }, []);
 
   const triggerFallback = useCallback(async (requestId: number, payload: AskPayload) => {
+    if (requestIdRef.current !== requestId) return;
     if (fallbackRequestIdRef.current === requestId) return;
     fallbackRequestIdRef.current = requestId;
 
-    setTokens("");
-    setFinalJson(null);
-    setPartialFlights(null);
-    setPartialBestFlight(null);
-    setPartialWeather(null);
-    setReasoningSteps([]);
     setIsFallback(true);
-    await runFallbackRequest(payload);
+    await runFallbackRequest(requestId, payload);
   }, [runFallbackRequest]);
 
   const start = useCallback(
@@ -110,15 +207,11 @@ export function useStreamingPlan() {
       cancelledRequestIdRef.current = null;
       fallbackRequestIdRef.current = null;
 
-      setTokens("");
-      setFinalJson(null);
-      setPartialFlights(null);
-      setPartialBestFlight(null);
-      setPartialWeather(null);
-      setReasoningSteps([]);
+      const isActiveRequest = () => requestIdRef.current === requestId;
+
+      clearVisibleResultState();
       setError(null);
       setIsFallback(false);
-      setRawStream("");
       setIsStreaming(true);
       bufferRef.current = "";
 
@@ -133,6 +226,7 @@ export function useStreamingPlan() {
       let hardNoActivityTimer: ReturnType<typeof setTimeout> | null = null;
       let streamErrorMessage: string | null = null;
       let receivedFinalJson = false;
+      let hasHydratedResultData = false;
 
       try {
         const response = await fetch(`${API_BASE}/ask?stream=true`, {
@@ -147,10 +241,7 @@ export function useStreamingPlan() {
 
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
-          let errMsg = `HTTP Error ${response.status}`;
-          if (errData.detail) {
-            errMsg = typeof errData.detail === "string" ? errData.detail : JSON.stringify(errData.detail);
-          }
+          const errMsg = extractResponseErrorMessage(errData, `HTTP Error ${response.status}`);
           throw new Error(errMsg);
         }
 
@@ -184,6 +275,7 @@ export function useStreamingPlan() {
         };
 
         const appendReasoningStep = (step: string) => {
+          if (!isActiveRequest()) return;
           const trimmed = step.trim();
           if (!trimmed) return;
           setReasoningSteps((prev) => {
@@ -194,6 +286,7 @@ export function useStreamingPlan() {
         };
 
         const processStructuredEvent = (eventType: string, eventData: string) => {
+          if (!isActiveRequest()) return;
           if (!eventData.trim()) return;
 
           if (eventType === "reasoning_step") {
@@ -215,9 +308,13 @@ export function useStreamingPlan() {
               const parsed = JSON.parse(eventData) as Record<string, unknown>;
               if (Array.isArray(parsed?.all_flights)) {
                 setPartialFlights(parsed.all_flights as Flight[]);
+                if (parsed.all_flights.length > 0) {
+                  hasHydratedResultData = true;
+                }
               }
               if (parsed?.best_flight && typeof parsed.best_flight === "object") {
                 setPartialBestFlight(parsed.best_flight as Flight);
+                hasHydratedResultData = true;
               }
             } catch {
               // Ignore malformed structured frame and continue streaming.
@@ -234,6 +331,9 @@ export function useStreamingPlan() {
                   : parsed;
               if (payload && typeof payload === "object") {
                 setPartialWeather(payload);
+                if (Object.keys(payload).length > 0) {
+                  hasHydratedResultData = true;
+                }
               }
             } catch {
               // Ignore malformed structured frame and continue streaming.
@@ -242,6 +342,8 @@ export function useStreamingPlan() {
         };
 
         const processData = async (eventType: string | null, data: string) => {
+          if (!isActiveRequest()) return true;
+
           if (eventType && eventType !== "done") {
             sawStreamActivity = true;
             processStructuredEvent(eventType, data);
@@ -255,11 +357,22 @@ export function useStreamingPlan() {
             streamErrorMessage = data.replace("[ERROR]", "").trim() || "Streaming request failed.";
 
             if (isRecoverableStreamError(streamErrorMessage)) {
+              if (hasHydratedResultData) {
+                setError(
+                  "Explanation generation timed out, but available flight/weather results are shown below."
+                );
+                setIsFallback(false);
+                setIsStreaming(false);
+                return true;
+              }
               await triggerFallback(requestId, payload);
               return true;
             }
 
-            setError("We hit a connection issue. Please try again.");
+            if (!hasHydratedResultData) {
+              clearVisibleResultState();
+            }
+            setError(streamErrorMessage || "We hit a connection issue. Please try again.");
             setIsStreaming(false);
             return true;
           }
@@ -276,16 +389,39 @@ export function useStreamingPlan() {
 
             try {
               const parsed = JSON.parse(after.trim());
-              if (typeof parsed?.error === "string" && isRecoverableStreamError(parsed.error)) {
-                await triggerFallback(requestId, payload);
+              if (typeof parsed?.error === "string") {
+                setResponseMeta(extractResponseMeta(parsed));
+                const doneJsonError = parsed.error.trim();
+                if (isRecoverableStreamError(doneJsonError)) {
+                  if (hasHydratedResultData) {
+                    setError(
+                      "Explanation generation timed out, but available flight/weather results are shown below."
+                    );
+                    setIsFallback(false);
+                    setIsStreaming(false);
+                    return true;
+                  }
+                  await triggerFallback(requestId, payload);
+                  return true;
+                }
+                if (!hasHydratedResultData) {
+                  clearVisibleResultState();
+                }
+                setError(doneJsonError || "We couldn't complete your plan. Please try again.");
+                setFinalJson(null);
+                setIsStreaming(false);
                 return true;
               }
 
               receivedFinalJson = true;
               setFinalJson(parsed);
+              setResponseMeta(extractResponseMeta(parsed));
               setIsStreaming(false);
               return true;
             } catch {
+              if (!hasHydratedResultData) {
+                clearVisibleResultState();
+              }
               setError("We couldn't complete your plan. Please try again.");
               setIsStreaming(false);
               return true;
@@ -309,6 +445,7 @@ export function useStreamingPlan() {
         }, STREAM_SOFT_DELAY_MS);
 
         hardNoActivityTimer = setTimeout(() => {
+          if (!isActiveRequest()) return;
           if (!sawStreamActivity && !receivedFinalJson) {
             fallbackRequestIdRef.current = requestId;
             setIsFallback(true);
@@ -319,6 +456,7 @@ export function useStreamingPlan() {
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
+          if (!isActiveRequest()) return;
 
           const chunk = decoder.decode(value, { stream: true });
           if (chunk.length > 0) {
@@ -346,6 +484,7 @@ export function useStreamingPlan() {
         }
 
         if (accumulatedTokens.trim().length > 0) {
+          if (!isActiveRequest()) return;
           setTokens(accumulatedTokens);
         }
 
@@ -369,7 +508,7 @@ export function useStreamingPlan() {
 
           if (fallbackRequestIdRef.current === requestId) {
             console.warn("[Analytics] Fallback triggered due to stream init timeout");
-            await runFallbackRequest(payload);
+            await runFallbackRequest(requestId, payload);
             return;
           }
 
@@ -378,21 +517,33 @@ export function useStreamingPlan() {
         }
 
         if (isRecoverableStreamError(getErrorMessage(err, ""))) {
+          if (hasHydratedResultData) {
+            setError("Explanation generation timed out, but available flight/weather results are shown below.");
+            setIsFallback(false);
+            setIsStreaming(false);
+            return;
+          }
           await triggerFallback(requestId, payload);
           return;
         }
 
-        setError("We couldn't complete your plan. Please try again.");
+        if (!isActiveRequest()) return;
+        if (!hasHydratedResultData) {
+          clearVisibleResultState();
+        }
+        setError(getErrorMessage(err, "We couldn't complete your plan. Please try again."));
       } finally {
         if (softDelayTimer) clearTimeout(softDelayTimer);
         if (hardNoActivityTimer) clearTimeout(hardNoActivityTimer);
         if (controllerRef.current === controller) {
           controllerRef.current = null;
         }
-        setIsStreaming(false);
+        if (isActiveRequest()) {
+          setIsStreaming(false);
+        }
       }
     },
-    [isRecoverableStreamError, runFallbackRequest, triggerFallback]
+    [clearVisibleResultState, isRecoverableStreamError, runFallbackRequest, triggerFallback]
   );
 
   return {
@@ -405,6 +556,7 @@ export function useStreamingPlan() {
     isStreaming,
     isFallback,
     error,
+    responseMeta,
     rawStream,
     start,
     cancel,

@@ -31,6 +31,7 @@ from core.metrics import (
 from core.config import TESTING
 # API key manager for rotation and exhaustion handling
 from core.api_key_manager import key_manager
+from core.iata_resolver import city_for_iata, is_iata_token
 
 # ----------------------------------------------------------------------
 # Module‑level configuration and state
@@ -58,10 +59,23 @@ ONECALL_OVERVIEW = f"{BASE_URL}/data/3.0/onecall/overview"
 _last_call = 0.0
 _rate_lock = asyncio.Lock()
 RATE_LIMIT_SECONDS = float(os.getenv("WEATHER_RATE_LIMIT_SECONDS", "1.0"))
+WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS = int(os.getenv("WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS", "3600"))
 
 # Retry settings (local)
 MAX_RETRIES = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _redact_request_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy safe for logs by masking credential-like fields."""
+    redacted: Dict[str, Any] = {}
+    for key, value in (params or {}).items():
+        key_l = str(key).lower()
+        if key_l in {"appid", "api_key", "authorization", "x-api-key"}:
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _empty_weather_response(location: Optional[str] = None) -> Dict[str, Any]:
@@ -82,6 +96,16 @@ def _empty_weather_response(location: Optional[str] = None) -> Dict[str, Any]:
         "has_snow": None,
         "precipitation_chance": None,
     }
+
+
+def _forecast_date_from_unix(ts: Optional[int], timezone_offset_sec: int = 0) -> Optional[str]:
+    """Return YYYY-MM-DD in destination local date for a unix timestamp."""
+    if ts is None:
+        return None
+    try:
+        return datetime.utcfromtimestamp(int(ts) + int(timezone_offset_sec)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 # Geocoding cache with TTL (city.lower() -> (lat, lon, timestamp))
 # Using a dict that maintains insertion order (Python 3.7+)
@@ -255,25 +279,32 @@ async def _make_request_raw(
                     # SUCCESS
                     if resp.status_code == 200:
                         data = resp.json()
-                        # --- ADD THIS RAW LOGGING BLOCK ---
                         logger.debug(
-                            "RAW WEATHER API TRACE",
+                            "WEATHER API TRACE",
                             extra={
                                 "request_url": url,
-                                "request_params": params_with_key,
-                                "response_payload": data
-                            }
+                                "request_params": _redact_request_params(params_with_key),
+                                "response_keys": sorted(list(data.keys()))[:50] if isinstance(data, dict) else None,
+                            },
                         )
-                        # ----------------------------------
                         # Handle OpenWeather payload-level errors that may still arrive with HTTP 200.
                         if isinstance(data, dict):
                             cod = str(data.get("cod", "")).strip().lower()
                             msg = (data.get("message") or "").lower()
                             if cod in {"401", "403"} or "invalid api key" in msg or "unauthorized" in msg:
                                 unauthorized_seen += 1
+                                WEATHER_RETRIES.labels(reason="unauthorized").inc()
+                                until_ts = int(datetime.now().timestamp()) + max(60, WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS)
+                                details = (data.get("message") or "unauthorized")[:1000]
+                                await key_manager.mark_exhausted(
+                                    "weather",
+                                    idx,
+                                    until=until_ts,
+                                    reason=f"unauthorized | {details}",
+                                )
                                 logger.warning(
-                                    "Weather key unauthorized (likely not activated or invalid) — skipping key",
-                                    extra={"key_idx": idx},
+                                    "Weather key unauthorized (likely invalid or pending activation) — cooldown applied",
+                                    extra={"key_idx": idx, "cooldown_seconds": WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS},
                                 )
                                 continue
                             if cod == "429" or "limit" in msg or "quota" in msg:
@@ -301,9 +332,18 @@ async def _make_request_raw(
                     # UNAUTHORIZED / FORBIDDEN -> do NOT exhaust; skip key and try another key
                     if resp.status_code in (401, 403):
                         unauthorized_seen += 1
+                        WEATHER_RETRIES.labels(reason="unauthorized").inc()
+                        until_ts = int(datetime.now().timestamp()) + max(60, WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS)
+                        details = (resp.text or "unauthorized")[:1000]
+                        await key_manager.mark_exhausted(
+                            "weather",
+                            idx,
+                            until=until_ts,
+                            reason=f"unauthorized_http_{resp.status_code} | {details}",
+                        )
                         logger.warning(
-                            "Weather key unauthorized (likely not activated or invalid) — skipping key",
-                            extra={"key_idx": idx},
+                            "Weather key unauthorized (likely invalid or pending activation) — cooldown applied",
+                            extra={"key_idx": idx, "cooldown_seconds": WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS},
                         )
                         continue
 
@@ -471,9 +511,18 @@ async def _get_coordinates(city: str) -> tuple[float, float]:
         lat, lon = await inflight
         return lat, lon
 
+    # Prefer city names for geocoding when caller passed an IATA token.
+    # This avoids ambiguous geocode matches on short 3-letter queries.
+    geo_query = city
+    city_token = city.strip().upper()
+    if is_iata_token(city_token):
+        mapped_city = city_for_iata(city_token)
+        if mapped_city:
+            geo_query = mapped_city
+
     url = GEO_URL
     params = {
-        "q": city,
+        "q": geo_query,
         "limit": 1,
         # API key will be added inside _make_request_raw
     }
@@ -583,7 +632,10 @@ async def get_current_weather(
             temp_max_c=temp_max,
             has_rain=has_rain,
             has_snow=has_snow,
-            forecast_date=datetime.utcfromtimestamp(data.get("dt", int(time.time()))).strftime("%Y-%m-%d"),
+            forecast_date=_forecast_date_from_unix(
+                data.get("dt", int(time.time())),
+                int(data.get("timezone", 0) or 0),
+            ),
         )
 
         # Fetch air quality separately (OneCall doesn't include it)
@@ -667,13 +719,13 @@ async def get_forecast(
         entries = data.get("list", [])
         if not entries:
             raise WeatherAPIError("Missing 'list' in forecast response")
+        city_timezone_offset = int(data.get("city", {}).get("timezone", 0) or 0)
 
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in entries:
             ts = item.get("dt")
-            if ts:
-                day_key = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-            else:
+            day_key = _forecast_date_from_unix(ts, city_timezone_offset)
+            if not day_key:
                 dt_txt = item.get("dt_txt")
                 if not dt_txt or len(dt_txt) < 10:
                     continue
@@ -688,6 +740,15 @@ async def get_forecast(
 
             # Choose entry closest to local midday for condition/timestamp.
             def _hour_dist(it: Dict[str, Any]) -> int:
+                ts = it.get("dt")
+                if ts is not None:
+                    try:
+                        local_hour = datetime.utcfromtimestamp(
+                            int(ts) + city_timezone_offset
+                        ).hour
+                        return abs(local_hour - 12)
+                    except Exception:
+                        pass
                 dt_txt = it.get("dt_txt", "")
                 if len(dt_txt) >= 13:
                     try:

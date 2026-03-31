@@ -102,6 +102,7 @@ export default function FlightsList({ flights, bestFlight, isLoading = false }: 
   }
 
   const orderedFlights = orderFlightsWithBestFirst(flights, bestFlight);
+  const totalFlights = orderedFlights.length;
 
   return (
     <div className="space-y-2 flights-stack">
@@ -111,7 +112,12 @@ export default function FlightsList({ flights, bestFlight, isLoading = false }: 
           className="flights-stack__item"
           style={{ animationDelay: `${Math.min(i, 6) * 45}ms` }}
         >
-          <FlightCard flight={f} isBest={isBestFlight(f, bestFlight)} />
+          <FlightCard
+            flight={f}
+            isBest={isBestFlight(f, bestFlight)}
+            rank={i + 1}
+            total={totalFlights}
+          />
         </div>
       ))}
     </div>

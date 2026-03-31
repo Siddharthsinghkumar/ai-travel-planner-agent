@@ -15,124 +15,63 @@ function extractReasoning(finalJson: TripPlan | null): string[] {
   const weather = finalJson.weather && typeof finalJson.weather === "object"
     ? (finalJson.weather as Record<string, unknown>)
     : null;
+  const legs = Array.isArray(finalJson.legs) ? finalJson.legs : [];
 
   const steps: string[] = [];
 
   if (best) {
+    const nonstop = best.stops === 0 || String(best.stops).trim() === "0";
+    const speedText = typeof best.duration_min === "number" ? `${best.duration_min} min total travel time` : "a stronger total travel time";
     steps.push(
-      `Selected ${best.airline} ${best.flight_no} because it offered the best overall balance for this route.`
+      nonstop
+        ? `We chose ${best.airline} ${best.flight_no} because it's non-stop with ${speedText}, which keeps the trip simpler for a similar fare band.`
+        : `We chose ${best.airline} ${best.flight_no} because it balanced fare and timing better than the alternatives for this route.`
     );
-
-    if (best.stops === 0 || String(best.stops).trim() === "0") {
-      steps.push("Non-stop routing reduced transfer risk and kept the trip simpler.");
-    } else {
-      steps.push(`Itinerary tradeoff: ${best.stops} stop(s) in exchange for stronger overall value.`);
-    }
-
-    if (typeof best.duration_min === "number") {
-      steps.push(`Total travel time of ${best.duration_min} minutes stayed within the strongest-ranked options.`);
-    }
-  }
-
-  const filtersApplied = debugInfo.filters_applied;
-  if (typeof filtersApplied === "string" && filtersApplied.trim() && filtersApplied !== "no specific filters") {
-    steps.push(`Matched preferences considered: ${filtersApplied}.`);
-  }
-
-  const rankedCount = debugInfo.ranked_count;
-  if (typeof rankedCount === "number" && rankedCount > 0) {
-    steps.push(`Compared ${rankedCount} ranked option${rankedCount === 1 ? "" : "s"} before final selection.`);
   }
 
   if (weather) {
     const condition = weather.condition ? String(weather.condition).toLowerCase() : "";
-    if (condition || weather.temperature_c !== undefined) {
-      steps.push("Destination weather was checked to finalize comfort and packing guidance.");
+    const temp = weather.temperature_c;
+    const tempNum = typeof temp === "number" ? temp : Number(temp);
+    if (condition.includes("rain")) {
+      steps.push("Packing advice prioritizes light rain protection because the destination forecast shows wet conditions.");
+    } else if (Number.isFinite(tempNum) && tempNum >= 32) {
+      steps.push("Packing advice prioritizes breathable clothing and hydration because the destination forecast is hot.");
+    } else if (condition || Number.isFinite(tempNum)) {
+      steps.push("Packing advice is based on the destination forecast so comfort and weather risk are covered before booking.");
     }
   }
 
   if (!steps.length && effectiveIntent.trip_type) {
-    steps.push(`Trip intent aligned to ${String(effectiveIntent.trip_type).toLowerCase()} priorities.`);
+    steps.push(`This recommendation follows your ${String(effectiveIntent.trip_type).toLowerCase()} travel intent and route constraints.`);
   }
 
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const step of steps) {
-    const normalized = step.trim().toLowerCase();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    deduped.push(step.trim());
+  if (!steps.length && legs.length > 0) {
+    steps.push("This itinerary was split into route legs and each leg was optimized for practical timing and fare balance.");
   }
 
-  return deduped.slice(0, 4);
+  return steps.slice(0, 2);
 }
 
-function isWeatherStep(step: string): boolean {
-  const normalized = step.toLowerCase();
-  return (
-    normalized.includes("weather") ||
-    normalized.includes("temperature") ||
-    normalized.includes("rain") ||
-    normalized.includes("snow") ||
-    normalized.includes("humidity") ||
-    normalized.includes("wind") ||
-    normalized.includes("precip")
-  );
-}
-
-function isSelectionStep(step: string): boolean {
-  const normalized = step.toLowerCase();
-  return (
-    normalized.includes("selected") ||
-    normalized.includes("best overall") ||
-    normalized.includes("strongest overall")
-  );
-}
-
-function isRoutingStep(step: string): boolean {
-  const normalized = step.toLowerCase();
-  return (
-    normalized.includes("non-stop routing") ||
-    normalized.includes("transfer risk") ||
-    normalized.includes("trip simpler")
-  );
-}
-
-function mergeReasoning(liveSteps: string[], finalSteps: string[]): string[] {
-  const merged: string[] = [];
-  const seen = new Set<string>();
-  let weatherStepIncluded = false;
-  let selectionStepIncluded = false;
-  let routingStepIncluded = false;
-  for (const step of [...liveSteps, ...finalSteps]) {
-    const normalized = step.trim().toLowerCase();
-    if (!normalized || seen.has(normalized)) continue;
-    if (isWeatherStep(normalized)) {
-      if (weatherStepIncluded) continue;
-      weatherStepIncluded = true;
-    }
-    if (isSelectionStep(normalized)) {
-      if (selectionStepIncluded) continue;
-      selectionStepIncluded = true;
-    }
-    if (isRoutingStep(normalized)) {
-      if (routingStepIncluded) continue;
-      routingStepIncluded = true;
-    }
-    seen.add(normalized);
-    merged.push(step.trim());
+function normalizeLiveReasoning(step: string): string {
+  const normalized = step.trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized.includes("weather") || normalized.includes("temperature") || normalized.includes("rain")) {
+    return "Packing guidance is being tuned using the latest destination weather conditions.";
   }
-  return merged.slice(0, 4);
+  return "Route ranking is balancing travel time, stop count, and fare so the final pick stays practical.";
 }
 
 export default function AIReasoningPanel({ finalJson, isStreaming, reasoningSteps = [] }: Props) {
   const finalReasoning = extractReasoning(finalJson);
-  const visibleReasoning = mergeReasoning(reasoningSteps, finalReasoning);
+  const visibleReasoning = finalReasoning.length > 0
+    ? finalReasoning
+    : Array.from(new Set(reasoningSteps.map(normalizeLiveReasoning).filter(Boolean))).slice(0, 2);
   const showFooter = isStreaming || visibleReasoning.length === 0;
 
   return (
     <div className="reasoning-panel">
-      <h3 className="reasoning-title">Why this recommendation</h3>
+      <h3 className="reasoning-title">Selection evidence</h3>
 
       {visibleReasoning.length > 0 ? (
         <ol className="reasoning-list">

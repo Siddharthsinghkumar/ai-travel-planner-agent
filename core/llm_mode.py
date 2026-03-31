@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Optional, Tuple
-from core.env_config import get_env_str, parse_csv_env
+from typing import Any, Dict, Optional, Tuple
+from core.env_config import get_env_str, parse_csv_env, is_env_set
 
 LLM_MODE_OLLAMA_ONLY = "ollama_only"
 LLM_MODE_CLOUD_ONLY = "cloud_only"
@@ -27,24 +27,51 @@ _cloud_provider_override_ctx: ContextVar[Optional[str]] = ContextVar("cloud_prov
 DEFAULT_CLOUD_PROVIDER = "gemini"
 
 
-def _configured_cloud_provider_chain_from_env() -> list[str]:
-    chain = [part.lower() for part in parse_csv_env("CLOUD_PROVIDER_CHAIN")]
-    if chain:
-        return chain
+def _dedupe_preserve_order(items: list[str], *, lower: bool = False) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        cleaned = (item or "").strip()
+        normalized = cleaned.lower() if lower else cleaned
+        if not cleaned or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized if lower else cleaned)
+    return out
+
+
+def get_cloud_provider_chain_resolution() -> Dict[str, Any]:
+    """
+    Resolve configured cloud-provider order with explicit source metadata.
+
+    Precedence:
+    1) CLOUD_PROVIDER_CHAIN (canonical ordered list)
+    2) CLOUD_PROVIDER (single-provider fallback)
+    3) default ("gemini")
+    """
+    raw_chain = parse_csv_env("CLOUD_PROVIDER_CHAIN")
+    if raw_chain:
+        providers = _dedupe_preserve_order(raw_chain, lower=True)
+        return {
+            "providers": providers or [DEFAULT_CLOUD_PROVIDER],
+            "source": "CLOUD_PROVIDER_CHAIN",
+            "raw_chain": raw_chain,
+            "raw_default_provider": get_env_str("CLOUD_PROVIDER", None),
+        }
 
     default_provider = (get_env_str("CLOUD_PROVIDER", DEFAULT_CLOUD_PROVIDER) or DEFAULT_CLOUD_PROVIDER).strip().lower()
-    return [default_provider] if default_provider else [DEFAULT_CLOUD_PROVIDER]
+    return {
+        "providers": [default_provider] if default_provider else [DEFAULT_CLOUD_PROVIDER],
+        "source": "CLOUD_PROVIDER" if is_env_set("CLOUD_PROVIDER") else "default",
+        "raw_chain": [],
+        "raw_default_provider": default_provider,
+    }
 
 
 def get_configured_cloud_providers() -> list[str]:
     """Return provider names configured via environment (order-preserving, deduplicated)."""
-    seen: set[str] = set()
-    providers: list[str] = []
-    for provider in _configured_cloud_provider_chain_from_env():
-        if provider not in seen:
-            seen.add(provider)
-            providers.append(provider)
-    return providers
+    resolution = get_cloud_provider_chain_resolution()
+    return list(resolution["providers"])
 
 
 def get_default_cloud_provider() -> str:
@@ -99,11 +126,110 @@ def get_effective_cloud_provider() -> Optional[str]:
     return get_default_cloud_provider()
 
 
+def get_llm_mode_resolution() -> Dict[str, Any]:
+    """
+    Resolve effective mode with explicit authority/source metadata.
+
+    Precedence:
+    1) LLM_MODE (canonical)
+    2) LLM_PRIORITY (legacy compatibility only when LLM_MODE is unset)
+    3) default (ollama_first)
+    """
+    raw_mode = get_env_str("LLM_MODE", None)
+    raw_priority = get_env_str("LLM_PRIORITY", None)
+    source = "default"
+    notes: list[str] = []
+    legacy_priority_used = False
+
+    if raw_mode and raw_mode.strip():
+        source = "LLM_MODE"
+        resolved = normalize_llm_mode(raw_mode, raw_priority)
+        if raw_mode.strip().lower() == "hybrid":
+            legacy_priority_used = True
+            notes.append("legacy_hybrid_mode")
+    elif raw_priority and raw_priority.strip():
+        source = "LLM_PRIORITY"
+        legacy_priority_used = True
+        resolved = normalize_llm_mode("hybrid", raw_priority)
+        notes.append("legacy_priority_without_llm_mode")
+    else:
+        resolved = LLM_MODE_OLLAMA_FIRST
+        notes.append("default_ollama_first")
+
+    return {
+        "mode": resolved or LLM_MODE_OLLAMA_FIRST,
+        "source": source,
+        "raw_mode": raw_mode,
+        "raw_priority": raw_priority,
+        "legacy_priority_used": legacy_priority_used,
+        "notes": notes,
+    }
+
+
 def get_llm_mode_default() -> str:
-    raw_mode = get_env_str("LLM_MODE", "hybrid")
-    raw_priority = get_env_str("LLM_PRIORITY", "local-first")
-    normalized = normalize_llm_mode(raw_mode, raw_priority)
-    return normalized or LLM_MODE_OLLAMA_FIRST
+    return str(get_llm_mode_resolution()["mode"])
+
+
+def get_mode_dependency_map(mode: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Report mode-scoped env authority to make routing behavior operator-friendly.
+    This map is informational and does not enforce behavior by itself.
+    """
+    resolved_mode = normalize_llm_mode(mode) if mode else get_llm_mode_default()
+    resolved_mode = resolved_mode or LLM_MODE_OLLAMA_FIRST
+
+    common = [
+        "LLM_MODE",
+        "PLANNER_LLM_TIMEOUT",
+        "ROUTER_TIMEOUT",
+        "PLANNER_STREAM_INIT_TIMEOUT",
+        "PLANNER_STREAM_TOTAL_TIMEOUT",
+    ]
+    cloud = [
+        "USE_CLOUD_LLM",
+        "CLOUD_PROVIDER_CHAIN",
+        "CLOUD_PROVIDER",
+        "CLOUD_LLM_MODEL",
+        "CLOUD_LLM_TIMEOUT",
+        "CLOUD_LLM_STREAM_CHUNK_TIMEOUT",
+        "CLOUD_ONLY_ALLOW_PROVIDER_FALLBACK",
+    ]
+    ollama = [
+        "OLLAMA_BASE_URL",
+        "OLLAMA_MODEL",
+        "OLLAMA_TIMEOUT",
+        "OLLAMA_THINKING_MODE",
+        "OLLAMA_BREAKER_FAILURE_THRESHOLD",
+        "OLLAMA_BREAKER_RECOVERY_TIMEOUT",
+        "LOCAL_LLM_TIMEOUT",
+        "OLLAMA_ROUTER_PROBE_TIMEOUT",
+    ]
+    compatibility = [
+        "LLM_PRIORITY",
+        "ENABLE_LEGACY_ASYNC_LLM_CLIENT",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLOUD_BASE_URL",
+    ]
+
+    authoritative = list(common)
+    ignored_for_routing: list[str] = []
+    if resolved_mode == LLM_MODE_OLLAMA_ONLY:
+        authoritative.extend(ollama)
+        ignored_for_routing = list(cloud)
+    elif resolved_mode == LLM_MODE_CLOUD_ONLY:
+        authoritative.extend(cloud)
+        ignored_for_routing = list(ollama)
+    else:
+        authoritative.extend(cloud)
+        authoritative.extend(ollama)
+
+    return {
+        "mode": resolved_mode,
+        "authoritative": _dedupe_preserve_order(authoritative),
+        "ignored_for_routing": _dedupe_preserve_order(ignored_for_routing),
+        "compatibility": _dedupe_preserve_order(compatibility),
+    }
 
 
 async def get_llm_mode_and_priority() -> Tuple[str, str]:

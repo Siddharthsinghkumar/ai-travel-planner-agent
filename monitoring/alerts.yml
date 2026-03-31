@@ -1,0 +1,49 @@
+groups:
+  - name: llm-travel-agent-alerts
+    rules:
+      - alert: HighHttp5xxRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status_class="5xx"}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+          ) > 0.05
+          and
+          sum(rate(http_requests_total[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP 5xx rate"
+          description: "5xx ratio is above 5% for at least 10 minutes."
+
+      - alert: FrequentStreamFallbacks
+        expr: sum(increase(stream_fallback_total[10m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent streaming fallbacks"
+          description: "stream_fallback_total increased by 5 or more in the last 10 minutes."
+
+      - alert: RepeatedRouterStreamFailures
+        expr: sum(increase(llm_router_stream_failures_total[10m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated router stream failures"
+          description: "Router stream failure counter is increasing repeatedly."
+
+      - alert: HighFirstTokenLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, provider) (rate(llm_first_token_latency_seconds_bucket[10m]))
+          ) > 4
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High first-token latency p95"
+          description: "First token latency p95 is above 4 seconds for at least 10 minutes."

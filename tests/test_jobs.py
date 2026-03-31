@@ -6,6 +6,11 @@ from core import job_queue
 
 @pytest.mark.asyncio
 async def test_enqueue_and_poll(monkeypatch):
+    monkeypatch.setenv("UVICORN_WORKERS", "1")
+    monkeypatch.setenv("ASYNC_JOB_REQUIRE_SINGLE_WORKER", "1")
+    monkeypatch.delenv("ALLOW_UNSAFE_ASYNC_JOBS", raising=False)
+    monkeypatch.setattr(app.state, "async_job_support", None, raising=False)
+
     async def fake_plan_trip(*args, **kwargs):
         await asyncio.sleep(0.01)
         return {"ok": True, "result": "done"}

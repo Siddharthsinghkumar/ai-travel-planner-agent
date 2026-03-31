@@ -47,9 +47,20 @@ except ImportError:
 from tools.airline_api import search_flights as _search_flights_impl, AirlineAPIError
 from tools.weather_api import check_weather as _check_weather_impl, get_forecast_for_date as _get_forecast_for_date_impl
 from agents.llm_router import generate, AllBackendsFailed
+from core.llm_mode import (
+    get_llm_mode_and_priority,
+    LLM_MODE_OLLAMA_ONLY,
+    LLM_MODE_CLOUD_ONLY,
+)
 
 # New centralised location resolver
-from core.iata_resolver import is_iata_token, resolve_location
+from core.iata_resolver import (
+    city_for_iata,
+    is_iata_token,
+    label_for_iata,
+    resolve_location,
+    resolve_location_with_trace,
+)
 from core.api_key_manager import key_manager as api_key_manager
 
 # Wrappers (unit‑test seam)
@@ -82,7 +93,70 @@ _FLIGHT_GET_WARNING_LOGGED = False
 USE_CLOUD_FALLBACK = get_env_bool("USE_CLOUD_LLM", default=True)
 PLANNER_LLM_MODEL = get_env_str("PLANNER_LLM_MODEL", "gpt-4o-mini")
 PLANNER_LLM_TIMEOUT = get_env_float("PLANNER_LLM_TIMEOUT", 45.0)  # seconds
-STREAM_INIT_TIMEOUT_FLOOR = 20.0  # seconds
+PLANNER_LLM_PROMPT_SOFT_LIMIT = max(2000, get_env_int("PLANNER_LLM_PROMPT_SOFT_LIMIT", 9500))
+PLANNER_LLM_PROMPT_HARD_LIMIT = max(2500, get_env_int("PLANNER_LLM_PROMPT_HARD_LIMIT", 7800))
+PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS = max(
+    300,
+    get_env_int("PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS", 1400),
+)
+PLANNER_LLM_WARNINGS_MAX_CHARS = max(
+    200,
+    get_env_int("PLANNER_LLM_WARNINGS_MAX_CHARS", 1200),
+)
+PLANNER_LLM_MAX_FLIGHTS_ONE_WAY = max(3, get_env_int("PLANNER_LLM_MAX_FLIGHTS_ONE_WAY", 8))
+PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP = max(2, get_env_int("PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP", 4))
+def _resolve_planner_llm_timeout() -> float:
+    return max(5.0, get_env_float("PLANNER_LLM_TIMEOUT", PLANNER_LLM_TIMEOUT))
+
+
+def _resolve_router_local_timeout_hint(planner_timeout: Optional[float] = None) -> float:
+    planner_timeout_hint = (
+        _resolve_planner_llm_timeout()
+        if planner_timeout is None
+        else max(5.0, float(planner_timeout))
+    )
+    ollama_timeout = max(1.0, get_env_float("OLLAMA_TIMEOUT", 30.0))
+    local_timeout_default = max(ollama_timeout, planner_timeout_hint)
+    return max(1.0, get_env_float("LOCAL_LLM_TIMEOUT", local_timeout_default))
+
+
+def _resolve_planner_llm_model() -> str:
+    return (get_env_str("PLANNER_LLM_MODEL", PLANNER_LLM_MODEL) or PLANNER_LLM_MODEL).strip()
+
+
+def _apply_prompt_hard_limit(prompt_text: str, *, hard_limit: int) -> Tuple[str, bool]:
+    """
+    Keep prompt size within a strict upper bound to reduce local-model timeout pressure.
+    Preserves both the beginning and end sections (facts + user question/instructions).
+    """
+    if hard_limit <= 0:
+        return prompt_text, False
+    if len(prompt_text) <= hard_limit:
+        return prompt_text, False
+
+    marker = "\n\n[...prompt trimmed for runtime stability...]\n\n"
+    min_head = int(hard_limit * 0.55)
+    min_tail = hard_limit - min_head - len(marker)
+    if min_tail < 120:
+        # Degenerate case: hard limit is very small; keep leading section only.
+        return prompt_text[:hard_limit], True
+
+    head = prompt_text[:min_head]
+    tail = prompt_text[-min_tail:]
+    return f"{head}{marker}{tail}", True
+
+
+def _planner_include_backend_status() -> bool:
+    return get_env_bool("PLANNER_INCLUDE_BACKEND_STATUS", default=PLANNER_INCLUDE_BACKEND_STATUS)
+
+
+def _stream_init_timeout_floor() -> float:
+    # Keep planner stream-init timeout aligned with router local backend handshake timeout
+    # to avoid planner-side premature cancellation while router still waits for first token.
+    return max(20.0, _resolve_router_local_timeout_hint())
+
+
+STREAM_INIT_TIMEOUT_FLOOR = _stream_init_timeout_floor()  # exported for tests/back-compat
 
 
 def _resolve_stream_init_timeout() -> float:
@@ -90,21 +164,82 @@ def _resolve_stream_init_timeout() -> float:
     Resolve the planner stream-init timeout from env with a safety floor.
     Prevents overly aggressive configuration from causing false stream cancellations.
     """
-    configured = get_env_float("PLANNER_STREAM_INIT_TIMEOUT", STREAM_INIT_TIMEOUT_FLOOR)
-    return max(configured, STREAM_INIT_TIMEOUT_FLOOR)
+    floor = _stream_init_timeout_floor()
+    configured = get_env_float("PLANNER_STREAM_INIT_TIMEOUT", floor)
+    return max(configured, floor)
 
 
 # Stream-init timeout must allow backend/router first-token handshake on healthy but slower requests.
 STREAM_INIT_TIMEOUT = _resolve_stream_init_timeout()
+
+
+def _resolve_stream_total_timeout(planner_timeout: float) -> Optional[float]:
+    """
+    Optional total stream timeout for planner consume loop.
+    Default disabled (0) to avoid cancelling healthy long responses while chunks are flowing.
+    """
+    configured = get_env_float("PLANNER_STREAM_TOTAL_TIMEOUT", 0.0)
+    if configured <= 0:
+        return None
+    return max(configured, planner_timeout)
 PLANNER_INCLUDE_BACKEND_STATUS = get_env_bool("PLANNER_INCLUDE_BACKEND_STATUS", default=False)
 
 # Per‑call timeouts
 FLIGHT_TOOL_TIMEOUT = get_env_float("FLIGHT_TOOL_TIMEOUT", 8.0)
 WEATHER_TOOL_TIMEOUT = get_env_float("WEATHER_TOOL_TIMEOUT", 5.0)
 LLM_CORRECTION_TIMEOUT = get_env_float("LLM_CORRECTION_TIMEOUT", 5.0)
+FLIGHT_SEARCH_BASE_RESULTS = 10
+FLIGHT_SEARCH_MAX_RESULTS_CAP = 14
+FLIGHT_SEARCH_WEAK_ROUTE_BONUS = 2
+FLIGHT_SEARCH_ROUND_TRIP_BONUS = 2
+FLIGHT_SEARCH_DEEP_SEARCH_BONUS = 2
 
 # Return trip timeout (covers flight + weather + LLM)
 RETURN_TRIP_TIMEOUT = get_env_float("RETURN_TRIP_TIMEOUT", 40.0)
+BOOKING_HANDOFF_TIMEOUT = get_env_float("BOOKING_HANDOFF_TIMEOUT", 1.2)
+PER_FLIGHT_HANDOFF_LIMIT = max(1, get_env_int("PER_FLIGHT_HANDOFF_LIMIT", 3))
+PER_FLIGHT_HANDOFF_PROBE_LIMIT = max(
+    PER_FLIGHT_HANDOFF_LIMIT,
+    min(8, get_env_int("PER_FLIGHT_HANDOFF_PROBE_LIMIT", PER_FLIGHT_HANDOFF_LIMIT + 2)),
+)
+PER_FLIGHT_HANDOFF_PROBE_MAX = max(
+    PER_FLIGHT_HANDOFF_PROBE_LIMIT,
+    min(12, get_env_int("PER_FLIGHT_HANDOFF_PROBE_MAX", PER_FLIGHT_HANDOFF_PROBE_LIMIT + 3)),
+)
+PER_FLIGHT_HANDOFF_SCAN_LIMIT = max(
+    PER_FLIGHT_HANDOFF_PROBE_LIMIT,
+    min(14, get_env_int("PER_FLIGHT_HANDOFF_SCAN_LIMIT", PER_FLIGHT_HANDOFF_PROBE_LIMIT + 5)),
+)
+ROUND_TRIP_HANDOFF_PROBE_BONUS = max(0, get_env_int("ROUND_TRIP_HANDOFF_PROBE_BONUS", 2))
+WEAK_ROUTE_HANDOFF_PROBE_BONUS = max(0, get_env_int("WEAK_ROUTE_HANDOFF_PROBE_BONUS", 2))
+ROUND_TRIP_HANDOFF_TIMEOUT_BONUS = max(0.0, get_env_float("ROUND_TRIP_HANDOFF_TIMEOUT_BONUS", 0.35))
+WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD = max(1, get_env_int("WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD", 6))
+WEAK_ROUTE_ROUND_TRIP_SCAN_BONUS = max(0, get_env_int("WEAK_ROUTE_ROUND_TRIP_SCAN_BONUS", 2))
+BOOKING_OPTIONS_HTTP_TIMEOUT_HINT = get_env_float("BOOKING_OPTIONS_HTTP_TIMEOUT", 2.2)
+BOOKING_OPTIONS_RETRIES_HINT = max(1, get_env_int("BOOKING_OPTIONS_RETRIES", 3))
+BOOKING_OPTIONS_RETRY_BACKOFF_HINT = get_env_float("BOOKING_OPTIONS_RETRY_BACKOFF", 0.15)
+BOOKING_OPTIONS_ATTEMPTS_BUDGET_HINT = min(2, BOOKING_OPTIONS_RETRIES_HINT)
+BOOKING_TOKEN_RESOLVE_TIMEOUT_HINT = get_env_float(
+    "BOOKING_TOKEN_RESOLVE_TIMEOUT",
+    (
+        BOOKING_OPTIONS_HTTP_TIMEOUT_HINT * BOOKING_OPTIONS_ATTEMPTS_BUDGET_HINT
+        + BOOKING_OPTIONS_RETRY_BACKOFF_HINT * max(0, BOOKING_OPTIONS_ATTEMPTS_BUDGET_HINT - 1)
+        + 0.5
+    ),
+)
+PER_FLIGHT_HANDOFF_TIMEOUT_FLOOR = min(
+    6.0,
+    max(
+        BOOKING_TOKEN_RESOLVE_TIMEOUT_HINT + 0.25,
+        BOOKING_OPTIONS_HTTP_TIMEOUT_HINT
+        + BOOKING_OPTIONS_RETRY_BACKOFF_HINT * max(0, BOOKING_OPTIONS_ATTEMPTS_BUDGET_HINT - 1)
+        + 0.9,
+    ),
+)
+PER_FLIGHT_HANDOFF_TIMEOUT = max(
+    get_env_float("PER_FLIGHT_HANDOFF_TIMEOUT", BOOKING_HANDOFF_TIMEOUT),
+    PER_FLIGHT_HANDOFF_TIMEOUT_FLOOR,
+)
 
 # Retry configuration for flight tool
 FLIGHT_RETRY_ATTEMPTS = get_env_int("FLIGHT_RETRY_ATTEMPTS", 3)
@@ -168,21 +303,6 @@ except ImportError:
 # ----------------------------------------------------------------------
 MAX_RECURSION_DEPTH = 3
 
-# ----------------------------------------------------------------------
-# City name to IATA override for deterministic test behavior
-# ----------------------------------------------------------------------
-CITY_IATA_OVERRIDES = {
-    "delhi": "DEL",
-    "new delhi": "DEL",
-    "mumbai": "BOM",
-    "bombay": "BOM",
-    "bangalore": "BLR",
-    "bengaluru": "BLR",
-    "kolkata": "CCU",
-    "calcutta": "CCU",
-    "chennai": "MAA",
-}
-
 def _record_price_snapshot_safe(*args, **kwargs):
     """
     Lazy wrapper to avoid eager DB initialization during module import.
@@ -215,7 +335,499 @@ async def _build_booking_handoff_url_safe(*args, **kwargs):
         from tools.booking_handoff import build_booking_handoff_url
         return await build_booking_handoff_url(*args, **kwargs)
     except Exception:
+        if kwargs.get("return_details"):
+            return {
+                "url": None,
+                "source": "unavailable",
+                "reason": "booking_handoff_exception",
+                "status": "unavailable",
+                "handoff_mode": "unavailable",
+                "landing_guarantee": "none",
+                "is_exact_handoff": False,
+                "is_search_fallback": False,
+                "is_provider_managed": False,
+                "is_booking_quality_exit": False,
+                "booking_exit_quality": "unavailable",
+                "failure_bucket": "exception",
+                "cache_hit": False,
+            }
         return None
+
+
+def _booking_handoff_timeout_or_exception_fallback(
+    *,
+    origin: Optional[str],
+    destination: Optional[str],
+    depart_date: Optional[str],
+    return_date: Optional[str],
+    flight: Optional[Dict[str, Any]],
+    failure_reason: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Build a deterministic fallback handoff payload for timeout/exception failures.
+    """
+    def _legacy_quality_from_tier(quality_tier: str) -> str:
+        normalized = str(quality_tier or "")
+        if normalized in {
+            "round_trip_route_seeded_with_itinerary_hints",
+            "route_seeded_with_itinerary_hints",
+        }:
+            return "route_seeded_with_itinerary_hints"
+        if normalized in {"round_trip_route_seeded_with_return_leg", "route_seeded_basic"}:
+            return "route_seeded_basic"
+        return "generic"
+
+    fallback_url: Optional[str] = None
+    fallback_quality_tier = (
+        "round_trip_route_seeded_with_return_leg"
+        if (return_date and origin and destination and depart_date)
+        else "route_seeded_basic"
+    )
+    fallback_quality = _legacy_quality_from_tier(fallback_quality_tier)
+    fallback_context: Dict[str, Any] = {
+        "route_type": "round_trip" if return_date else "one_way",
+        "has_route_seed": bool(origin and destination and depart_date),
+        "has_itinerary_hints": False,
+        "includes_return_leg_hint": bool(return_date and origin and destination and depart_date),
+        "quality_tier": fallback_quality_tier,
+    }
+    try:
+        from tools.booking_handoff import (
+            _search_fallback_context,
+            _search_fallback_quality,
+            build_google_flights_fallback,
+        )
+        if origin and destination and depart_date:
+            fallback_url = build_google_flights_fallback(
+                origin=origin,
+                destination=destination,
+                depart_date=depart_date,
+                return_date=return_date,
+                flight=flight,
+            )
+            fallback_quality_tier = _search_fallback_quality(
+                origin=origin,
+                destination=destination,
+                depart_date=depart_date,
+                return_date=return_date,
+                flight=flight,
+            )
+            fallback_quality = _legacy_quality_from_tier(fallback_quality_tier)
+            fallback_context = _search_fallback_context(
+                origin=origin,
+                destination=destination,
+                depart_date=depart_date,
+                return_date=return_date,
+                flight=flight,
+            )
+            fallback_context["quality_tier"] = fallback_quality_tier
+    except Exception:
+        fallback_url = None
+        if isinstance(flight, dict) and (
+            str(flight.get("airline") or "").strip()
+            or str(flight.get("flight_no") or "").strip()
+            or str(flight.get("departure_time") or "").strip()
+            or str(flight.get("arrival_time") or "").strip()
+        ):
+            if return_date and origin and destination and depart_date:
+                fallback_quality_tier = "round_trip_route_seeded_with_itinerary_hints"
+            elif return_date:
+                fallback_quality_tier = "round_trip_route_seeded_with_return_leg"
+            else:
+                fallback_quality_tier = "route_seeded_with_itinerary_hints"
+            fallback_context["has_itinerary_hints"] = True
+        fallback_quality = _legacy_quality_from_tier(fallback_quality_tier)
+        fallback_context["quality_tier"] = fallback_quality_tier
+
+    if fallback_url:
+        fallback_context["quality_tier"] = fallback_quality_tier
+        return fallback_url, {
+            "source": "google_flights_fallback",
+            "reason": f"{failure_reason}_google_search_fallback",
+            "provider": "google_flights",
+            "status": "ok",
+            "handoff_mode": "search_fallback",
+            "landing_guarantee": "best_effort_search",
+            "search_fallback_quality": fallback_quality,
+            "search_fallback_context": fallback_context,
+            "is_exact_handoff": False,
+            "is_search_fallback": True,
+            "is_provider_managed": False,
+            "is_booking_quality_exit": False,
+            "booking_exit_quality": "search_assist",
+            "failure_bucket": "timeout" if "timeout" in failure_reason else "exception",
+            "cache_hit": False,
+        }
+
+    if failure_reason == "booking_handoff_timeout":
+        return None, {
+            "source": "timeout",
+            "reason": failure_reason,
+            "status": "unavailable",
+            "handoff_mode": "unavailable",
+            "landing_guarantee": "none",
+            "is_exact_handoff": False,
+            "is_search_fallback": False,
+            "is_provider_managed": False,
+            "is_booking_quality_exit": False,
+            "booking_exit_quality": "unavailable",
+            "failure_bucket": "timeout",
+            "cache_hit": False,
+        }
+
+    return None, {
+        "source": "unavailable",
+        "reason": failure_reason,
+        "status": "unavailable",
+        "handoff_mode": "unavailable",
+        "landing_guarantee": "none",
+        "is_exact_handoff": False,
+        "is_search_fallback": False,
+        "is_provider_managed": False,
+        "is_booking_quality_exit": False,
+        "booking_exit_quality": "unavailable",
+        "failure_bucket": "exception",
+        "cache_hit": False,
+    }
+
+
+async def _resolve_flight_booking_handoff(
+    *,
+    flight_obj: Any,
+    origin: Optional[str],
+    destination: Optional[str],
+    depart_date: Optional[str],
+    return_date: Optional[str],
+    timeout_sec: float,
+    candidate_rank: Optional[int] = None,
+    probe_signal: Optional[int] = None,
+    route_type: str = "one_way",
+    cache_mode_hint: Optional[str] = None,
+) -> Tuple[Any, Dict[str, Any], Optional[str]]:
+    """
+    Resolve booking handoff for one flight and preserve an explicit classification payload.
+    Returns (possibly-updated flight object, handoff info, handoff URL).
+    """
+    booking_handoff_info: Dict[str, Any] = {
+        "source": "unavailable",
+        "reason": "not_attempted",
+        "status": "unavailable",
+    }
+    booking_url: Optional[str] = None
+    handoff_started = time.monotonic()
+
+    flight_payload = (
+        flight_obj.model_dump()
+        if hasattr(flight_obj, "model_dump")
+        else (dict(vars(flight_obj)) if hasattr(flight_obj, "__dict__") else {})
+    )
+    has_booking_token = bool(isinstance(flight_payload, dict) and flight_payload.get("booking_token"))
+    has_shareable = bool(
+        isinstance(flight_payload, dict)
+        and (
+            flight_payload.get("shareable_link")
+            or flight_payload.get("provider_link")
+            or flight_payload.get("partner_booking_link")
+            or flight_payload.get("booking_url")
+        )
+    )
+
+    booking_task = asyncio.create_task(
+        _build_booking_handoff_url_safe(
+            flight=flight_payload,
+            origin=origin,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            return_details=True,
+        )
+    )
+
+    try:
+        booking_result = await asyncio.wait_for(booking_task, timeout=timeout_sec)
+        if isinstance(booking_result, dict):
+            booking_url = booking_result.get("url")
+            reason_value = booking_result.get("reason")
+            cache_hit_value = booking_result.get("cache_hit")
+            if cache_hit_value is None and isinstance(reason_value, str):
+                cache_hit_value = reason_value.endswith("_cache")
+            failure_bucket_value = booking_result.get("failure_bucket")
+            if not failure_bucket_value and isinstance(reason_value, str) and reason_value:
+                failure_bucket_value = reason_value
+            booking_handoff_info = {
+                "source": booking_result.get("source") or "unavailable",
+                "reason": reason_value or "unknown",
+                "provider": booking_result.get("provider"),
+                "status": booking_result.get("status") or ("ok" if booking_url else "unavailable"),
+                "handoff_mode": booking_result.get("handoff_mode"),
+                "landing_guarantee": booking_result.get("landing_guarantee"),
+                "search_fallback_quality": booking_result.get("search_fallback_quality"),
+                "search_fallback_context": booking_result.get("search_fallback_context"),
+                "artifact_field": booking_result.get("artifact_field"),
+                "requires_browser_post": booking_result.get("requires_browser_post"),
+                "is_exact_handoff": booking_result.get("is_exact_handoff"),
+                "is_search_fallback": booking_result.get("is_search_fallback"),
+                "is_provider_managed": booking_result.get("is_provider_managed"),
+                "is_booking_quality_exit": booking_result.get("is_booking_quality_exit"),
+                "booking_exit_quality": booking_result.get("booking_exit_quality"),
+                "failure_bucket": failure_bucket_value,
+                "cache_hit": cache_hit_value,
+            }
+        else:
+            booking_url = booking_result
+            if booking_url:
+                booking_handoff_info = {"source": "unknown", "reason": "legacy_url_only", "status": "ok"}
+            else:
+                booking_handoff_info = {"source": "unavailable", "reason": "legacy_url_missing", "status": "unavailable"}
+    except asyncio.TimeoutError:
+        booking_url, booking_handoff_info = _booking_handoff_timeout_or_exception_fallback(
+            origin=origin,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            flight=flight_payload,
+            failure_reason="booking_handoff_timeout",
+        )
+        booking_handoff_info["failure_bucket"] = "timeout"
+        booking_handoff_info["cache_hit"] = False
+    except Exception as exc:
+        logger.info("build_booking_handoff_url failed; continuing without handoff URL: %s", str(exc))
+        booking_url, booking_handoff_info = _booking_handoff_timeout_or_exception_fallback(
+            origin=origin,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            flight=flight_payload,
+            failure_reason="booking_handoff_exception",
+        )
+        booking_handoff_info["failure_bucket"] = "exception"
+        booking_handoff_info["cache_hit"] = False
+
+    if booking_url and hasattr(flight_obj, "model_copy"):
+        flight_obj = flight_obj.model_copy(update={"handoff_url": booking_url})
+    elif booking_url and isinstance(flight_obj, dict):
+        updated = dict(flight_obj)
+        updated["handoff_url"] = booking_url
+        flight_obj = updated
+
+    flight_no = None
+    if isinstance(flight_payload, dict):
+        flight_no = flight_payload.get("flight_no")
+    logger.info(
+        "booking_handoff_flight_resolution",
+        extra={
+            "flight_no": flight_no,
+            "route_type": route_type,
+            "candidate_rank": candidate_rank,
+            "probe_signal": probe_signal,
+            "cache_mode_hint": cache_mode_hint,
+            "has_booking_token": has_booking_token,
+            "has_shareable_hint": has_shareable,
+            "timeout_sec": timeout_sec,
+            "duration_ms": int((time.monotonic() - handoff_started) * 1000),
+            "result_bucket": _booking_handoff_bucket(booking_handoff_info),
+            "is_booking_ready": bool(booking_handoff_info.get("is_booking_quality_exit")),
+            "reason": booking_handoff_info.get("reason"),
+            "failure_bucket": booking_handoff_info.get("failure_bucket"),
+            "cache_hit": booking_handoff_info.get("cache_hit"),
+        },
+    )
+
+    return flight_obj, booking_handoff_info, booking_url
+
+
+def _booking_handoff_strength(meta: Dict[str, Any]) -> int:
+    """
+    Higher score = better booking-quality handoff for top-level promotion.
+    Keeps per-flight rows unchanged; only used for primary booking_handoff selection.
+    """
+    if not isinstance(meta, dict):
+        return 0
+
+    if meta.get("is_booking_quality_exit"):
+        if meta.get("requires_browser_post"):
+            return 500
+        if meta.get("handoff_mode") == "direct_booking":
+            return 480
+        return 460
+
+    # Backward-compatible promotion for legacy compact metadata that may not
+    # carry explicit is_booking_quality_exit flags.
+    source = str(meta.get("source") or "").strip().lower()
+    status = str(meta.get("status") or "").strip().lower()
+    if status == "ok" and source in {"booking_token", "shareable_link"}:
+        return 440
+
+    if meta.get("is_provider_managed"):
+        return 420
+
+    if meta.get("is_search_fallback"):
+        quality = str(meta.get("search_fallback_quality") or "")
+        context_payload = meta.get("search_fallback_context")
+        if isinstance(context_payload, dict):
+            quality_tier = str(context_payload.get("quality_tier") or "")
+            if quality_tier:
+                quality = quality_tier
+        if quality == "round_trip_route_seeded_with_itinerary_hints":
+            return 280
+        if quality == "round_trip_route_seeded_with_return_leg":
+            return 240
+        if quality == "route_seeded_with_itinerary_hints":
+            return 260
+        if quality == "route_seeded_basic":
+            return 220
+        return 180
+
+    if status == "ok":
+        return 120
+
+    if source in {"timeout", "unavailable"}:
+        return 20
+
+    return 0
+
+
+def _booking_handoff_bucket(meta: Dict[str, Any]) -> str:
+    if not isinstance(meta, dict):
+        return "unknown"
+    if meta.get("is_booking_quality_exit"):
+        return "booking_ready"
+    reason = str(meta.get("reason") or "")
+    if reason.startswith("booking_handoff_timeout"):
+        return "timeout"
+    if reason.startswith("booking_options_provider_error"):
+        return "provider_error"
+    if reason.startswith("booking_options_http_error"):
+        return "http_error"
+    if reason.startswith("booking_options_request_exception"):
+        return "request_exception"
+    if reason.startswith("booking_options_parse_error"):
+        return "parse_error"
+    if str(meta.get("source") or "") == "google_flights_fallback":
+        return "search_fallback"
+    if str(meta.get("status") or "") == "unavailable":
+        return "unavailable"
+    return "other"
+
+
+def _align_top_level_booking_handoff_with_rows(
+    top_level_meta: Dict[str, Any],
+    top_flights_payload: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Optional[str], bool]:
+    """
+    Ensure top-level booking handoff is never weaker than the strongest per-flight row
+    already present in the response payload.
+    """
+    current_meta = dict(top_level_meta or {})
+    current_score = _booking_handoff_strength(current_meta)
+    best_meta = current_meta
+    best_score = current_score
+    best_rank = int(current_meta.get("selected_flight_rank", 1) or 1)
+    best_url: Optional[str] = None
+
+    for idx, row in enumerate(top_flights_payload or []):
+        if not isinstance(row, dict):
+            continue
+        candidate_meta = row.get("booking_handoff") or {}
+        if not isinstance(candidate_meta, dict):
+            continue
+        candidate_score = _booking_handoff_strength(candidate_meta)
+        candidate_rank = int(row.get("rank", idx + 1) or (idx + 1))
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best_meta = dict(candidate_meta)
+            best_rank = candidate_rank
+            best_url = (
+                row.get("handoff_url")
+                or row.get("booking_url")
+                or None
+            )
+
+    if best_score <= current_score:
+        return current_meta, None, False
+
+    if best_rank != 1:
+        best_meta["selected_flight_rank"] = best_rank
+    return best_meta, best_url, True
+
+
+def _booking_handoff_cache_snapshot() -> Dict[str, Any]:
+    """
+    Returns compact cache stats for cold-vs-hot booking handoff diagnostics.
+    """
+    try:
+        from tools.booking_handoff import booking_resolution_cache_stats
+
+        stats = booking_resolution_cache_stats()
+        entries = int(stats.get("entries") or 0)
+        ttl_sec = int(stats.get("ttl_sec") or 0)
+        return {
+            "cache_mode": "hot" if entries > 0 else "cold",
+            "cache_entries": entries,
+            "cache_ttl_sec": ttl_sec,
+        }
+    except Exception:
+        return {
+            "cache_mode": "unknown",
+            "cache_entries": None,
+            "cache_ttl_sec": None,
+        }
+
+
+def _flight_payload_for_handoff_signal(flight_obj: Any) -> Dict[str, Any]:
+    if hasattr(flight_obj, "model_dump"):
+        payload = flight_obj.model_dump()
+        return payload if isinstance(payload, dict) else {}
+    if isinstance(flight_obj, dict):
+        return dict(flight_obj)
+    if hasattr(flight_obj, "__dict__"):
+        try:
+            payload = dict(vars(flight_obj))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _booking_handoff_candidate_signal(flight_obj: Any) -> int:
+    """
+    Heuristic signal for booking-artifact richness.
+    Higher scores are more likely to yield booking-ready exits.
+    """
+    payload = _flight_payload_for_handoff_signal(flight_obj)
+    if not payload:
+        return 0
+
+    score = 0
+    if payload.get("booking_token"):
+        score += 8
+    booking_request = payload.get("booking_request")
+    if isinstance(booking_request, dict):
+        score += 6
+        if booking_request.get("url") or booking_request.get("endpoint") or booking_request.get("booking_url"):
+            score += 2
+        if booking_request.get("post_data") not in (None, "", {}, []):
+            score += 2
+    options = payload.get("booking_options")
+    if isinstance(options, list) and options:
+        score += 2
+        has_option_link = False
+        for opt in options[:8]:
+            if not isinstance(opt, dict):
+                continue
+            if any(opt.get(key) for key in ("booking_url", "link", "url", "deeplink", "redirect_link")):
+                has_option_link = True
+                break
+        if has_option_link:
+            score += 3
+    if any(
+        payload.get(field)
+        for field in ("shareable_link", "provider_link", "partner_booking_link", "booking_url")
+    ):
+        score += 4
+    if any(isinstance(payload.get(field), (dict, list)) for field in ("offer", "offers", "providers", "book_with")):
+        score += 1
+    return score
 
 
 async def _hold_booking_safe(*args, **kwargs):
@@ -307,42 +919,72 @@ def _extract_booking_id(user_query: str) -> Optional[int]:
                 return None
     return None
 
-def _resolve_city_to_iata(city_text: str) -> Optional[str]:
+def _resolve_city_to_iata_with_trace(city_text: str) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Resolve a free-form city string to an IATA code. Priorities:
-      1) exact override mapping (lowercased)
-      2) word-boundary match against overrides (to catch 'new delhi')
-      3) resolve_location(...) fallback
-      4) if token looks like a 3-letter IATA, return upper()
-      5) return None
+      1) explicit valid 3-letter IATA token (uppercase token from user input)
+      2) resolve_location(...) over cleaned candidate variants
+      3) return None
     """
+    trace: Dict[str, Any] = {
+        "input": city_text,
+        "candidates": [],
+        "selected_iata": None,
+        "resolution_basis": "unresolved",
+        "resolver_trace": None,
+    }
     if not city_text:
-        return None
+        trace["resolution_basis"] = "empty_input"
+        return None, trace
     token = city_text.strip().lower()
+    cleaned = " ".join(
+        p for p in re.findall(r"[a-z]+", token)
+        if p not in {
+            "flight", "flights", "from", "to", "on", "at", "for", "via", "through",
+            "stopover", "stop", "in", "return", "returning", "leaving", "departing",
+            "coming", "back", "after", "before", "trip", "business", "holiday",
+            "urgent", "flexible", "book", "booking", "ticket", "tickets", "find",
+            "cheapest", "cheap", "and", "with", "under", "tomorrow", "today", "next",
+            "this", "day", "days", "week", "weeks",
+        }
+    ).strip()
+    candidates = [c for c in [cleaned, token] if c]
+    trace["candidates"] = list(candidates)
 
-    # 1) exact override
-    if token in CITY_IATA_OVERRIDES:
-        return CITY_IATA_OVERRIDES[token]
+    # 1) explicit uppercase IATA token present anywhere in the fragment.
+    for token_match in re.findall(r"\b([A-Z]{3})\b", city_text):
+        if is_iata_token(token_match):
+            trace["selected_iata"] = token_match
+            trace["resolution_basis"] = "explicit_iata_token"
+            return token_match, trace
 
-    # 2) word-boundary check for multi-word overrides or aliases
-    for k, v in CITY_IATA_OVERRIDES.items():
-        # treat keys as already lowercased
-        if re.search(r'\b' + re.escape(k) + r'\b', token):
-            return v
+    # 2) explicit 3-letter uppercase token when it is a real IATA code.
+    explicit_token = city_text.strip()
+    if len(explicit_token) == 3 and explicit_token.isalpha() and explicit_token.isupper():
+        if is_iata_token(explicit_token):
+            trace["selected_iata"] = explicit_token
+            trace["resolution_basis"] = "explicit_iata_token"
+            return explicit_token, trace
 
     # 3) fallback to resolver (external module)
     try:
-        resolved = resolve_location(token)  # keep existing resolver usage
-        if resolved:
-            return resolved
-    except Exception as e:
+        for candidate in candidates:
+            resolved, resolver_trace = resolve_location_with_trace(candidate)
+            sanitized = _sanitize_iata_code(resolved)
+            if sanitized:
+                trace["selected_iata"] = sanitized
+                trace["resolver_trace"] = resolver_trace
+                trace["resolution_basis"] = resolver_trace.get("match_basis") or "resolver"
+                return sanitized, trace
+    except Exception:
         logger.debug("resolve_location failed", exc_info=True)
 
-    # 4) treat 3-letter tokens as raw IATA
-    if len(token) == 3 and token.isalpha():
-        return token.upper()
+    return None, trace
 
-    return None
+
+def _resolve_city_to_iata(city_text: str) -> Optional[str]:
+    resolved, _trace = _resolve_city_to_iata_with_trace(city_text)
+    return resolved
 
 
 def _sanitize_iata_code(value: Optional[str]) -> Optional[str]:
@@ -367,12 +1009,21 @@ def _sanitize_iata_code(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _iata_city_label(iata_code: Optional[str]) -> Dict[str, Optional[str]]:
+    normalized = _sanitize_iata_code(iata_code)
+    if not normalized:
+        return {"iata": None, "city": None, "label": None}
+    city = city_for_iata(normalized)
+    label = label_for_iata(normalized) or normalized
+    return {"iata": normalized, "city": city, "label": label}
+
+
 def _infer_route_pair_from_query(user_query: str) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
     """
     Deterministically infer origin/destination from free-form text when route regex misses.
     Priority:
       1) explicit IATA token pair (e.g., "DEL BOM")
-      2) known city alias pair in text order (e.g., "Delhi Mumbai")
+      2) resolver-backed city phrase pair in text order (generic, no planner-local aliases)
     """
     trace: Dict[str, Any] = {
         "source": None,
@@ -382,63 +1033,226 @@ def _infer_route_pair_from_query(user_query: str) -> Tuple[Optional[str], Option
     if not user_query:
         return None, None, trace
 
-    # 1) explicit IATA tokens
+    # 1) explicit IATA tokens (uppercase only to avoid treating normal words like "via"/"new" as airport codes)
     iata_tokens: List[str] = []
-    for tok in re.findall(r"\b([A-Za-z]{3})\b", user_query):
-        up = tok.upper()
-        if is_iata_token(up) and up not in iata_tokens:
-            iata_tokens.append(up)
+    for tok in re.findall(r"\b([A-Z]{3})\b", user_query):
+        if is_iata_token(tok) and tok not in iata_tokens:
+            iata_tokens.append(tok)
     trace["iata_candidates"] = iata_tokens
     if len(iata_tokens) >= 2:
         trace["source"] = "iata_pair"
         return iata_tokens[0], iata_tokens[1], trace
 
-    # 2) known city aliases in appearance order
-    hits: List[Tuple[int, str, str]] = []
     q_lower = user_query.lower()
-    # longer aliases first to avoid "new delhi" being swallowed by "delhi"
-    for city_alias, code in sorted(CITY_IATA_OVERRIDES.items(), key=lambda kv: len(kv[0]), reverse=True):
-        for m in re.finditer(r"\b" + re.escape(city_alias) + r"\b", q_lower):
-            hits.append((m.start(), city_alias, code))
-    hits.sort(key=lambda x: x[0])
-    trace["city_candidates"] = [{"city": city, "code": code, "pos": pos} for pos, city, code in hits]
+    # If query already carries explicit "from ... to ..." phrasing and that path
+    # failed earlier, do not invent a route from unrelated words.
+    if re.search(r"\bfrom\b.+\bto\b", q_lower):
+        trace["source"] = "skipped_unresolved_from_to"
+        return None, None, trace
+
+    # 2) resolver-backed city phrase scan in appearance order.
+    noise_words = {
+        "flight", "flights", "from", "to", "on", "at", "for", "via", "through",
+        "stopover", "stop", "in", "return", "returning", "leaving", "departing",
+        "coming", "back", "after", "before", "trip", "business", "holiday",
+        "urgent", "flexible", "book", "booking", "ticket", "tickets", "find",
+        "cheapest", "cheap", "and", "with", "under", "tomorrow", "today", "next",
+        "this", "day", "days", "week", "weeks", "plan",
+    }
+    words = [(m.start(), m.group(0), m.group(0).lower()) for m in re.finditer(r"[A-Za-z]{2,}", user_query)]
+    meaningful_tokens = [w for _, _, w in words if w not in noise_words and len(w) > 1]
+    if len(meaningful_tokens) > 4:
+        trace["source"] = "skipped_ambiguous_phrase"
+        return None, None, trace
+
+    best_hits_by_pos: Dict[int, Dict[str, Any]] = {}
+
+    max_ngram = min(4, len(words))
+    for size in range(max_ngram, 0, -1):
+        for i in range(0, len(words) - size + 1):
+            segment = words[i:i + size]
+            lowers = [w[2] for w in segment]
+            if any(tok in noise_words for tok in lowers):
+                continue
+            if size == 1 and len(lowers[0]) <= 3:
+                continue
+            if size > 1 and max(len(tok) for tok in lowers) <= 3:
+                continue
+            phrase = " ".join(w[1] for w in segment)
+            resolved_raw, resolver_trace = resolve_location_with_trace(phrase)
+            resolved = _sanitize_iata_code(resolved_raw)
+            if not resolved:
+                continue
+            pos = segment[0][0]
+            existing = best_hits_by_pos.get(pos)
+            if existing is None or size > existing["size"]:
+                best_hits_by_pos[pos] = {
+                    "pos": pos,
+                    "city": phrase,
+                    "code": resolved,
+                    "size": size,
+                    "resolution_basis": resolver_trace.get("match_basis"),
+                    "is_fuzzy": resolver_trace.get("is_fuzzy"),
+                    "confidence": resolver_trace.get("confidence"),
+                    "runner_up_confidence": resolver_trace.get("runner_up_confidence"),
+                }
+
+    ordered_hits = [best_hits_by_pos[pos] for pos in sorted(best_hits_by_pos.keys())]
+    trace["city_candidates"] = [
+        {
+            "city": h["city"],
+            "code": h["code"],
+            "pos": h["pos"],
+            "resolution_basis": h.get("resolution_basis"),
+            "is_fuzzy": bool(h.get("is_fuzzy")),
+            "confidence": h.get("confidence"),
+            "runner_up_confidence": h.get("runner_up_confidence"),
+        }
+        for h in ordered_hits
+    ]
 
     ordered_codes: List[str] = []
-    for _, _, code in hits:
+    for hit in ordered_hits:
+        code = hit["code"]
         if code not in ordered_codes:
             ordered_codes.append(code)
 
     if len(ordered_codes) >= 2:
-        trace["source"] = "city_pair"
+        trace["source"] = "resolver_phrase_pair"
         return ordered_codes[0], ordered_codes[1], trace
 
     return None, None, trace
+
+
+def _build_flight_search_profile(intent: "ParsedIntent", normalization_debug: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a compact, bounded search-breadth profile for weak-route/round-trip/deep-search paths.
+    Keeps strong-route defaults unchanged.
+    """
+    final = (normalization_debug or {}).get("final") or {}
+    route_inference = (normalization_debug or {}).get("route_inference") or {}
+    origin_basis = str(final.get("origin_resolution_basis") or "").lower()
+    destination_basis = str(final.get("destination_resolution_basis") or "").lower()
+    weak_route_confidence = bool(
+        final.get("origin_resolution_is_fuzzy")
+        or final.get("destination_resolution_is_fuzzy")
+        or "fuzzy" in origin_basis
+        or "fuzzy" in destination_basis
+        or route_inference.get("source") in {"resolver_phrase_pair", "skipped_ambiguous_phrase"}
+    )
+
+    breadth_bump = 0
+    if weak_route_confidence:
+        breadth_bump += FLIGHT_SEARCH_WEAK_ROUTE_BONUS
+    if bool(intent.return_date):
+        breadth_bump += FLIGHT_SEARCH_ROUND_TRIP_BONUS
+    if bool(intent.deep_search):
+        breadth_bump += FLIGHT_SEARCH_DEEP_SEARCH_BONUS
+
+    max_results = min(FLIGHT_SEARCH_MAX_RESULTS_CAP, FLIGHT_SEARCH_BASE_RESULTS + breadth_bump)
+    return {
+        "max_results": max_results,
+        "breadth_bump": max_results - FLIGHT_SEARCH_BASE_RESULTS,
+        "deep_search": bool(intent.deep_search),
+        "weak_route_confidence": weak_route_confidence,
+        "is_round_trip": bool(intent.return_date),
+    }
 
 # ----------------------------------------------------------------------
 # LLM circuit breaker with auto-recovery
 # ----------------------------------------------------------------------
 _llm_failures = 0
 _llm_failure_lock = asyncio.Lock()
-LLM_FAILURE_THRESHOLD = 5
+LLM_FAILURE_THRESHOLD = max(1, get_env_int("LLM_FAILURE_THRESHOLD", 5))
 LLM_CIRCUIT_OPEN = False
-LLM_CIRCUIT_RESET_TIMEOUT = 120  # seconds
+LLM_CIRCUIT_RESET_TIMEOUT = max(10, get_env_int("LLM_CIRCUIT_RESET_TIMEOUT", 120))  # seconds
+LLM_FAILURE_IDLE_RESET_TIMEOUT = max(30.0, get_env_float("LLM_FAILURE_IDLE_RESET_TIMEOUT", 180.0))
 _llm_circuit_reset_time: Optional[float] = None
+_llm_last_failure_at: Optional[float] = None
+_llm_last_failure_stage: Optional[str] = None
+_llm_last_failure_reason: Optional[str] = None
+_NON_COUNTING_FAILURE_REASONS = {"circuit_open", "cancelled", "stream_no_visible_tokens"}
 
-async def check_llm_circuit() -> bool:
+
+def _is_ollama_only_mode(llm_mode: Optional[str], effective_mode: Optional[str]) -> bool:
+    mode = (effective_mode or llm_mode or "").strip().lower()
+    return mode == LLM_MODE_OLLAMA_ONLY
+
+
+def _counter_reason_from_router_reason(reason: Optional[str]) -> str:
+    normalized = (reason or "").strip().lower()
+    if normalized in {"timeout", "stream_timeout"}:
+        return "upstream_timeout"
+    if normalized in _NON_COUNTING_FAILURE_REASONS:
+        return normalized
+    return "upstream_unavailable"
+
+
+async def check_llm_circuit(*, llm_mode: Optional[str] = None, effective_mode: Optional[str] = None) -> bool:
     """Return True if circuit is open (skip LLM). Handles auto-recovery."""
     global _llm_failures, LLM_CIRCUIT_OPEN, _llm_circuit_reset_time
+    global _llm_last_failure_at, _llm_last_failure_stage, _llm_last_failure_reason
+    mode_hint = (effective_mode or llm_mode or "").strip().lower()
+    if not mode_hint:
+        try:
+            resolved_mode, _ = await get_llm_mode_and_priority()
+            mode_hint = (resolved_mode or "").strip().lower()
+        except Exception:
+            try:
+                mode_hint = (get_llm_mode_default() or "").strip().lower()
+            except Exception:
+                mode_hint = ""
+    if _is_ollama_only_mode(mode_hint, mode_hint):
+        # In strict ollama_only mode, rely on backend-local circuiting in ollama_client.
+        # Reset any stale planner-global state so logs/metrics don't look sticky across mode changes.
+        async with _llm_failure_lock:
+            if LLM_CIRCUIT_OPEN or _llm_failures:
+                logger.info(
+                    "LLM planner circuit state reset in ollama_only mode",
+                    extra={
+                        "failure_scope": "planner_process_consecutive",
+                        "previous_failure_count": _llm_failures,
+                        "was_open": LLM_CIRCUIT_OPEN,
+                    },
+                )
+            LLM_CIRCUIT_OPEN = False
+            _llm_failures = 0
+            _llm_circuit_reset_time = None
+            _llm_last_failure_at = None
+            _llm_last_failure_stage = None
+            _llm_last_failure_reason = None
+        return False
     async with _llm_failure_lock:
         now = time.monotonic()
         # Auto-recover if timeout elapsed
         if LLM_CIRCUIT_OPEN and _llm_circuit_reset_time and now > _llm_circuit_reset_time:
-            logger.info("LLM circuit breaker reset after timeout")
+            logger.info(
+                "LLM circuit breaker reset after timeout",
+                extra={
+                    "failure_scope": "planner_process_consecutive",
+                    "reset_timeout_sec": LLM_CIRCUIT_RESET_TIMEOUT,
+                },
+            )
             LLM_CIRCUIT_OPEN = False
             _llm_failures = 0
             _llm_circuit_reset_time = None
+            _llm_last_failure_at = None
+            _llm_last_failure_stage = None
+            _llm_last_failure_reason = None
 
         if _llm_failures >= LLM_FAILURE_THRESHOLD:
             if not LLM_CIRCUIT_OPEN:
-                logger.warning("LLM circuit breaker OPEN")
+                logger.warning(
+                    "LLM circuit breaker OPEN",
+                    extra={
+                        "failure_scope": "planner_process_consecutive",
+                        "failure_count": _llm_failures,
+                        "threshold": LLM_FAILURE_THRESHOLD,
+                        "reset_timeout_sec": LLM_CIRCUIT_RESET_TIMEOUT,
+                        "last_failure_stage": _llm_last_failure_stage,
+                        "last_failure_reason": _llm_last_failure_reason,
+                    },
+                )
                 LLM_CIRCUIT_OPEN = True
                 _llm_circuit_reset_time = now + LLM_CIRCUIT_RESET_TIMEOUT
         return LLM_CIRCUIT_OPEN
@@ -446,17 +1260,100 @@ async def check_llm_circuit() -> bool:
 async def record_llm_success():
     """Reset failure count on success."""
     global _llm_failures, LLM_CIRCUIT_OPEN, _llm_circuit_reset_time
+    global _llm_last_failure_at, _llm_last_failure_stage, _llm_last_failure_reason
     async with _llm_failure_lock:
         _llm_failures = 0
         LLM_CIRCUIT_OPEN = False
         _llm_circuit_reset_time = None
+        _llm_last_failure_at = None
+        _llm_last_failure_stage = None
+        _llm_last_failure_reason = None
 
-async def record_llm_failure():
-    """Increment failure count."""
-    global _llm_failures
+async def record_llm_failure(
+    *,
+    stage: str = "unknown",
+    reason: Optional[str] = None,
+    llm_mode: Optional[str] = None,
+    effective_mode: Optional[str] = None,
+    attempt_count: Optional[int] = None,
+    backend: Optional[str] = None,
+):
+    """Increment process-wide consecutive failure count."""
+    global _llm_failures, _llm_last_failure_at, _llm_last_failure_stage, _llm_last_failure_reason
+    resolved_llm_mode = (llm_mode or "").strip().lower() or None
+    resolved_effective_mode = (effective_mode or "").strip().lower() or None
+    if not resolved_llm_mode and not resolved_effective_mode:
+        try:
+            resolved_mode, _ = await get_llm_mode_and_priority()
+            resolved_llm_mode = (resolved_mode or "").strip().lower() or None
+            resolved_effective_mode = resolved_effective_mode or resolved_llm_mode
+        except Exception:
+            try:
+                fallback_mode = (get_llm_mode_default() or "").strip().lower()
+                if fallback_mode:
+                    resolved_llm_mode = fallback_mode
+                    resolved_effective_mode = resolved_effective_mode or fallback_mode
+            except Exception:
+                pass
     async with _llm_failure_lock:
-        _llm_failures += 1
-        logger.warning(f"LLM failure count: {_llm_failures}")
+        normalized_reason = (reason or "").strip().lower()
+        counted_toward_circuit = normalized_reason not in _NON_COUNTING_FAILURE_REASONS
+        strict_ollama_only = _is_ollama_only_mode(resolved_llm_mode, resolved_effective_mode)
+        if counted_toward_circuit and strict_ollama_only:
+            counted_toward_circuit = False
+        now = time.monotonic()
+        if counted_toward_circuit:
+            if (
+                _llm_last_failure_at is not None
+                and (now - _llm_last_failure_at) > LLM_FAILURE_IDLE_RESET_TIMEOUT
+                and _llm_failures > 0
+            ):
+                logger.info(
+                    "LLM failure counter reset after idle interval",
+                    extra={
+                        "failure_scope": "planner_process_consecutive",
+                        "idle_reset_timeout_sec": LLM_FAILURE_IDLE_RESET_TIMEOUT,
+                        "previous_failure_count": _llm_failures,
+                    },
+                )
+                _llm_failures = 0
+            _llm_failures += 1
+        elif strict_ollama_only and _llm_failures:
+            # Keep planner-level counter neutral in strict local mode.
+            _llm_failures = 0
+        _llm_last_failure_at = now
+        _llm_last_failure_stage = stage
+        _llm_last_failure_reason = normalized_reason or reason
+        if counted_toward_circuit:
+            logger.warning(
+                "LLM failure count: %s",
+                _llm_failures,
+                extra={
+                    "failure_scope": "planner_process_consecutive",
+                    "failure_stage": stage,
+                    "failure_reason": normalized_reason or reason,
+                    "llm_mode": resolved_llm_mode,
+                    "effective_mode": resolved_effective_mode,
+                    "attempt_count": attempt_count,
+                    "backend": backend,
+                    "counted_toward_circuit": True,
+                },
+            )
+        else:
+            logger.info(
+                "LLM failure observed (not counted toward planner circuit)",
+                extra={
+                    "failure_scope": "planner_process_consecutive",
+                    "failure_stage": stage,
+                    "failure_reason": normalized_reason or reason,
+                    "llm_mode": resolved_llm_mode,
+                    "effective_mode": resolved_effective_mode,
+                    "attempt_count": attempt_count,
+                    "backend": backend,
+                    "counted_toward_circuit": False,
+                    "failure_count": _llm_failures,
+                },
+            )
 
 # ----------------------------------------------------------------------
 # Async-safe cache decorator with per-key locks and bounded TTL cache
@@ -630,10 +1527,17 @@ class Flight(BaseModel):
     arrival_time: str
     duration_min: int
     price_inr: Union[str, int]
+    price_unavailable: bool = False
     stops: Union[str, int] = 0           # int from API; "N/A" when unknown
     layover_info: str = ""               # e.g. "1h 30m at BOM"
     baggage: str = "Check airline"       # Extracted from SerpAPI extensions
     booking_token: Optional[str] = None  # For booking handoff
+    shareable_link: Optional[str] = None
+    provider_link: Optional[str] = None
+    partner_booking_link: Optional[str] = None
+    booking_url: Optional[str] = None
+    booking_request: Optional[Dict[str, Any]] = None
+    booking_options: Optional[List[Dict[str, Any]]] = None
     carbon_emissions_g: Optional[int] = None  # CO2 in grams
     date: Optional[str] = None
     handoff_url: Optional[str] = None    # Resolved booking deep-link (set after ranking)
@@ -647,12 +1551,21 @@ class Flight(BaseModel):
         if isinstance(v, int):
             return f"₹{v:,}"
         if isinstance(v, str):
-            if not v.startswith('₹'):
+            raw = v.strip()
+            if not raw:
+                return "Price unavailable"
+            lowered = raw.lower()
+            if "unavailable" in lowered or lowered in {"n/a", "na", "unknown"}:
+                return "Price unavailable"
+            if not raw.startswith('₹'):
                 try:
-                    price_int = int(str(v).replace(',', '').replace('₹', '').strip())
+                    price_int = int(str(raw).replace(',', '').replace('₹', '').strip())
                     return f"₹{price_int:,}"
-                except:
-                    return "₹999,999"
+                except Exception:
+                    return "Price unavailable"
+            return raw
+        if v is None:
+            return "Price unavailable"
         return v
 
     @field_validator('departure_time', 'arrival_time', mode='before')
@@ -692,6 +1605,12 @@ class PlanResult(BaseModel):
     # New fields for weather presence tracking
     weather_present: bool = True
     weather_reason: Optional[str] = None
+    flight_counts: Optional[Dict[str, int]] = None
+    stopover_filter: Optional[Dict[str, Any]] = None
+    result_status: str = "success"
+    degradation: Optional[Dict[str, Any]] = None
+    booking_handoff: Optional[Dict[str, Any]] = None
+    top_flights: Optional[List[Dict[str, Any]]] = None
 
 class MultiCityResult(BaseModel):
     """Structured output for multi-city trips."""
@@ -710,30 +1629,83 @@ def extract_stopover(query_text: str) -> Dict[str, Optional[str]]:
     Accepts multiword city names and many phrasings.
     """
     q = query_text.strip()
+    tail_guard = (
+        r'(?=\s+(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in|'
+        r'on|for|at|tomorrow|today|next|this|return(?:ing)?|coming\s+back|'
+        r'leaving|departing|after|before|under|with|by)\b|$)'
+    )
 
-    # Try: from <A> to <B> via <C>  (non-greedy multiword)
-    m = re.search(r'from\s+(.+?)\s+to\s+(.+?)\s+(?:via|through|stopover|connecting via)\s+(.+)', q, re.IGNORECASE)
-    if m:
-        return {"origin_text": m.group(1).strip(), "destination_text": m.group(2).strip(), "via_text": m.group(3).strip()}
+    def _clean_fragment(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        cleaned = re.sub(r"\s+", " ", text).strip(" ,.-")
+        # Strip directive/boilerplate prefixes so route fragments remain city-focused.
+        for _ in range(3):
+            next_cleaned = cleaned
+            next_cleaned = re.sub(
+                r"^(?:please\s+|kindly\s+)?(?:find|search|show|get|book)(?:\s+me)?\s+",
+                "",
+                next_cleaned,
+                flags=re.IGNORECASE,
+            )
+            next_cleaned = re.sub(
+                r"^(?:a|an|the|flight|flights|trip|from|to|round[\s-]*trip|one[\s-]*way|return(?:\s+flight)?|multi[\s-]*city)\s+",
+                "",
+                next_cleaned,
+                flags=re.IGNORECASE,
+            )
+            if next_cleaned == cleaned:
+                break
+            cleaned = next_cleaned
+        cleaned = re.sub(r"\s+(?:on|for|at)\s+\d{4}-\d{2}-\d{2}\s*$", "", cleaned, flags=re.IGNORECASE)
+        return cleaned or None
 
-    # Try: <A> to <B> via <C>
-    m = re.search(r'\b(.+?)\s+to\s+(.+?)\s+(?:via|through|stopover)\s+(.+)', q, re.IGNORECASE)
+    # from <A> to <B> [via <C>]
+    m = re.search(
+        rf'\bfrom\s+([A-Za-z][A-Za-z\s-]{{1,80}}?)\s+to\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
+        q,
+        re.IGNORECASE,
+    )
     if m:
-        return {"origin_text": m.group(1).strip(), "destination_text": m.group(2).strip(), "via_text": m.group(3).strip()}
+        origin = _clean_fragment(m.group(1))
+        destination = _clean_fragment(m.group(2))
+        via_match = re.search(
+            rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
+            q,
+            re.IGNORECASE,
+        )
+        via = _clean_fragment(via_match.group(1)) if via_match else None
+        return {"origin_text": origin, "destination_text": destination, "via_text": via}
 
-    # Try: via <C> alone
-    m = re.search(r'\bvia\s+(.+)', q, re.IGNORECASE)
+    # <A> to <B> [via <C>]
+    m = re.search(
+        rf'\b([A-Za-z][A-Za-z\s-]{{1,80}}?)\s+to\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
+        q,
+        re.IGNORECASE,
+    )
     if m:
-        return {"origin_text": None, "destination_text": None, "via_text": m.group(1).strip()}
+        origin = _clean_fragment(m.group(1))
+        destination = _clean_fragment(m.group(2))
+        via_match = re.search(
+            rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
+            q,
+            re.IGNORECASE,
+        )
+        via = _clean_fragment(via_match.group(1)) if via_match else None
+        return {"origin_text": origin, "destination_text": destination, "via_text": via}
 
-    # Fallback: simple "<A> to <B>"
-    m = re.search(r'\b(.+?)\s+to\s+(.+?)\b', q, re.IGNORECASE)
+    # via <C> alone
+    m = re.search(
+        rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
+        q,
+        re.IGNORECASE,
+    )
     if m:
-        return {"origin_text": m.group(1).strip(), "destination_text": m.group(2).strip(), "via_text": None}
+        return {"origin_text": None, "destination_text": None, "via_text": _clean_fragment(m.group(1))}
 
     return {"origin_text": None, "destination_text": None, "via_text": None}
 
-def normalize_trip(user_query: str) -> Dict[str, Any]:
+def normalize_trip(user_query: str, include_trace: bool = False) -> Dict[str, Any]:
     """
     Build a canonical trip object from raw user_query using regex and centralised resolver.
     Returns dict with keys: origin_iata, destination_iata, via_iata.
@@ -744,23 +1716,36 @@ def normalize_trip(user_query: str) -> Dict[str, Any]:
     dest_iata = None
     via_iata = None
 
+    route_trace: Dict[str, Any] = {
+        "raw_fragments": parts,
+        "origin_resolution": None,
+        "destination_resolution": None,
+        "via_resolution": None,
+    }
+
     if parts["origin_text"]:
-        origin_iata = _resolve_city_to_iata(parts["origin_text"])
+        origin_iata, origin_trace = _resolve_city_to_iata_with_trace(parts["origin_text"])
+        route_trace["origin_resolution"] = origin_trace
         logger.debug(f"normalize_trip: origin_text='{parts['origin_text']}' -> origin_iata={origin_iata}")
 
     if parts["destination_text"]:
-        dest_iata = _resolve_city_to_iata(parts["destination_text"])
+        dest_iata, destination_trace = _resolve_city_to_iata_with_trace(parts["destination_text"])
+        route_trace["destination_resolution"] = destination_trace
         logger.debug(f"normalize_trip: dest_text='{parts['destination_text']}' -> dest_iata={dest_iata}")
 
     if parts["via_text"]:
-        via_iata = _resolve_city_to_iata(parts["via_text"])
+        via_iata, via_trace = _resolve_city_to_iata_with_trace(parts["via_text"])
+        route_trace["via_resolution"] = via_trace
         logger.debug(f"normalize_trip: via_text='{parts['via_text']}' -> via_iata={via_iata}")
 
-    return {
+    payload: Dict[str, Any] = {
         "origin_iata": origin_iata,
         "destination_iata": dest_iata,
         "via_iata": via_iata,
     }
+    if include_trace:
+        payload["route_trace"] = route_trace
+    return payload
 
 # ----------------------------------------------------------------------
 # Preference extraction constants
@@ -794,17 +1779,20 @@ class ParsedIntent(BaseModel):
     wants_eco: bool = False           # True when user asks for green/eco/low-carbon flights
     trip_type: Optional[str] = None   # No default – fallback applied in business logic
     deep_search: bool = False         # NEW: user wants absolute cheapest, exhaustive search
+    date_parse_trace: Optional[Dict[str, Any]] = None
+    route_parse_trace: Optional[Dict[str, Any]] = None
 
 def parse_intent(user_query: str) -> ParsedIntent:
     """Extract all structured data from the natural language query."""
     intent = ParsedIntent()
 
-    # --- First, use the robust normalize_trip to get IATA codes ---
-    trip = normalize_trip(user_query)
+    # --- First, use the robust normalize_trip to get IATA codes + route trace ---
+    trip = normalize_trip(user_query, include_trace=True)
     if trip["origin_iata"]:
         intent.origin_iata = trip["origin_iata"]
     if trip["destination_iata"]:
         intent.destination_iata = trip["destination_iata"]
+    intent.route_parse_trace = trip.get("route_trace")
 
     # Deterministic fallback for compact route formats like "DEL BOM ..." or "Delhi Mumbai ..."
     if not intent.origin_iata or not intent.destination_iata:
@@ -821,8 +1809,57 @@ def parse_intent(user_query: str) -> ParsedIntent:
     # (we could keep via_city for potential later use, but for now we ignore)
 
     q = user_query.lower()
+    WORD_TO_NUM = {
+        'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+        'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11,
+        'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
+        'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19,
+        'twenty': 20, 'thirty': 30, 'fortnight': 14,
+    }
+
+    def _replace_word_numbers(text: str) -> str:
+        normalized = text
+        for word, num in WORD_TO_NUM.items():
+            normalized = re.sub(rf'\b{word}\b', str(num), normalized)
+        return normalized
+
+    q_num = _replace_word_numbers(q)
+
+    def _has_explicit_calendar_date(text: str) -> bool:
+        """Detect explicit calendar-like dates while excluding duration phrases."""
+        month_names = (
+            "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            "jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        )
+        return bool(
+            re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+            or re.search(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{month_names})(?:\s+\d{{4}})?\b", text)
+            or re.search(rf"\b(?:{month_names})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,\s*\d{{4}})?\b", text)
+            or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})\b", text)
+        )
+
+    def _has_ambiguous_calendar_without_year(text: str) -> bool:
+        """Detect month/day style dates without an explicit year."""
+        month_names = (
+            "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            "jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        )
+        return bool(
+            re.search(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{month_names})\b(?!\s+\d{{4}}\b)", text)
+            or re.search(rf"\b(?:{month_names})\s+\d{{1,2}}(?:st|nd|rd|th)?\b(?!,\s*\d{{4}}\b)", text)
+            or re.search(r"\b\d{1,2}[/-]\d{1,2}\b(?![/-]\d{2,4}\b)", text)
+        )
+
     today = datetime.now().date()
     _relative_date_set = False   # track if we set date via relative rules
+    date_parse_trace: Dict[str, Any] = {
+        "source": "none",
+        "raw_match": None,
+        "candidate_source": None,
+        "candidate_date": None,
+        "year_inferred": False,
+        "discard_reason": None,
+    }
 
     # --- "starting DATE" match (e.g., "starting March 20") ---
     starting_match = re.search(
@@ -832,39 +1869,67 @@ def parse_intent(user_query: str) -> ParsedIntent:
     if starting_match and not _relative_date_set:
         try:
             parsed_start = dateutil.parser.parse(starting_match.group(1), dayfirst=True)
-            if parsed_start.date() >= today:
-                intent.date = parsed_start.strftime("%Y-%m-%d")
-                _relative_date_set = True
+            # Keep explicit "starting <date>" literal date even if it is in the past.
+            intent.date = parsed_start.strftime("%Y-%m-%d")
+            date_parse_trace["source"] = "starting_clause"
+            date_parse_trace["raw_match"] = starting_match.group(1)
+            _relative_date_set = True
         except Exception:
             pass
 
-    # --- Enhanced relative date parsing (with word numbers + weeks) ---
+    # --- Explicit ISO departure date in query should be preserved exactly ---
     if not _relative_date_set:
-        _WORD_TO_NUM = {
-            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
-            'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11,
-            'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
-            'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19,
-            'twenty': 20, 'thirty': 30, 'fortnight': 14,
-        }
-        q_rel = q
-        for word, num in _WORD_TO_NUM.items():
-            q_rel = re.sub(rf'\b{word}\b', str(num), q_rel)
-
-        # "14 days after today" / "14 days from now"
-        rel_days = re.search(
-            r'(\d+)\s+days?\s+(?:after|from)\s+today|(\d+)\s+days?\s+from\s+now',
-            q_rel
-        )
-        if rel_days:
-            n = int(rel_days.group(1) or rel_days.group(2))
-            intent.date = (today + timedelta(days=n)).strftime("%Y-%m-%d")
+        iso_departure_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", q)
+        if iso_departure_match:
+            intent.date = iso_departure_match.group(1)
+            date_parse_trace["source"] = "explicit_iso"
+            date_parse_trace["raw_match"] = iso_departure_match.group(1)
             _relative_date_set = True
 
-        # "2 weeks from now / after today"
-        elif re.search(r'(\d+)\s+weeks?\s+(?:from\s+(?:now|today)|after\s+today)', q_rel):
-            m = re.search(r'(\d+)\s+weeks?', q_rel)
-            intent.date = (today + timedelta(weeks=int(m.group(1)))).strftime("%Y-%m-%d")
+    # --- Enhanced relative date parsing (with word numbers + weeks) ---
+    if not _relative_date_set:
+        q_rel = q_num
+
+        # Explicit relative anchors first (avoid fuzzy parsing on trailing duration numbers).
+        if re.search(r"\bday after tomorrow\b", q_rel):
+            intent.date = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+            date_parse_trace["source"] = "relative_day_after_tomorrow"
+            _relative_date_set = True
+        elif re.search(r"\btomorrow\b", q_rel):
+            intent.date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+            date_parse_trace["source"] = "relative_tomorrow"
+            _relative_date_set = True
+
+        # "in 3 days", "3 days later", "3 days after today", "3 days from now"
+        if not _relative_date_set:
+            rel_days = re.search(
+                r"\bin\s+(\d+)\s+days?\b|(\d+)\s+days?\s+later\b|(\d+)\s+days?\s+(?:after|from)\s+today\b|(\d+)\s+days?\s+from\s+now\b",
+                q_rel,
+            )
+            if rel_days:
+                n = int(next(g for g in rel_days.groups() if g))
+                intent.date = (today + timedelta(days=n)).strftime("%Y-%m-%d")
+                date_parse_trace["source"] = "relative_days_offset"
+                date_parse_trace["raw_match"] = rel_days.group(0)
+                _relative_date_set = True
+
+        # "in 2 weeks", "2 weeks from now / after today"
+        if not _relative_date_set:
+            rel_weeks = re.search(
+                r"\bin\s+(\d+)\s+weeks?\b|(\d+)\s+weeks?\s+(?:from\s+(?:now|today)|after\s+today)\b",
+                q_rel,
+            )
+            if rel_weeks:
+                n = int(next(g for g in rel_weeks.groups() if g))
+                intent.date = (today + timedelta(weeks=n)).strftime("%Y-%m-%d")
+                date_parse_trace["source"] = "relative_weeks_offset"
+                date_parse_trace["raw_match"] = rel_weeks.group(0)
+                _relative_date_set = True
+
+        # Keep broad "today" last so specific offsets like "14 days after today" win.
+        if not _relative_date_set and re.search(r"\btoday\b", q_rel):
+            intent.date = today.strftime("%Y-%m-%d")
+            date_parse_trace["source"] = "relative_today"
             _relative_date_set = True
 
     # --- If relative date not set, fall back to other date parsers ---
@@ -876,9 +1941,12 @@ def parse_intent(user_query: str) -> ParsedIntent:
         )
 
         parsed_date = None
+        parsed_source = None
         if HAS_DATEPARSER:
             settings = {'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'DMY'}
             parsed_date = dateparser.parse(q_clean, settings=settings)
+            if parsed_date:
+                parsed_source = "dateparser"
         else:
             # Fallback regex
             date_match = re.search(r'\b(\d{1,2})(st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b', q)
@@ -887,32 +1955,63 @@ def parse_intent(user_query: str) -> ParsedIntent:
                 year = today.year
                 try:
                     parsed_date = datetime.strptime(f"{day} {month} {year}", "%d %B %Y")
+                    parsed_source = "fallback_month_day_regex"
                 except:
                     pass
 
-        if not parsed_date:
+        # Guard against fuzzy parser anchoring to a bare duration number (e.g., "returning 3 days later" -> Jan 3).
+        relative_trip_tokens = re.search(r"\b(return(?:ing)?|later|days?|weeks?|tomorrow|today|from now|after today|in \d+)\b", q_clean)
+        if not parsed_date and not (relative_trip_tokens and not _has_explicit_calendar_date(q_clean)):
             try:
                 parsed_date = dateutil.parser.parse(
                     q_clean,
                     fuzzy=True, dayfirst=True,
                     default=datetime.now().replace(month=1, day=1)
                 )
+                parsed_source = "dateutil_fuzzy"
             except:
                 pass
 
         if parsed_date:
+            date_parse_trace["candidate_source"] = parsed_source
+            date_parse_trace["candidate_date"] = parsed_date.strftime("%Y-%m-%d")
             # Sanity check: reject absurd years and any past date
             if parsed_date.year > today.year + 2 or parsed_date.year < 2000:
                 parsed_date = None
+                date_parse_trace["discard_reason"] = "year_out_of_range"
             elif parsed_date.date() < today:
-                # Past date: bump forward one year as best guess
-                bumped = parsed_date.replace(year=parsed_date.year + 1)
-                # If still in the past (e.g., parsed year was far behind), reject entirely
-                parsed_date = bumped if bumped.date() >= today else None
-                if parsed_date:
-                    intent.date = parsed_date.strftime("%Y-%m-%d")
+                explicit_calendar = _has_explicit_calendar_date(q)
+                ambiguous_without_year = _has_ambiguous_calendar_without_year(q)
+                if explicit_calendar and ambiguous_without_year:
+                    # Conservative inference: only infer next year for explicit month/day style dates
+                    # that did not specify a year.
+                    try:
+                        bumped = parsed_date.replace(year=parsed_date.year + 1)
+                    except ValueError:
+                        bumped = None
+                    if bumped and bumped.date() >= today:
+                        intent.date = bumped.strftime("%Y-%m-%d")
+                        date_parse_trace["source"] = "explicit_ambiguous_year_inferred"
+                        date_parse_trace["year_inferred"] = True
+                    else:
+                        intent.date = parsed_date.strftime("%Y-%m-%d")
+                        date_parse_trace["source"] = "explicit_calendar_preserved_past"
+                else:
+                    # Preserve explicit dated user text exactly; do not silently rewrite.
+                    if explicit_calendar:
+                        intent.date = parsed_date.strftime("%Y-%m-%d")
+                        date_parse_trace["source"] = "explicit_calendar_preserved_past"
+                    else:
+                        # Fuzzy implicit date parsed in the past: drop it instead of silently bumping year.
+                        date_parse_trace["discard_reason"] = "implicit_past_candidate"
+                        date_parse_trace["source"] = "fuzzy_past_discarded"
             else:
                 intent.date = parsed_date.strftime("%Y-%m-%d")
+                date_parse_trace["source"] = parsed_source or "parser_candidate"
+
+    if intent.date and date_parse_trace["source"] == "none":
+        date_parse_trace["source"] = "resolved_without_trace"
+    intent.date_parse_trace = date_parse_trace
 
     # --- Time preference ---
     for key in TIME_WINDOWS:
@@ -951,12 +2050,39 @@ def parse_intent(user_query: str) -> ParsedIntent:
         intent.baggage_pref = "checked"
 
     # --- Trip duration (for return) ---
-    duration_match = re.search(r'(\d+)[-\s]*(day|night)', q)
-    if duration_match:
-        intent.trip_duration_days = int(duration_match.group(1))
+    def _unit_to_days(count: int, unit: str) -> int:
+        unit_l = (unit or "").lower()
+        if unit_l.startswith("week"):
+            return count * 7
+        return count
+
+    return_duration_patterns = (
+        r"\b(?:return(?:ing)?|coming\s+back|come\s+back|back)\b[^.]{0,80}?\b(?:after|in)\s+(?P<count>\d+)\s+(?P<unit>day|days|night|nights|week|weeks)\b",
+        r"\b(?:return(?:ing)?|coming\s+back|come\s+back|back)\b[^.]{0,80}?\b(?P<count>\d+)\s+(?P<unit>day|days|night|nights|week|weeks)\s+(?:later|after\s+that)\b",
+    )
+    for pattern in return_duration_patterns:
+        match = re.search(pattern, q_num)
+        if match:
+            intent.trip_duration_days = _unit_to_days(int(match.group("count")), match.group("unit"))
+            break
+
+    if intent.trip_duration_days is None:
+        duration_match = re.search(
+            r"\b(?:for|trip\s+for|stay(?:ing)?\s+for)\s+(\d+)\s*(day|days|night|nights|week|weeks)\b"
+            r"|\b(\d+)\s*(day|days|night|nights|week|weeks)\s+trip\b",
+            q_num,
+        )
+        if duration_match:
+            count_raw = duration_match.group(1) or duration_match.group(3)
+            unit_raw = duration_match.group(2) or duration_match.group(4)
+            if count_raw and unit_raw:
+                intent.trip_duration_days = _unit_to_days(int(count_raw), unit_raw)
 
     # --- Return date explicit ---
-    return_match = re.search(r'return(?:ing)?(?: on)? (\d{1,2}[\-/]\d{1,2}(?:[\-/]\d{2,4})?)', q)
+    return_match = re.search(
+        r'return(?:ing)?(?:\s+on)?\s+(\d{4}-\d{2}-\d{2}|\d{1,2}[\-/]\d{1,2}(?:[\-/]\d{2,4})?)',
+        q,
+    )
     if return_match:
         try:
             dt = dateutil.parser.parse(return_match.group(1), dayfirst=True)
@@ -964,10 +2090,17 @@ def parse_intent(user_query: str) -> ParsedIntent:
         except:
             pass
 
-    # --- Stopover city (using improved regex) ---
-    via_match = re.search(r'\bvia\s+([A-Za-z][a-z]+(?:\s+[A-Z][a-z]+)*)', q)
+    # --- Stopover city ---
+    # Parse from original query to preserve multi-word city names (for example, "New Delhi", "Abu Dhabi").
+    via_match = re.search(
+        r'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{1,80}?)(?=\s+(?:on|for|at|tomorrow|today|next|this|return(?:ing)?|coming\s+back|leaving|departing|after|before|under|with|by)\b|$)',
+        user_query,
+        flags=re.IGNORECASE,
+    )
     if via_match:
-        intent.stopover_city = via_match.group(1).strip().title()
+        stopover_text = re.sub(r'\s+', ' ', via_match.group(1)).strip(" ,.-")
+        stopover_text = re.sub(r'^(?:in)\s+', '', stopover_text, flags=re.IGNORECASE)
+        intent.stopover_city = stopover_text.title()
 
     # --- Flight preference ---
     if "cheapest" in q or "cheap" in q or "lowest price" in q or "budget" in q:
@@ -1019,6 +2152,8 @@ def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
     filtered = []
     # Local warnings list (passed to LLM later)
     filter_warnings = []
+    warned_unknown_price_budget = False
+    warned_unknown_stops_direct = False
     for f in flights:
         reasons = []
         # Normalize fields
@@ -1032,9 +2167,17 @@ def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
             if not (start <= dep <= end):
                 reasons.append("time")
         if intent.price_limit:
-            price = price_to_int(f.price_inr)
-            if price > intent.price_limit:
-                reasons.append("price")
+            price_unavailable = bool(getattr(f, "price_unavailable", False))
+            if price_unavailable:
+                if not warned_unknown_price_budget:
+                    filter_warnings.append(
+                        "Some flights had unavailable prices, so budget filtering could not be strictly enforced for those options."
+                    )
+                    warned_unknown_price_budget = True
+            else:
+                price = price_to_int(f.price_inr)
+                if price > intent.price_limit:
+                    reasons.append("price")
         if intent.wants_direct:
             # Tolerant direct detection
             stops_clean = stops.replace("stops", "").strip()
@@ -1042,7 +2185,9 @@ def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
             # Unknown stops → assume it might be direct (benefit of doubt)
             if stops in ("n/a", "", "unknown"):
                 direct = True
-                filter_warnings.append("Stop data unavailable for recommended flight; directness cannot be confirmed.")
+                if not warned_unknown_stops_direct:
+                    filter_warnings.append("Stop data unavailable for recommended flight; directness cannot be confirmed.")
+                    warned_unknown_stops_direct = True
             elif any(x in stops for x in ("non-stop", "nonstop", "direct")):
                 direct = True
             else:
@@ -1198,6 +2343,24 @@ def _enforce_narrative_consistency(
 
 def _safe_llm_error_message(error: Exception) -> str:
     if isinstance(error, AllBackendsFailed):
+        status = error.as_dict() if hasattr(error, "as_dict") else {}
+        failures = status.get("failures") or []
+        mode = (status.get("mode") or "").strip().lower()
+        effective_mode = (status.get("effective_mode") or "").strip().lower()
+        strict_mode = effective_mode or mode
+        single_backend_scope = (
+            len(failures) <= 1
+            and (
+                mode in {LLM_MODE_OLLAMA_ONLY, LLM_MODE_CLOUD_ONLY}
+                or effective_mode in {LLM_MODE_OLLAMA_ONLY, LLM_MODE_CLOUD_ONLY}
+            )
+        )
+        if single_backend_scope:
+            if strict_mode == LLM_MODE_OLLAMA_ONLY:
+                return "Configured Ollama backend temporarily unavailable"
+            if strict_mode == LLM_MODE_CLOUD_ONLY:
+                return "Configured cloud backend temporarily unavailable"
+            return "Configured LLM backend temporarily unavailable"
         return "LLM backends temporarily unavailable"
 
     message = str(error).lower()
@@ -1208,11 +2371,88 @@ def _safe_llm_error_message(error: Exception) -> str:
     return "LLM response unavailable"
 
 
+def _is_single_backend_unavailable(error: AllBackendsFailed) -> bool:
+    status = error.as_dict() if hasattr(error, "as_dict") else {}
+    failures = status.get("failures") or []
+    mode = (status.get("mode") or "").strip().lower()
+    effective_mode = (status.get("effective_mode") or "").strip().lower()
+    return (
+        len(failures) <= 1
+        and (
+            mode in {LLM_MODE_OLLAMA_ONLY, LLM_MODE_CLOUD_ONLY}
+            or effective_mode in {LLM_MODE_OLLAMA_ONLY, LLM_MODE_CLOUD_ONLY}
+        )
+    )
+
+
+def _primary_router_failure_reason(status: Dict[str, Any]) -> str:
+    failures = status.get("failures") or []
+    if failures and isinstance(failures[0], dict):
+        return _counter_reason_from_router_reason(str(failures[0].get("reason") or ""))
+    return "upstream_unavailable"
+
+
+def _truncate_for_prompt(value: str, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 18)].rstrip() + " ...[trimmed]"
+
+
 def _backend_status_payload(error: Exception) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"message": _safe_llm_error_message(error)}
-    if PLANNER_INCLUDE_BACKEND_STATUS and isinstance(error, AllBackendsFailed):
+    if _planner_include_backend_status() and isinstance(error, AllBackendsFailed):
         payload["backend_status"] = error.as_dict()
     return payload
+
+
+def _classify_tool_failure_reason(error: Any) -> str:
+    text = str(error or "").lower()
+    if "timed out" in text or "timeout" in text:
+        return "upstream_timeout"
+    if "no available keys" in text or "temporarily unavailable" in text or "all serpapi keys exhausted" in text:
+        return "upstream_unavailable"
+    return "provider_failure"
+
+
+def _failure_domain_from_reason(reason: Optional[str]) -> str:
+    r = (reason or "").strip().lower()
+    if r in {"upstream_timeout", "upstream_unavailable", "provider_failure"}:
+        return "upstream_provider"
+    if r in {"invalid_route", "invalid_past_date", "invalid_date_order"}:
+        return "request_validation"
+    if r in {"no_flights"}:
+        return "search_outcome"
+    return "internal_backend"
+
+
+def _llm_degradation_payload(
+    *,
+    reason: str,
+    message: str,
+    provider: Optional[str] = None,
+    backend_status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "component": "llm_explanation",
+        "reason": reason,
+        "message": message,
+        "domain": _failure_domain_from_reason(reason),
+    }
+    if provider:
+        payload["provider"] = provider
+    if backend_status:
+        payload["backend_status"] = backend_status
+    return payload
+
+
+def _explanation_degradation_note(reason: Optional[str], message: Optional[str]) -> str:
+    safe_reason = (reason or "upstream_unavailable").strip().lower()
+    safe_message = (
+        (message or "").strip()
+        or "LLM explanation degraded; structured flight and weather data remain available."
+    )
+    return f"LLM explanation degraded ({safe_reason}): {safe_message}"
 
 
 async def generate_explanation(
@@ -1228,17 +2468,30 @@ async def generate_explanation(
     price_analysis_str: str = "",   # NEW: structured price trend info
     price_prediction_str: str = "", # NEW: price prediction advice
     booking_url: Optional[str] = None,  # NEW: optional booking link
-) -> str:
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Call LLM to produce a natural language response, with timeout and circuit breaker."""
-    if await check_llm_circuit():
+    try:
+        llm_mode_hint, llm_priority_hint = await get_llm_mode_and_priority()
+    except Exception:
+        llm_mode_hint, llm_priority_hint = "unknown", "unknown"
+
+    if await check_llm_circuit(llm_mode=llm_mode_hint, effective_mode=llm_mode_hint):
         logger.warning("LLM circuit breaker open, returning deterministic summary")
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
             error="circuit breaker open", location=intent.destination_iata
+        ), _llm_degradation_payload(
+            reason="upstream_unavailable",
+            message="LLM circuit breaker is open; explanation generated via deterministic fallback.",
+            provider="router",
         )
 
-    # Cap flights shown in prompt to reduce token usage (5 for round trips, 10 otherwise)
-    max_flights_in_prompt = 5 if intent.return_date else 10
+    # Cap flights shown in prompt to reduce token usage.
+    max_flights_in_prompt = (
+        PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP
+        if intent.return_date
+        else PLANNER_LLM_MAX_FLIGHTS_ONE_WAY
+    )
     flights_str = "\n".join([
         f"- {f.airline} {f.flight_no} on {f.date or 'N/A'} | "
         f"{f.departure_time} → {f.arrival_time} | "
@@ -1262,6 +2515,11 @@ async def generate_explanation(
         warnings_str = "\nSystem Notes/Warnings:\n- " + "\n- ".join(processed)
     else:
         warnings_str = ""
+    warnings_str = _truncate_for_prompt(warnings_str, PLANNER_LLM_WARNINGS_MAX_CHARS)
+    trip_description_for_prompt = _truncate_for_prompt(
+        trip_description,
+        PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS,
+    )
 
     # Ensure weather values are plain (not enum objects) and build readable string
     weather_display = _normalized_weather_display(weather)
@@ -1404,18 +2662,24 @@ async def generate_explanation(
         + airline_rule
     )
 
-    prompt = f"""
+    def _render_prompt(
+        *,
+        trip_description_block: str,
+        warnings_block: str,
+        flights_block: str,
+    ) -> str:
+        return f"""
 CRITICAL CONSTRAINT: The stops field for this flight is '{stops_display}'.
 {constraint_note}{baggage_constraint}{layover_constraint}{temp_constraint}
 
-You are a helpful travel assistant helping a user plan {trip_description}.
+You are a helpful travel assistant helping a user plan {trip_description_block}.
 
 User preferences:
 - {filters_applied}
-{warnings_str}
+{warnings_block}
 
 Flight options from {intent.origin_iata} to {intent.destination_iata} around {intent.date}:
-{flights_str}
+{flights_block}
 
 Best matching flight:
 - {best_flight.airline} {best_flight.flight_no} on {best_flight.date or 'N/A'} |
@@ -1437,79 +2701,251 @@ User's question: {user_query}
 Please recommend the best flight, explain why it matches their preferences, mention the weather forecast suitability (including packing advice based on min/max temperature and any rain or snow alerts), and answer the user's query helpfully.
 """
 
+    prompt = _render_prompt(
+        trip_description_block=trip_description_for_prompt,
+        warnings_block=warnings_str,
+        flights_block=flights_str,
+    )
+
     # Combine facts block and prompt with an instruction to echo the facts
-    full_prompt = facts_block + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n" + prompt
+    full_prompt = (
+        facts_block
+        + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n"
+        + prompt
+    )
+    prompt_chars_before_trim = len(full_prompt)
+    prompt_trimmed = False
+    prompt_hard_trimmed = False
+    trimmed_flights_in_prompt = max_flights_in_prompt
+    if prompt_chars_before_trim > PLANNER_LLM_PROMPT_SOFT_LIMIT:
+        prompt_trimmed = True
+        trimmed_flights_in_prompt = max(2, max_flights_in_prompt // 2)
+        trimmed_flights_str = "\n".join([
+            f"- {f.airline} {f.flight_no} on {f.date or 'N/A'} | "
+            f"{f.departure_time} → {f.arrival_time} | "
+            f"{f.duration_min} min | {f.price_inr} | "
+            f"Stops: {f.stops} | Baggage: {f.baggage}"
+            for f in all_flights[:trimmed_flights_in_prompt]
+        ])
+        prompt = _render_prompt(
+            trip_description_block=_truncate_for_prompt(
+                trip_description_for_prompt,
+                max(320, PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS // 2),
+            ),
+            warnings_block=_truncate_for_prompt(
+                warnings_str,
+                max(240, PLANNER_LLM_WARNINGS_MAX_CHARS // 2),
+            ),
+            flights_block=trimmed_flights_str,
+        )
+        full_prompt = (
+            facts_block
+            + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n"
+            + prompt
+        )
+        logger.info(
+            "LLM prompt trimmed for timeout protection",
+            extra={
+                "llm_mode": llm_mode_hint,
+                "llm_priority": llm_priority_hint,
+                "prompt_chars_before": prompt_chars_before_trim,
+                "prompt_chars_after": len(full_prompt),
+                "flights_before": max_flights_in_prompt,
+                "flights_after": trimmed_flights_in_prompt,
+                "is_round_trip": bool(intent.return_date),
+            },
+        )
+
+    full_prompt, prompt_hard_trimmed = _apply_prompt_hard_limit(
+        full_prompt,
+        hard_limit=PLANNER_LLM_PROMPT_HARD_LIMIT,
+    )
+    if prompt_hard_trimmed:
+        prompt_trimmed = True
+        logger.info(
+            "LLM prompt hard-capped for runtime stability",
+            extra={
+                "llm_mode": llm_mode_hint,
+                "llm_priority": llm_priority_hint,
+                "hard_limit_chars": PLANNER_LLM_PROMPT_HARD_LIMIT,
+                "prompt_chars_after_cap": len(full_prompt),
+            },
+        )
 
     logger.info("Sending prompt to LLM")
-    # ADD DEBUG LOGGING FOR PROMPT AND TRIP_DESCRIPTION
     logger.debug(
-        "LLM prompt (first 500 chars): %s",
-        full_prompt[:500].replace('\n', ' ')
+        "LLM prompt prepared",
+        extra={"prompt_chars": len(full_prompt)},
     )
     logger.debug(
-        "LLM trip_description (first 500 chars): %s",
-        trip_description[:500].replace('\n', ' ')
+        "LLM trip description prepared",
+        extra={"trip_description_chars": len(trip_description)},
+    )
+    logger.info(
+        "LLM explanation request context",
+        extra={
+            "llm_mode": llm_mode_hint,
+            "llm_priority": llm_priority_hint,
+            "prompt_chars": len(full_prompt),
+            "prompt_trimmed": prompt_trimmed,
+            "prompt_hard_trimmed": prompt_hard_trimmed,
+            "flights_in_prompt": trimmed_flights_in_prompt,
+            "all_flights_count": len(all_flights),
+            "warnings_count": len(warnings or []),
+            "has_return_date": bool(intent.return_date),
+            "has_weather_payload": bool(weather_display),
+            "has_price_context": bool(
+                (price_insights_str or "").strip()
+                or (price_analysis_str or "").strip()
+                or (price_prediction_str or "").strip()
+            ),
+            "has_booking_url": bool((booking_url or "").strip()),
+            "trip_description_chars": len(trip_description or ""),
+        },
     )
 
     LLMROUTER_FALLBACK_MARKER = "All LLM backends failed"
+    planner_timeout = _resolve_planner_llm_timeout()
+    planner_model = _resolve_planner_llm_model()
+    router_timeout_hint = get_env_float("ROUTER_TIMEOUT", 90.0)
+    router_local_timeout_hint = _resolve_router_local_timeout_hint(planner_timeout)
+    logger.info(
+        "LLM timeout ownership (non-stream)",
+        extra={
+            "timeout_owner": "router_backend_timeout",
+            "planner_timeout_hint_sec": planner_timeout,
+            "router_local_timeout_sec": router_local_timeout_hint,
+            "router_timeout_sec": router_timeout_hint,
+        },
+    )
     try:
-        llm_text = await asyncio.wait_for(
-            generate(
-                prompt=full_prompt,
-                system=system,
-                model=PLANNER_LLM_MODEL,
-                stream=False
-            ),
-            timeout=PLANNER_LLM_TIMEOUT
+        llm_text = await generate(
+            prompt=full_prompt,
+            system=system,
+            model=planner_model,
+            stream=False,
         )
         # Detect when llm_router itself returned an internal fallback string instead of raising
         if LLMROUTER_FALLBACK_MARKER in (llm_text or ""):
             logger.warning("generate() returned internal backend-failure fallback; retrying once")
             await asyncio.sleep(1)
             try:
-                llm_text = await asyncio.wait_for(
-                    generate(
-                        prompt=full_prompt,
-                        system=system,
-                        model=PLANNER_LLM_MODEL,
-                        stream=False
-                    ),
-                    timeout=min(PLANNER_LLM_TIMEOUT, 30)
+                llm_text = await generate(
+                    prompt=full_prompt,
+                    system=system,
+                    model=planner_model,
+                    stream=False,
                 )
             except Exception:
                 llm_text = ""
             if not llm_text or LLMROUTER_FALLBACK_MARKER in llm_text:
-                await record_llm_failure()
+                await record_llm_failure(
+                    stage="generate_explanation",
+                    reason="router_fallback_marker",
+                    llm_mode=llm_mode_hint,
+                    effective_mode=llm_mode_hint,
+                    attempt_count=2,
+                )
                 return generate_deterministic_summary(
                     best_flight, weather, filters_applied,
                     error="All LLM backends failed", location=intent.destination_iata
+                ), _llm_degradation_payload(
+                    reason="upstream_unavailable",
+                    message="All configured LLM backends failed; explanation generated via deterministic fallback.",
+                    provider="router",
                 )
         llm_text = _enforce_narrative_consistency(llm_text, best_flight, weather)
         await record_llm_success()
-        return llm_text
-    except asyncio.TimeoutError:
-        logger.error(f"LLM call timed out after {PLANNER_LLM_TIMEOUT}s")
-        await record_llm_failure()
+        return llm_text, None
+    except (TimeoutError, asyncio.TimeoutError):
+        timeout_budget = max(router_local_timeout_hint, planner_timeout)
+        logger.error("LLM call timed out after %.2fs", timeout_budget)
+        await record_llm_failure(
+            stage="generate_explanation",
+            reason="upstream_timeout",
+            llm_mode=llm_mode_hint,
+            effective_mode=llm_mode_hint,
+            attempt_count=1,
+            backend="ollama_or_router",
+        )
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
             error="timed out", location=intent.destination_iata
+        ), _llm_degradation_payload(
+            reason="upstream_timeout",
+            message=f"LLM explanation timed out after {timeout_budget}s; deterministic fallback used.",
+            provider="router",
         )
     except AllBackendsFailed as e:
-        logger.warning("LLM backends unavailable for explanation", extra=e.as_dict())
-        await record_llm_failure()
+        status = e.as_dict()
+        failures = status.get("failures") or []
+        counter_reason = _primary_router_failure_reason(status)
+        first_failure = failures[0] if failures else {}
+        primary_backend = (
+            str(first_failure.get("backend") or "")
+            if isinstance(first_failure, dict)
+            else None
+        )
+        single_backend_scope = _is_single_backend_unavailable(e)
+        logger.warning(
+            "LLM backend unavailable for explanation"
+            if single_backend_scope
+            else "LLM backends unavailable for explanation",
+            extra={
+                **status,
+                "configured_llm_mode": llm_mode_hint,
+                "failure_count_reported": len(failures),
+            },
+        )
+        await record_llm_failure(
+            stage="generate_explanation",
+            reason=counter_reason,
+            llm_mode=llm_mode_hint,
+            effective_mode=status.get("effective_mode"),
+            attempt_count=max(1, len(failures)),
+            backend=primary_backend,
+        )
         return generate_deterministic_summary(
             best_flight,
             weather,
             filters_applied,
             error=_safe_llm_error_message(e),
             location=intent.destination_iata
+        ), _llm_degradation_payload(
+            reason="upstream_unavailable",
+            message=(
+                "Configured LLM backend unavailable; deterministic explanation fallback used."
+                if single_backend_scope
+                else "LLM backends unavailable; deterministic explanation fallback used."
+            ),
+            provider="router",
+            backend_status=status,
         )
     except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        await record_llm_failure()
+        logger.error("LLM call failed", extra={"error": str(e), "error_type": type(e).__name__})
+        msg = str(e).lower()
+        counter_reason = (
+            "circuit_open"
+            if ("circuit breaker open" in msg or "circuit breaker is open" in msg)
+            else "upstream_timeout"
+            if ("timed out" in msg or "timeout" in msg)
+            else "upstream_unavailable"
+        )
+        await record_llm_failure(
+            stage="generate_explanation",
+            reason=counter_reason,
+            llm_mode=llm_mode_hint,
+            effective_mode=llm_mode_hint,
+            attempt_count=1,
+            backend="ollama_or_router",
+        )
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
             error=_safe_llm_error_message(e), location=intent.destination_iata
+        ), _llm_degradation_payload(
+            reason="upstream_unavailable",
+            message="LLM explanation unavailable; deterministic fallback used.",
+            provider="router",
         )
 
 def generate_deterministic_summary(
@@ -1533,7 +2969,7 @@ def generate_deterministic_summary(
             f"Duration: {best_flight.duration_min} minutes, Price: {best_flight.price_inr}. "
             f"Weather at destination{loc_display}: {weather_str}. ")
     if error:
-        base += f"(Note: Enhanced explanation unavailable due to {error}.)"
+        base += f"(Explanation degraded: {error}.)"
     return base
 
 # ----------------------------------------------------------------------
@@ -1566,7 +3002,7 @@ Query: {user_query}
             generate(
                 prompt=mini_prompt,
                 system="You are a precise travel assistant. Always output JSON only.",
-                model=PLANNER_LLM_MODEL,
+                model=_resolve_planner_llm_model(),
                 stream=False
             ),
             timeout=LLM_CORRECTION_TIMEOUT
@@ -1665,7 +3101,11 @@ async def _plan_trip_internal(
     # Prevent excessive recursion
     if depth >= MAX_RECURSION_DEPTH:
         logger.error("Max recursion depth reached")
-        return {"error": "Too deep recursion in trip planning"}
+        return {
+            "error": "Too deep recursion in trip planning",
+            "failure_reason": "planner_error",
+            "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+        }
 
     # Use shared module-level cache unless custom tools are injected
     cached_search = (
@@ -1684,8 +3124,8 @@ async def _plan_trip_internal(
 
     def _normalize_weather_for_display(weather_value: Any, requested_location: Optional[str] = None) -> Any:
         """
-        Keep weather payload shape intact while making display temperature more realistic.
-        Preference: use temp_max_c when present, then apply tropical floor for Mumbai/BOM.
+        Keep weather payload shape intact and attach display labels without
+        altering source numeric weather values.
         """
         if weather_value is None or isinstance(weather_value, Exception):
             return weather_value
@@ -1706,14 +3146,14 @@ async def _plan_trip_internal(
         if requested_location and not payload.get("location"):
             payload["location"] = requested_location
 
-        temp_max = payload.get("temp_max_c")
-        if isinstance(temp_max, (int, float)):
-            payload["temperature_c"] = temp_max
-
-        temp_val = payload.get("temperature_c")
-        loc_value = str(payload.get("location") or requested_location or "").strip().lower()
-        if isinstance(temp_val, (int, float)) and loc_value in {"bom", "mumbai"} and temp_val < 15:
-            payload["temperature_c"] = max(temp_val, 18)
+        normalized_location = _sanitize_iata_code(str(requested_location or payload.get("location") or ""))
+        if normalized_location:
+            payload["location"] = normalized_location
+            location_city = city_for_iata(normalized_location)
+            location_label = label_for_iata(normalized_location) or normalized_location
+            if location_city:
+                payload["location_city"] = location_city
+            payload["location_label"] = location_label
 
         return payload
 
@@ -1727,7 +3167,11 @@ async def _plan_trip_internal(
             return await inflight
 
         async def _fetch_weather() -> Any:
-            result = await cached_weather(location=location, travel_date=travel_date, units="metric")
+            weather_query_location = location
+            normalized_loc = _sanitize_iata_code(location)
+            if normalized_loc:
+                weather_query_location = city_for_iata(normalized_loc) or location
+            result = await cached_weather(location=weather_query_location, travel_date=travel_date, units="metric")
             normalized = _normalize_weather_for_display(result, requested_location=location)
             weather_cache[cache_key] = normalized
             return normalized
@@ -1755,6 +3199,9 @@ async def _plan_trip_internal(
         }
     }
     relaxation_attempts: List[Dict[str, Any]] = []
+    tool_search_meta: Dict[str, Any] = {}
+    pre_filter_count = 0
+    post_filter_count = 0
 
     # ------------------------------------------------------------------
     # 1. Parse intent (overrides explicit params)
@@ -1766,11 +3213,16 @@ async def _plan_trip_internal(
     else:
         intent = ParsedIntent()
 
+    explicit_route_resolution: Dict[str, Any] = {}
     # Override with explicit parameters if provided, using central resolver
     if origin:
-        intent.origin_iata = _resolve_city_to_iata(origin)
+        resolved_origin, origin_trace = _resolve_city_to_iata_with_trace(origin)
+        intent.origin_iata = resolved_origin
+        explicit_route_resolution["origin"] = origin_trace
     if destination:
-        intent.destination_iata = _resolve_city_to_iata(destination)
+        resolved_destination, destination_trace = _resolve_city_to_iata_with_trace(destination)
+        intent.destination_iata = resolved_destination
+        explicit_route_resolution["destination"] = destination_trace
     if date:
         intent.date = date
 
@@ -1780,11 +3232,44 @@ async def _plan_trip_internal(
     normalization_debug["after_initial_parse"] = {
         "origin_iata": intent.origin_iata,
         "destination_iata": intent.destination_iata,
+        "route_parse_trace": intent.route_parse_trace,
+        "date_parse_trace": intent.date_parse_trace,
+        "explicit_route_resolution": explicit_route_resolution,
     }
 
-    # Trip type resolution: explicit parameter > parsed intent > fallback "Business"
-    resolved_trip_type = trip_type or intent.trip_type or "Business"
+    # Trip-type resolution keeps semantic intent separate from route-mode labels.
+    normalized_trip_type = (trip_type or "").strip().lower()
+    semantic_trip_map = {
+        "business": "Business",
+        "holiday": "Holiday",
+        "flexible": "Flexible",
+        "urgent": "Urgent",
+    }
+    route_trip_map = {
+        "one-way": "one-way",
+        "one way": "one-way",
+        "oneway": "one-way",
+        "round-trip": "round-trip",
+        "round trip": "round-trip",
+        "return": "round-trip",
+        "via-stopover": "via-stopover",
+        "via stopover": "via-stopover",
+        "via / stopover": "via-stopover",
+        "stopover": "via-stopover",
+    }
+    semantic_trip_override = semantic_trip_map.get(normalized_trip_type)
+    requested_trip_mode = route_trip_map.get(normalized_trip_type)
+
+    resolved_trip_type = semantic_trip_override or intent.trip_type or "Business"
     intent.trip_type = resolved_trip_type
+
+    # Structured round-trip mode should trigger return-leg planning even when query text omits it.
+    if requested_trip_mode == "round-trip" and not intent.return_date and not intent.trip_duration_days:
+        intent.trip_duration_days = 3
+    elif requested_trip_mode == "one-way":
+        # Structured one-way mode should suppress return-leg inference from free-text.
+        intent.return_date = None
+        intent.trip_duration_days = None
 
     # Sanity check: stopover city cannot be same as origin or destination
     if intent.stopover_city:
@@ -1796,17 +3281,31 @@ async def _plan_trip_internal(
 
     phases['intent_parsing'] = time.monotonic() - start
 
-    # If we still lack origin/destination, try LLM correction only if user_query exists
     llm_correction_explanation = None
+
+    # Deterministic non-LLM fallback first for compact/weak route forms
+    # to reduce model-dependent variability during route recovery.
     if user_query and (not intent.origin_iata or not intent.destination_iata):
-        logger.info("Missing origin/destination, attempting LLM correction")
+        inferred_origin, inferred_dest, infer_trace = _infer_route_pair_from_query(user_query)
+        if not intent.origin_iata and inferred_origin:
+            intent.origin_iata = _sanitize_iata_code(inferred_origin)
+        if not intent.destination_iata and inferred_dest:
+            intent.destination_iata = _sanitize_iata_code(inferred_dest)
+        normalization_debug["route_inference"] = infer_trace
+
+    # If we still lack origin/destination, use LLM correction as fallback.
+    if user_query and (not intent.origin_iata or not intent.destination_iata):
+        logger.info("Missing origin/destination after deterministic recovery, attempting LLM correction")
         start = time.monotonic()
         corrected_origin, corrected_dest, explanation = await correct_cities_with_llm(user_query)
         normalized_corrected_origin = _sanitize_iata_code(corrected_origin)
         normalized_corrected_dest = _sanitize_iata_code(corrected_dest)
-        if corrected_origin:
+        # Non-destructive merge: never clobber an already-resolved side with
+        # null/invalid LLM output. LLM correction is only allowed to fill missing
+        # route sides when normalization yields a valid IATA code.
+        if not intent.origin_iata and normalized_corrected_origin:
             intent.origin_iata = normalized_corrected_origin
-        if corrected_dest:
+        if not intent.destination_iata and normalized_corrected_dest:
             intent.destination_iata = normalized_corrected_dest
         if explanation:
             llm_correction_explanation = explanation
@@ -1820,18 +3319,35 @@ async def _plan_trip_internal(
         }
         phases['city_correction'] = time.monotonic() - start
 
-    # Deterministic non-LLM fallback for compact route forms (e.g., "DEL BOM ...", "Delhi Mumbai ...").
-    if user_query and (not intent.origin_iata or not intent.destination_iata):
-        inferred_origin, inferred_dest, infer_trace = _infer_route_pair_from_query(user_query)
-        if not intent.origin_iata and inferred_origin:
-            intent.origin_iata = _sanitize_iata_code(inferred_origin)
-        if not intent.destination_iata and inferred_dest:
-            intent.destination_iata = _sanitize_iata_code(inferred_dest)
-        normalization_debug["route_inference"] = infer_trace
+    normalization_debug["route_trace"] = {
+        "raw_fragments": (intent.route_parse_trace or {}).get("raw_fragments"),
+        "query_resolution": {
+            "origin": (intent.route_parse_trace or {}).get("origin_resolution"),
+            "destination": (intent.route_parse_trace or {}).get("destination_resolution"),
+            "via": (intent.route_parse_trace or {}).get("via_resolution"),
+        },
+        "explicit_param_resolution": explicit_route_resolution,
+        "route_inference": normalization_debug.get("route_inference"),
+    }
 
+    query_route_trace = intent.route_parse_trace or {}
+    explicit_origin_basis = (explicit_route_resolution.get("origin") or {}).get("resolution_basis")
+    explicit_destination_basis = (explicit_route_resolution.get("destination") or {}).get("resolution_basis")
+    query_origin_basis = (query_route_trace.get("origin_resolution") or {}).get("resolution_basis")
+    query_destination_basis = (query_route_trace.get("destination_resolution") or {}).get("resolution_basis")
     normalization_debug["final"] = {
         "origin_iata": intent.origin_iata,
         "destination_iata": intent.destination_iata,
+        "origin_resolution_basis": explicit_origin_basis or query_origin_basis,
+        "destination_resolution_basis": explicit_destination_basis or query_destination_basis,
+        "origin_resolution_is_fuzzy": bool(
+            ((explicit_route_resolution.get("origin") or {}).get("resolver_trace") or {}).get("is_fuzzy")
+            or ((query_route_trace.get("origin_resolution") or {}).get("resolver_trace") or {}).get("is_fuzzy")
+        ),
+        "destination_resolution_is_fuzzy": bool(
+            ((explicit_route_resolution.get("destination") or {}).get("resolver_trace") or {}).get("is_fuzzy")
+            or ((query_route_trace.get("destination_resolution") or {}).get("resolver_trace") or {}).get("is_fuzzy")
+        ),
     }
 
     if not intent.origin_iata or not intent.destination_iata:
@@ -1845,6 +3361,8 @@ async def _plan_trip_internal(
         )
         return {
             "error": "Could not determine origin or destination airport after AI correction.",
+            "failure_reason": "invalid_route",
+            "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
             "debug_info": {
                 "phases": phases.copy(),
                 "intent": intent.model_dump(),
@@ -1866,15 +3384,69 @@ async def _plan_trip_internal(
         base_date = datetime.now() + timedelta(days=1)
     search_date = base_date.strftime("%Y-%m-%d")
 
+    normalization_debug["date_interpretation"] = {
+        "provided_date_param": date,
+        "parsed_intent_date": intent.date,
+        "search_date": search_date,
+        "source": (intent.date_parse_trace or {}).get("source"),
+        "year_inferred": bool((intent.date_parse_trace or {}).get("year_inferred")),
+        "discard_reason": (intent.date_parse_trace or {}).get("discard_reason"),
+    }
+
     if not intent.return_date and intent.trip_duration_days:
         intent.return_date = (base_date + timedelta(days=intent.trip_duration_days)).strftime("%Y-%m-%d")
+        normalization_debug["date_interpretation"]["return_date_derived_from_duration"] = {
+            "trip_duration_days": intent.trip_duration_days,
+            "return_date": intent.return_date,
+        }
+
+    # Reject past dates truthfully; do not silently rewrite calendar intent.
+    today_date = datetime.now().date()
+    outbound_dt = None
+    try:
+        outbound_dt = datetime.strptime(search_date, "%Y-%m-%d").date()
+        if outbound_dt < today_date:
+            return {
+                "error": f"Travel date {search_date} is in the past. Please provide today or a future date.",
+                "failure_reason": "invalid_past_date",
+                "search_date": search_date,
+                "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+                "debug_info": {"phases": phases.copy(), "intent": intent.model_dump()},
+            }
+    except Exception:
+        pass
+
+    if intent.return_date:
+        try:
+            return_dt = datetime.strptime(intent.return_date, "%Y-%m-%d").date()
+            if return_dt < today_date:
+                return {
+                    "error": f"Return date {intent.return_date} is in the past. Please provide a future return date.",
+                    "failure_reason": "invalid_past_date",
+                    "search_date": search_date,
+                    "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+                    "debug_info": {"phases": phases.copy(), "intent": intent.model_dump()},
+                }
+            if outbound_dt and return_dt < outbound_dt:
+                return {
+                    "error": f"Return date {intent.return_date} must be on or after departure date {search_date}.",
+                    "failure_reason": "invalid_date_order",
+                    "search_date": search_date,
+                    "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+                    "debug_info": {"phases": phases.copy(), "intent": intent.model_dump()},
+                }
+            if outbound_dt:
+                # Keep duration telemetry aligned with the actual outbound→return delta.
+                intent.trip_duration_days = max((return_dt - outbound_dt).days, 0)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Handle stopover (multicity) – sequential legs, but note: this is for multi-segment, not true stopover
     # For true stopover, we should filter flights after search.
     # ------------------------------------------------------------------
     if intent.stopover_city:
-        via_iata = resolve_location(intent.stopover_city) if intent.stopover_city else None
+        via_iata = _resolve_city_to_iata(intent.stopover_city) if intent.stopover_city else None
         if via_iata and via_iata not in (intent.origin_iata, intent.destination_iata):
             # Fetch leg1
             leg1 = await _plan_trip_internal(
@@ -1945,14 +3517,18 @@ async def _plan_trip_internal(
                 )
 
                 # --- Enrich with stopover filter info ---
-                # Count how many itineraries actually have this stopover (simple: at least one leg has layover_airports containing via_iata)
-                matched_leg1 = 1 if via_iata in l1_flight.layover_airports else 0
-                matched_leg2 = 1 if via_iata in l2_flight.layover_airports else 0
-                matched_count = matched_leg1 + matched_leg2
+                # In explicit multi-city mode we intentionally split the route into
+                # two legs around `via_iata`, so this request is considered matched
+                # by construction (layover_airports is not the right signal here).
+                matched_leg1 = 1
+                matched_leg2 = 1
+                matched_count = 2
                 debug_info_stopover = {
                     "requested": intent.stopover_city,
                     "resolved_iata": via_iata,
-                    "matched_count": matched_count
+                    "matched_count": matched_count,
+                    "match_strategy": "multicity_leg_split",
+                    "match_reason": "explicit_multicity_leg_split",
                 }
                 logger.info("Stopover filter applied", extra=debug_info_stopover)
 
@@ -1974,7 +3550,7 @@ async def _plan_trip_internal(
 
                 # FIX: Use final destination weather (l2_weather) for the standard weather block,
                 # while the combined_trip_description already contains per-leg weather.
-                combined_llm = await generate_explanation(
+                combined_llm, combined_llm_degradation = await generate_explanation(
                     user_query=user_query,
                     intent=intent,
                     best_flight=l1_flight,
@@ -1987,6 +3563,11 @@ async def _plan_trip_internal(
                     price_analysis_str="",
                     price_prediction_str="",
                 )
+                if combined_llm_degradation:
+                    warnings.append(
+                        f"Detailed explanation degraded ({combined_llm_degradation.get('reason')}); "
+                        "structured itinerary data is complete."
+                    )
 
                 # Split the combined response on the "Leg 2" boundary so each leg gets its own slice.
                 split_match = re.search(r'\bLeg\s*2\b', combined_llm, re.IGNORECASE)
@@ -2098,6 +3679,8 @@ async def _plan_trip_internal(
                         "raw_response": l2_weather,
                     }
                 }
+                leg1 = leg1.model_copy(update={"stopover_filter": debug_info_stopover})
+                leg2 = leg2.model_copy(update={"stopover_filter": debug_info_stopover})
                 return MultiCityResult(legs=[leg1, leg2])
         # fallback: if via_iata not resolved or is same as origin/destination, treat as normal trip
 
@@ -2105,15 +3688,32 @@ async def _plan_trip_internal(
     # 2 & 3. Fetch ALL API data — flights and weather, with smart reuse and parallelism
     # ------------------------------------------------------------------
     start_apis = time.monotonic()
+    search_profile = _build_flight_search_profile(intent, normalization_debug)
+    normalization_debug["flight_search_profile"] = search_profile
+
+    async def _call_flight_tool_safe(**kwargs):
+        """
+        Forward deep_search/max_results when supported.
+        Older injected test doubles may not accept deep_search.
+        """
+        try:
+            return await flight_tool(**kwargs)
+        except TypeError as e:
+            if "deep_search" in str(e):
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("deep_search", None)
+                return await flight_tool(**fallback_kwargs)
+            raise
 
     # Outbound flight task
     flight_task = asyncio.create_task(
-        flight_tool(
+        _call_flight_tool_safe(
             departure=intent.origin_iata,
             arrival=intent.destination_iata,
             date=search_date,
-            max_results=10,
+            max_results=search_profile["max_results"],
             return_date=intent.return_date if intent.return_date else None,
+            deep_search=search_profile["deep_search"],
         )
     )
 
@@ -2125,7 +3725,13 @@ async def _plan_trip_internal(
         gather_results = await asyncio.gather(*gather_tasks, return_exceptions=True)
     except Exception as e:
         logger.error(f"Parallel data fetch failed: {e}")
-        return {"error": str(e), "search_date": search_date, "debug_info": {"phases": phases.copy()}}
+        return {
+            "error": str(e),
+            "failure_reason": _classify_tool_failure_reason(e),
+            "search_date": search_date,
+            "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+            "debug_info": {"phases": phases.copy()},
+        }
 
     result_iter = iter(gather_results)
     flight_result = next(result_iter)
@@ -2141,8 +3747,8 @@ async def _plan_trip_internal(
                 return_hits = []
                 outbound_hits = []
                 for f in raw_flights:
-                    # Some flight dicts have 'date' field; some might have 'search_date'
-                    flight_date = f.get('date') or f.get('search_date')
+                    # Some flight payloads are dicts while others are Flight/Pydantic objects.
+                    flight_date = _flight_value_safe(f, "date") or _flight_value_safe(f, "search_date")
                     if flight_date == intent.return_date:
                         return_hits.append(f)
                     elif flight_date == search_date:
@@ -2167,7 +3773,8 @@ async def _plan_trip_internal(
     # Outbound weather
     try:
         outbound_dt = datetime.strptime(search_date, "%Y-%m-%d").date()
-        if (outbound_dt - today).days <= WEATHER_FORECAST_MAX_DAYS:
+        outbound_delta_days = (outbound_dt - today).days
+        if 0 <= outbound_delta_days <= WEATHER_FORECAST_MAX_DAYS:
             dates_to_fetch.append(("outbound", intent.destination_iata, search_date))
     except Exception:
         # if date invalid, skip weather
@@ -2177,7 +3784,8 @@ async def _plan_trip_internal(
     if intent.return_date and not intent.stopover_city:
         try:
             return_dt = datetime.strptime(intent.return_date, "%Y-%m-%d").date()
-            if (return_dt - today).days <= WEATHER_FORECAST_MAX_DAYS:
+            return_delta_days = (return_dt - today).days
+            if 0 <= return_delta_days <= WEATHER_FORECAST_MAX_DAYS:
                 dates_to_fetch.append(("return", intent.origin_iata, intent.return_date))
         except Exception:
             pass
@@ -2260,15 +3868,72 @@ async def _plan_trip_internal(
         weather_present_ret = False
         weather_reason_ret = "forecast_horizon_exceeded"
 
+    def _align_weather_date(
+        payload: Any,
+        *,
+        requested_date: Optional[str],
+        present: bool,
+        reason: Optional[str],
+        leg: str,
+    ) -> Tuple[Any, bool, Optional[str]]:
+        if not requested_date or payload is None or isinstance(payload, Exception):
+            return payload, present, reason
+
+        if isinstance(payload, dict):
+            weather_payload = dict(payload)
+        elif hasattr(payload, "model_dump"):
+            weather_payload = payload.model_dump()
+        elif hasattr(payload, "__dict__"):
+            weather_payload = dict(vars(payload))
+        else:
+            return payload, present, reason
+
+        forecast_date = weather_payload.get("forecast_date")
+        if forecast_date and str(forecast_date) != requested_date:
+            logger.info(
+                "Weather forecast date mismatch for %s leg; using unavailable placeholder",
+                leg,
+                extra={
+                    "requested_date": requested_date,
+                    "provider_forecast_date": str(forecast_date),
+                },
+            )
+            return (
+                {
+                    "condition": "Forecast unavailable for requested travel date",
+                    "temperature_c": "N/A",
+                    "forecast_date": requested_date,
+                    "requested_date": requested_date,
+                    "provider_forecast_date": str(forecast_date),
+                    "forecast_exact_match": False,
+                },
+                False,
+                "forecast_date_mismatch",
+            )
+
+        if requested_date:
+            weather_payload["forecast_exact_match"] = bool(forecast_date and str(forecast_date) == requested_date)
+        return weather_payload, present, reason
+
+    if intent.return_date and not intent.stopover_city:
+        weather_ret, weather_present_ret, weather_reason_ret = _align_weather_date(
+            weather_ret,
+            requested_date=intent.return_date,
+            present=weather_present_ret,
+            reason=weather_reason_ret,
+            leg="return",
+        )
+
     # If we still don't have return_flight_result and we need it, fetch it now sequentially
     if intent.return_date and not intent.stopover_city and return_flight_result is None:
         logger.info("Performing separate return flight search")
         try:
-            return_flight_result = await flight_tool(
+            return_flight_result = await _call_flight_tool_safe(
                 departure=intent.destination_iata,
                 arrival=intent.origin_iata,
                 date=return_date_str,
-                max_results=10,
+                max_results=search_profile["max_results"],
+                deep_search=search_profile["deep_search"],
             )
         except Exception as e:
             logger.warning(f"Return flight search failed: {e}")
@@ -2279,20 +3944,51 @@ async def _plan_trip_internal(
     # --- Process flight_result and extract outbound flights and price_insights ---
     if isinstance(flight_result, Exception):
         logger.error(f"Flight search failed: {flight_result}")
-        return {"error": str(flight_result), "search_date": search_date, "debug_info": {"phases": phases.copy()}}
+        failure_reason = _classify_tool_failure_reason(flight_result)
+        return {
+            "error": str(flight_result),
+            "failure_reason": failure_reason,
+            "search_date": search_date,
+            "flight_counts": {"pre_filter": 0, "post_filter": 0, "filtered_out": 0},
+            "debug_info": {"phases": phases.copy()},
+        }
     if isinstance(flight_result, tuple):
-        all_flights, price_insights_raw = flight_result
+        all_flights, price_payload = flight_result
+        if isinstance(price_payload, dict) and "_search_meta" in price_payload:
+            tool_search_meta = dict(price_payload.get("_search_meta") or {})
+            price_insights_raw = price_payload.get("price_insights")
+        else:
+            price_insights_raw = price_payload
     else:
         all_flights = flight_result
         price_insights_raw = None
     if not all_flights:
-        return {"warning": "No live flights found.", "fallback": True, "search_date": search_date, "weather": {}, "debug_info": {"phases": phases.copy()}}
+        raw_candidate_count = int(tool_search_meta.get("raw_candidate_count") or 0)
+        no_flights_reason = "filtered_out" if raw_candidate_count > 0 else "no_inventory"
+        return {
+            "warning": "No live flights found.",
+            "fallback": True,
+            "failure_reason": "no_flights",
+            "no_flights_reason": no_flights_reason,
+            "search_date": search_date,
+            "weather": {},
+            "flight_counts": {
+                "pre_filter": 0,
+                "post_filter": 0,
+                "filtered_out": raw_candidate_count,
+                "raw_provider": raw_candidate_count,
+            },
+            "debug_info": {
+                "phases": phases.copy(),
+                "tool_search_meta": tool_search_meta,
+            },
+        }
 
     # If we extracted return flights earlier, we need to separate them from all_flights.
     if return_flight_result and isinstance(return_flight_result, list) and not isinstance(return_flight_result, Exception):
         # Remove any flights in all_flights that have return date
         original_len = len(all_flights)
-        all_flights = [f for f in all_flights if f.get('date') != intent.return_date]
+        all_flights = [f for f in all_flights if _flight_value_safe(f, "date") != intent.return_date]
         if len(all_flights) != original_len:
             logger.info(f"Removed {original_len - len(all_flights)} return-leg flights from outbound list")
 
@@ -2306,6 +4002,7 @@ async def _plan_trip_internal(
 
     # At this point, all_flights is a list of raw flight dicts; normalize them
     all_flights = normalize_flights(all_flights, search_date)
+    pre_filter_count = len(all_flights)
 
     # ------------------------------------------------------------------
     # 4. Apply filters and rank (with fallback) – update effective intent
@@ -2327,29 +4024,46 @@ async def _plan_trip_internal(
     # and enrich the prompt.
     stopover_matched_itins = []
     stopover_iata = None
+    stopover_filter_payload: Optional[Dict[str, Any]] = None
     if intent.stopover_city:
         stopover_text = intent.stopover_city
+        stopover_match_strategy = None
+        stopover_match_reason = None
         try:
-            stopover_iata = resolve_location(stopover_text)
+            stopover_iata = _resolve_city_to_iata(stopover_text)
         except Exception:
             stopover_iata = None
 
         # Filter flights by layover_airports
         if stopover_iata:
             stopover_matched_itins = [f for f in all_flights if stopover_iata in (f.layover_airports or [])]
+            stopover_match_strategy = "iata_layover_airports"
+            if stopover_matched_itins:
+                stopover_match_reason = "matched_resolved_stopover_iata"
+            else:
+                stopover_match_reason = "resolved_stopover_iata_not_present_in_layovers"
         else:
             # fallback to substring match in layover_info
             lower_v = stopover_text.lower()
             stopover_matched_itins = [f for f in all_flights if lower_v in (f.layover_info or "").lower()]
+            stopover_match_strategy = "layover_info_substring"
+            if stopover_matched_itins:
+                stopover_match_reason = "matched_stopover_text_in_layover_info"
+            else:
+                stopover_match_reason = "unresolved_stopover_city"
 
         # Update debug info
         debug_info_stopover = {
             "requested": stopover_text,
             "resolved_iata": stopover_iata,
-            "matched_count": len(stopover_matched_itins)
+            "matched_count": len(stopover_matched_itins),
+            "match_strategy": stopover_match_strategy,
+            "match_reason": stopover_match_reason,
         }
+        stopover_filter_payload = debug_info_stopover
         debug_info = debug_info or {}
         debug_info["stopover"] = debug_info_stopover
+        debug_info["stopover_filter"] = debug_info_stopover
         logger.info("Stopover filter applied", extra=debug_info_stopover)
 
         # If we have matches, we may want to prioritize them in ranking, but we'll handle in prompt enrichment
@@ -2478,38 +4192,282 @@ async def _plan_trip_internal(
 
     if not filtered:
         # Even all_flights was empty, but we already handled that earlier
-        return {"error": "Sorry, I couldn't find any flights matching your preferences."}
+        return {
+            "error": "Sorry, I couldn't find any flights matching your preferences.",
+            "failure_reason": "no_flights",
+            "no_flights_reason": "filtered_out",
+            "search_date": search_date,
+            "flight_counts": {
+                "pre_filter": pre_filter_count,
+                "post_filter": 0,
+                "filtered_out": max(pre_filter_count, 0),
+            },
+            "debug_info": {"phases": phases.copy(), "tool_search_meta": tool_search_meta},
+        }
 
     ranked = rank_flights(filtered, ranking_intent)
     best_flight = ranked[0]
     ranked_count = len(ranked)
+    post_filter_count = ranked_count
     phases['filter_rank'] = time.monotonic() - start
 
     # ------------------------------------------------------------------
-    # Resolve booking handoff URL for best flight (non-blocking; falls back gracefully)
+    # Resolve booking handoff per top-N ranked flights and keep best-flight summary.
     # ------------------------------------------------------------------
-    # Spawn booking task but don't block LLM indefinitely
-    booking_task = asyncio.create_task(
-        _build_booking_handoff_url_safe(
-            flight=best_flight.model_dump(),
+    booking_handoff_info: Dict[str, Any] = {
+        "source": "unavailable",
+        "reason": "not_attempted",
+        "status": "unavailable",
+    }
+    top_flights_payload: List[Dict[str, Any]] = []
+    booking_url: Optional[str] = None
+
+    top_ranked = ranked[:PER_FLIGHT_HANDOFF_LIMIT]
+    top_signal_max = max((_booking_handoff_candidate_signal(f) for f in top_ranked), default=0)
+    weak_route_confidence = bool((search_profile or {}).get("weak_route_confidence"))
+    round_trip_low_signal = bool(intent.return_date and top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD)
+    weak_signal_candidates = bool(
+        top_signal_max <= 0
+        or (top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD and (weak_route_confidence or bool(intent.return_date)))
+    )
+    probe_limit = PER_FLIGHT_HANDOFF_PROBE_LIMIT
+    if intent.return_date:
+        probe_limit += ROUND_TRIP_HANDOFF_PROBE_BONUS
+    if weak_signal_candidates:
+        probe_limit += WEAK_ROUTE_HANDOFF_PROBE_BONUS
+    if round_trip_low_signal:
+        # Small extra probe on weak round-trip signal to avoid early fallback lock-in.
+        probe_limit += 1
+    probe_limit = max(len(top_ranked), min(PER_FLIGHT_HANDOFF_PROBE_MAX, probe_limit))
+    scan_limit = min(len(ranked), max(probe_limit, PER_FLIGHT_HANDOFF_SCAN_LIMIT))
+    if round_trip_low_signal:
+        scan_limit = min(len(ranked), scan_limit + WEAK_ROUTE_ROUND_TRIP_SCAN_BONUS)
+
+    probe_entries: List[Tuple[int, Any, int]] = [
+        (idx, ranked[idx], _booking_handoff_candidate_signal(ranked[idx]))
+        for idx in range(len(top_ranked))
+    ]
+    if scan_limit > len(top_ranked):
+        extra_entries: List[Tuple[int, Any, int]] = [
+            (idx, ranked[idx], _booking_handoff_candidate_signal(ranked[idx]))
+            for idx in range(len(top_ranked), scan_limit)
+        ]
+        # Prefer artifact-rich candidates while keeping rank proximity as tiebreaker.
+        extra_entries.sort(key=lambda item: (item[2], -item[0]), reverse=True)
+        for entry in extra_entries:
+            if len(probe_entries) >= probe_limit:
+                break
+            probe_entries.append(entry)
+
+    probe_ranked = [entry[1] for entry in probe_entries]
+    per_flight_handoff_timeout = PER_FLIGHT_HANDOFF_TIMEOUT + (
+        ROUND_TRIP_HANDOFF_TIMEOUT_BONUS if intent.return_date else 0.0
+    )
+    booking_stage_started = time.monotonic()
+    if probe_ranked:
+        cache_snapshot = _booking_handoff_cache_snapshot()
+        logger.info(
+            "booking_handoff_stage_started",
+            extra={
+                "flight_candidates": len(top_ranked),
+                "probe_candidates": len(probe_ranked),
+                "probe_limit": probe_limit,
+                "scan_limit": scan_limit,
+                "top_signal_max": top_signal_max,
+                "weak_route_confidence": weak_route_confidence,
+                "weak_signal_candidates": weak_signal_candidates,
+                "is_round_trip": bool(intent.return_date),
+                "per_flight_timeout_sec": per_flight_handoff_timeout,
+                **cache_snapshot,
+            },
+        )
+        resolved_handoffs = await asyncio.gather(
+            *[
+                _resolve_flight_booking_handoff(
+                    flight_obj=flight,
+                    origin=intent.origin_iata,
+                    destination=intent.destination_iata,
+                    depart_date=search_date,
+                    return_date=intent.return_date,
+                    timeout_sec=per_flight_handoff_timeout,
+                    candidate_rank=ranked_idx + 1,
+                    probe_signal=signal,
+                    route_type="round_trip" if intent.return_date else "one_way",
+                    cache_mode_hint=cache_snapshot.get("cache_mode"),
+                )
+                for ranked_idx, flight, signal in probe_entries
+            ]
+        )
+
+        promotion_pool: List[Dict[str, Any]] = []
+        for idx, (resolved_flight, handoff_meta, resolved_url) in enumerate(resolved_handoffs):
+            rank = probe_entries[idx][0] + 1
+            promotion_pool.append(
+                {
+                    "rank": rank,
+                    "booking_handoff": handoff_meta,
+                    "handoff_url": resolved_url,
+                    "is_in_top_payload": idx < len(top_ranked),
+                }
+            )
+            if idx >= len(top_ranked):
+                continue
+            payload = (
+                resolved_flight.model_dump()
+                if hasattr(resolved_flight, "model_dump")
+                else dict(resolved_flight)
+            )
+            payload["booking_handoff"] = handoff_meta
+            payload["rank"] = rank
+            top_flights_payload.append(payload)
+
+            if idx == 0:
+                if hasattr(resolved_flight, "model_dump"):
+                    best_flight = resolved_flight
+                booking_handoff_info = handoff_meta
+                booking_url = resolved_url or payload.get("handoff_url")
+
+        # Promote best booking-quality exit to top-level handoff summary even if
+        # fare-ranked row 1 is a weaker fallback.
+        if promotion_pool:
+            scored: List[Tuple[int, int]] = []
+            for i, payload in enumerate(promotion_pool):
+                score = _booking_handoff_strength(payload.get("booking_handoff") or {})
+                scored.append((score, i))
+            best_handoff_idx = max(scored, key=lambda x: (x[0], -x[1]))[1]
+            promoted_payload = promotion_pool[best_handoff_idx]
+            promoted_meta = promoted_payload.get("booking_handoff") or {}
+            if isinstance(promoted_meta, dict):
+                booking_handoff_info = dict(promoted_meta)
+                selected_rank = promoted_payload.get("rank", best_handoff_idx + 1)
+                if selected_rank != 1:
+                    booking_handoff_info["selected_flight_rank"] = selected_rank
+                booking_url = promoted_payload.get("handoff_url") or booking_url
+
+            bucket_counts: Dict[str, int] = {}
+            for payload in promotion_pool:
+                bucket = _booking_handoff_bucket(payload.get("booking_handoff") or {})
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            has_booking_ready = any(
+                bool((payload.get("booking_handoff") or {}).get("is_booking_quality_exit"))
+                for payload in promotion_pool
+            )
+            cache_assisted_successes = sum(
+                1
+                for payload in promotion_pool
+                if str((payload.get("booking_handoff") or {}).get("reason") or "").endswith("_cache")
+            )
+            search_fallback_quality_counts: Dict[str, int] = {}
+            best_search_fallback_rank: Optional[int] = None
+            best_search_fallback_score = -1
+            probe_signals: List[int] = [entry[2] for entry in probe_entries]
+            positive_signal_candidates = sum(1 for sig in probe_signals if sig > 0)
+            artifact_signal_candidates = sum(
+                1 for sig in probe_signals if sig >= WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD
+            )
+            max_probe_signal = max(probe_signals, default=0)
+            for payload in promotion_pool:
+                meta = payload.get("booking_handoff") or {}
+                if not isinstance(meta, dict) or not meta.get("is_search_fallback"):
+                    continue
+                quality = str(meta.get("search_fallback_quality") or "generic")
+                search_fallback_quality_counts[quality] = search_fallback_quality_counts.get(quality, 0) + 1
+                score = _booking_handoff_strength(meta)
+                if score > best_search_fallback_score:
+                    best_search_fallback_score = score
+                    best_search_fallback_rank = int(payload.get("rank") or 1)
+            if isinstance(booking_handoff_info, dict) and booking_handoff_info.get("is_search_fallback"):
+                booking_handoff_info["search_fallback_pool"] = {
+                    "fallback_candidates": sum(search_fallback_quality_counts.values()),
+                    "quality_counts": search_fallback_quality_counts,
+                    "best_fallback_rank": best_search_fallback_rank or 1,
+                    "probed_candidates": len(probe_entries),
+                    "positive_signal_candidates": positive_signal_candidates,
+                    "artifact_signal_candidates": artifact_signal_candidates,
+                    "max_probe_signal": max_probe_signal,
+                    "signal_threshold": WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD,
+                }
+            logger.info(
+                "booking_handoff_stage_completed",
+                extra={
+                    "flight_candidates": len(top_ranked),
+                    "probe_candidates": len(probe_ranked),
+                    "probe_limit": probe_limit,
+                    "scan_limit": scan_limit,
+                    "top_signal_max": top_signal_max,
+                    "weak_route_confidence": weak_route_confidence,
+                    "weak_signal_candidates": weak_signal_candidates,
+                    "is_round_trip": bool(intent.return_date),
+                    "duration_ms": int((time.monotonic() - booking_stage_started) * 1000),
+                    "bucket_counts": bucket_counts,
+                    "has_booking_ready": has_booking_ready,
+                    "cache_assisted_successes": cache_assisted_successes,
+                    "search_fallback_quality_counts": search_fallback_quality_counts,
+                    "selected_primary_rank": booking_handoff_info.get("selected_flight_rank", 1),
+                    **cache_snapshot,
+                },
+            )
+
+        # Preserve ranked ordering while carrying handoff URLs for top-N flights.
+        if top_flights_payload:
+            updated_ranked = []
+            for idx, original in enumerate(ranked):
+                if idx < len(top_ranked):
+                    updated_ranked.append(resolved_handoffs[idx][0])
+                else:
+                    updated_ranked.append(original)
+            ranked = updated_ranked
+
+    if not top_flights_payload and hasattr(best_flight, "model_dump"):
+        # Defensive fallback: should be rare, but keep best-flight handoff summary intact.
+        resolved_best, booking_handoff_info, booking_url = await _resolve_flight_booking_handoff(
+            flight_obj=best_flight,
             origin=intent.origin_iata,
             destination=intent.destination_iata,
             depart_date=search_date,
             return_date=intent.return_date,
+            timeout_sec=PER_FLIGHT_HANDOFF_TIMEOUT,
+            candidate_rank=1,
+            probe_signal=_booking_handoff_candidate_signal(best_flight),
+            route_type="round_trip" if intent.return_date else "one_way",
+            cache_mode_hint=_booking_handoff_cache_snapshot().get("cache_mode"),
         )
-    )
-    try:
-        # Wait up to 0.8 seconds for booking URL; if it times out, continue with placeholder
-        booking_url = await asyncio.wait_for(booking_task, timeout=0.8)
-    except asyncio.TimeoutError:
-        logger.info("Booking handoff resolution timed out; continuing without handoff URL")
-        booking_url = None  # placeholder, will be updated later if needed
-    except Exception as _e:
-        logger.info("build_booking_handoff_url failed; continuing without handoff URL: %s", str(_e))
-        booking_url = None
+        if hasattr(resolved_best, "model_dump"):
+            best_flight = resolved_best
+            top_flights_payload = [
+                {
+                    **best_flight.model_dump(),
+                    "booking_handoff": booking_handoff_info,
+                    "rank": 1,
+                }
+            ]
+        else:
+            top_flights_payload = []
+            booking_url = None
+            booking_handoff_info = {
+                "source": "unavailable",
+                "reason": "booking_handoff_unresolved",
+                "status": "unavailable",
+            }
 
-    if booking_url:
-        best_flight = best_flight.model_copy(update={"handoff_url": booking_url})
+    aligned_handoff_meta, aligned_handoff_url, handoff_aligned = _align_top_level_booking_handoff_with_rows(
+        booking_handoff_info,
+        top_flights_payload,
+    )
+    if handoff_aligned:
+        previous_bucket = _booking_handoff_bucket(booking_handoff_info or {})
+        aligned_bucket = _booking_handoff_bucket(aligned_handoff_meta or {})
+        booking_handoff_info = aligned_handoff_meta
+        if aligned_handoff_url:
+            booking_url = aligned_handoff_url
+        logger.info(
+            "booking_handoff_top_level_aligned_with_per_flight_quality",
+            extra={
+                "previous_bucket": previous_bucket,
+                "aligned_bucket": aligned_bucket,
+                "selected_flight_rank": booking_handoff_info.get("selected_flight_rank", 1),
+            },
+        )
 
     # ------------------------------------------------------------------
     # 5. Build description for LLM using effective_intent
@@ -2629,18 +4587,39 @@ async def _plan_trip_internal(
     # Add API trace to debug_info (now defined)
     # ------------------------------------------------------------------
     debug_info = debug_info or {}
+    origin_route = _iata_city_label(intent.origin_iata)
+    destination_route = _iata_city_label(intent.destination_iata)
     debug_info.update({
         "phases": phases.copy(),
         "intent": intent.model_dump(),
         "effective_intent": effective_intent.model_dump(),
+        "requested_trip_mode": requested_trip_mode,
+        "route_labels": {
+            "origin_iata": origin_route["iata"],
+            "origin_city": origin_route["city"],
+            "origin_label": origin_route["label"],
+            "destination_iata": destination_route["iata"],
+            "destination_city": destination_route["city"],
+            "destination_label": destination_route["label"],
+        },
         "filters_applied": filters_applied,
         "trip_description": trip_description,
         "all_flights": [f.model_dump() for f in all_flights],
+        "top_flights": top_flights_payload,
+        "per_flight_handoff_limit": PER_FLIGHT_HANDOFF_LIMIT,
+        "flight_counts": {
+            "pre_filter": pre_filter_count,
+            "post_filter": post_filter_count,
+            "filtered_out": max(pre_filter_count - post_filter_count, 0),
+            "raw_provider": int(tool_search_meta.get("raw_candidate_count") or pre_filter_count),
+        },
+        "tool_search_meta": tool_search_meta,
         "filtered_count": filtered_count,
         "ranked_count": ranked_count,
         "price_insights_str": price_insights_str,
         "price_analysis_str": price_analysis_str,
         "price_prediction_str": price_prediction_str,
+        "booking_handoff": booking_handoff_info,
         "normalization": normalization_debug,
         "relaxation_attempts": relaxation_attempts,
         # NEW — full API traceability including raw responses
@@ -2747,9 +4726,11 @@ async def _plan_trip_internal(
     if skip_llm:
         # Provide a clean summary when LLM is skipped
         llm_text = f"Flight: {best_flight.airline} {best_flight.flight_no} ({best_flight.departure_time} - {best_flight.arrival_time}). Price: {best_flight.price_inr}. Weather: {weather_dict.get('condition')}, {weather_dict.get('temperature_c')}°C."
+        llm_degradation = None
+        llm_degradation_note = ""
     else:
         start = time.monotonic()
-        llm_text = await generate_explanation(
+        llm_text, llm_degradation = await generate_explanation(
             user_query=user_query,
             intent=intent,
             best_flight=best_flight,
@@ -2765,6 +4746,14 @@ async def _plan_trip_internal(
         )
         phases['llm_generation'] = time.monotonic() - start
         debug_info["phases"] = phases.copy()
+        llm_degradation_note = ""
+        if llm_degradation:
+            llm_degradation_note = _explanation_degradation_note(
+                llm_degradation.get("reason"),
+                llm_degradation.get("message"),
+            )
+            warnings.append(llm_degradation_note)
+            debug_info["degradation"] = llm_degradation
 
         # No second LLM call — the combined trip_description already covers both legs.
         # Split llm_text at the RETURN section to give return_trip its own slice.
@@ -2800,12 +4789,23 @@ async def _plan_trip_internal(
         best_flight=best_flight.model_dump(),
         weather=weather_dict,
         search_date=search_date,
-        fallback_note="",
+        fallback_note=llm_degradation_note if llm_degradation else "",
         debug_info=result_debug,
         warnings=warnings if warnings else None,
         return_trip=return_trip_result if isinstance(return_trip_result, PlanResult) else None,
         weather_present=weather_present_out,
         weather_reason=weather_reason_out,
+        flight_counts={
+            "pre_filter": pre_filter_count,
+            "post_filter": post_filter_count,
+            "filtered_out": max(pre_filter_count - post_filter_count, 0),
+            "raw_provider": int(tool_search_meta.get("raw_candidate_count") or pre_filter_count),
+        },
+        stopover_filter=stopover_filter_payload,
+        result_status="degraded" if llm_degradation else "success",
+        degradation=llm_degradation,
+        booking_handoff=booking_handoff_info,
+        top_flights=top_flights_payload,
     )
 
     # ------------------------------------------------------------------
@@ -2895,6 +4895,11 @@ async def plan_trip(
         - If stream=False: PlanResult, MultiCityResult, or error dict
         - If stream=True: AsyncGenerator[str, None]
     """
+    try:
+        llm_mode_hint, _ = await get_llm_mode_and_priority()
+    except Exception:
+        llm_mode_hint = "unknown"
+
     action = _detect_booking_or_tracking_action(user_query)
 
     async def _handle_action_intent() -> Dict[str, Any]:
@@ -3026,6 +5031,7 @@ async def plan_trip(
                 payload = await _handle_action_intent()
                 msg = payload.get("message") or payload.get("error") or "Action processed."
                 yield msg
+                metrics.record_stream_done_json("action")
                 yield "[DONE_JSON]" + json.dumps(payload)
             return action_stream()
         return await _handle_action_intent()
@@ -3047,6 +5053,74 @@ async def plan_trip(
 
     # --- Streaming branch ---
     async def stream_generator() -> AsyncGenerator[str, None]:
+        stream_provider = "unknown"
+        got_first_token = False
+        data_result: Optional[Union[PlanResult, MultiCityResult, Dict[str, Any]]] = None
+
+        def done_json_frame(payload: Dict[str, Any], status: str) -> str:
+            metrics.record_stream_done_json(status)
+            return "[DONE_JSON]" + json.dumps(payload)
+
+        def _fallback_llm_text_from_structured_result() -> str:
+            if isinstance(data_result, PlanResult):
+                return str(data_result.llm_response or "").strip()
+            return ""
+
+        def _degraded_done_payload(
+            *,
+            reason: str,
+            message: str,
+            provider: Optional[str] = None,
+            backend_status: Optional[Dict[str, Any]] = None,
+            partial_llm_response: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            degradation = _llm_degradation_payload(
+                reason=reason,
+                message=message,
+                provider=provider,
+                backend_status=backend_status,
+            )
+            if isinstance(data_result, PlanResult):
+                payload = data_result.model_dump()
+                degradation_note = _explanation_degradation_note(reason, message)
+                warnings = list(payload.get("warnings") or [])
+                warnings.append(degradation_note)
+                payload["warnings"] = warnings
+                payload["result_status"] = "degraded"
+                payload["degradation"] = degradation
+                payload["fallback_note"] = payload.get("fallback_note") or degradation_note
+                if partial_llm_response:
+                    payload["llm_response"] = partial_llm_response
+                return payload
+
+            if isinstance(data_result, MultiCityResult):
+                payload = data_result.model_dump()
+                degradation_note = _explanation_degradation_note(reason, message)
+                payload["result_status"] = "degraded"
+                payload["degradation"] = degradation
+                payload["fallback_note"] = payload.get("fallback_note") or degradation_note
+                for leg in payload.get("legs", []):
+                    leg_warnings = list(leg.get("warnings") or [])
+                    leg_warnings.append(degradation_note)
+                    leg["warnings"] = leg_warnings
+                    leg["result_status"] = "degraded"
+                    leg["degradation"] = degradation
+                    leg["fallback_note"] = leg.get("fallback_note") or degradation_note
+                return payload
+
+            return {
+                "error": message,
+                    "failure_reason": reason,
+                    "failure_domain": _failure_domain_from_reason(reason),
+                    "result_status": "error",
+                }
+
+        async def _emit_structured_fallback_chunk_if_available() -> None:
+            fallback_text = _fallback_llm_text_from_structured_result()
+            if fallback_text:
+                yield_text = fallback_text if fallback_text.endswith(" ") else f"{fallback_text} "
+                yield yield_text
+
         try:
             # Emit an immediate non-technical progress signal so clients can distinguish a healthy
             # stream from a stalled connection before LLM token generation begins.
@@ -3066,16 +5140,39 @@ async def plan_trip(
                 skip_llm=True
             )
 
-            # Handle error responses
-            if isinstance(data_result, dict) and "error" in data_result:
-                yield json.dumps({"error": data_result["error"]})
-                yield "[DONE_JSON]" + json.dumps({"error": data_result["error"]})
+            # Any dict payload at this stage is non-success for streaming.
+            # Stream consumers must receive explicit error semantics, never a soft success.
+            if isinstance(data_result, dict):
+                planner_error = str(
+                    data_result.get("error")
+                    or data_result.get("warning")
+                    or "Planner returned an incomplete response payload."
+                ).strip()
+                if not planner_error:
+                    planner_error = "Planner returned an incomplete response payload."
+                yield f"[ERROR] {planner_error}"
+                done_payload: Dict[str, Any] = {"error": planner_error}
+                for key in ("failure_reason", "no_flights_reason", "flight_counts", "search_date"):
+                    if key in data_result:
+                        done_payload[key] = data_result.get(key)
+                if "failure_reason" not in done_payload:
+                    done_payload["failure_reason"] = "planner_incomplete"
+                done_payload["failure_domain"] = _failure_domain_from_reason(done_payload.get("failure_reason"))
+                done_payload["result_status"] = "error"
+                yield done_json_frame(done_payload, status="error")
                 return
 
-            # 2. Check circuit breaker before calling LLM
-            if await check_llm_circuit():
-                yield "[ERROR] LLM temporarily unavailable"
-                yield "[DONE_JSON]" + json.dumps({"error": "LLM temporarily unavailable"})
+            if not isinstance(data_result, (PlanResult, MultiCityResult)):
+                yield "[ERROR] Planner returned an unsupported response type."
+                yield done_json_frame(
+                    {
+                        "error": "Planner returned an unsupported response type.",
+                        "failure_reason": "planner_incomplete",
+                        "failure_domain": _failure_domain_from_reason("planner_incomplete"),
+                        "result_status": "error",
+                    },
+                    status="error",
+                )
                 return
 
             # 3. Extract data needed for prompt
@@ -3087,7 +5184,25 @@ async def plan_trip(
                 # Ensure llm_response is None for all legs
                 for leg in final_json.get("legs", []):
                     leg["llm_response"] = None
-                yield "[DONE_JSON]" + json.dumps(final_json)
+                yield done_json_frame(final_json, status="success")
+                return
+
+            # 2. Check circuit breaker before calling LLM for single-leg explanation stream.
+            if await check_llm_circuit(llm_mode=llm_mode_hint, effective_mode=llm_mode_hint):
+                metrics.record_stream_failure("unknown")
+                metrics.record_stream_fallback("circuit_open", "unknown")
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": "Explanation generation degraded: LLM temporarily unavailable, returning structured flight and weather data."},
+                )
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason="upstream_unavailable",
+                        message="LLM circuit breaker is open; explanation stream skipped.",
+                        provider="router",
+                    ),
+                    status="degraded",
+                )
                 return
 
             # Single leg
@@ -3097,6 +5212,7 @@ async def plan_trip(
             warnings = data_result.warnings or []
             debug_info = data_result.debug_info or {}
             intent_dict = debug_info.get("intent", {})
+            route_labels = debug_info.get("route_labels", {}) if isinstance(debug_info, dict) else {}
             # Use effective_intent if available for filters description
             effective_intent_dict = debug_info.get("effective_intent", intent_dict)
             all_flights_dicts = debug_info.get("all_flights", [])
@@ -3112,7 +5228,14 @@ async def plan_trip(
                     "flights",
                     {
                         "all_flights": all_flights_dicts,
+                        "top_flights": data_result.top_flights or [],
                         "best_flight": data_result.best_flight,
+                        "origin_iata": intent_dict.get("origin_iata"),
+                        "destination_iata": intent_dict.get("destination_iata"),
+                        "origin_city": route_labels.get("origin_city"),
+                        "destination_city": route_labels.get("destination_city"),
+                        "origin_label": route_labels.get("origin_label"),
+                        "destination_label": route_labels.get("destination_label"),
                     },
                 )
 
@@ -3120,6 +5243,16 @@ async def plan_trip(
                 weather_payload: Dict[str, Any] = {}
                 for key, value in weather.items():
                     weather_payload[key] = value.value if hasattr(value, "value") else value
+                destination_iata = _sanitize_iata_code(str(intent_dict.get("destination_iata") or ""))
+                if destination_iata:
+                    if not weather_payload.get("location"):
+                        weather_payload["location"] = destination_iata
+                    if not weather_payload.get("location_city"):
+                        city = city_for_iata(destination_iata)
+                        if city:
+                            weather_payload["location_city"] = city
+                    if not weather_payload.get("location_label"):
+                        weather_payload["location_label"] = label_for_iata(destination_iata) or destination_iata
                 yield _sse_event("weather", {"weather": weather_payload})
 
             # Emit progressive reasoning steps from known structured data.
@@ -3165,12 +5298,23 @@ async def plan_trip(
                 )
 
             # Build prompt — kept in sync with generate_explanation (non-streaming path)
+            stream_max_flights_in_prompt = (
+                PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP
+                if intent_dict.get("return_date")
+                else PLANNER_LLM_MAX_FLIGHTS_ONE_WAY
+            )
+            stream_min_flights = 2 if intent_dict.get("return_date") else 3
+            stream_max_flights_in_prompt = max(stream_min_flights, stream_max_flights_in_prompt)
+            stream_flights_in_prompt = max(
+                1,
+                min(stream_max_flights_in_prompt, len(all_flights_dicts)),
+            )
             flights_str = "\n".join([
                 f"- {f['airline']} {f['flight_no']} on {f.get('date','N/A')} | "
                 f"{f['departure_time']} → {f['arrival_time']} | "
                 f"{f['duration_min']} min | {f['price_inr']} | "
                 f"Stops: {f.get('stops', 'N/A')} | Baggage: {f.get('baggage', 'N/A')}"
-                for f in all_flights_dicts[:10]
+                for f in all_flights_dicts[:stream_flights_in_prompt]
             ])
 
             # Format warnings if present, escalating "relaxed" warnings to mandatory instructions
@@ -3188,6 +5332,16 @@ async def plan_trip(
                 warnings_str = "\nSystem Notes/Warnings:\n- " + "\n- ".join(processed)
             else:
                 warnings_str = ""
+            warnings_for_prompt = _truncate_for_prompt(warnings_str, PLANNER_LLM_WARNINGS_MAX_CHARS)
+            trip_description_for_prompt = _truncate_for_prompt(
+                trip_description,
+                PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS,
+            )
+            stream_prompt_trimmed = (
+                stream_flights_in_prompt < min(10, len(all_flights_dicts))
+                or warnings_for_prompt != warnings_str
+                or trip_description_for_prompt != trip_description
+            )
 
             # Ensure weather values are plain
             weather_display = _normalized_weather_display(weather)
@@ -3319,11 +5473,11 @@ async def plan_trip(
 CRITICAL CONSTRAINT: The stops field for this flight is '{stops_display}'.
 {constraint_note}{layover_constraint}{temp_constraint}
 
-You are a helpful travel assistant helping a user plan {trip_description}.
+You are a helpful travel assistant helping a user plan {trip_description_for_prompt}.
 
 User preferences:
 - {filters_applied}
-{warnings_str}
+{warnings_for_prompt}
 
 Flight options from {intent_dict.get('origin_iata')} to {intent_dict.get('destination_iata')} around {intent_dict.get('date')}:
 {flights_str}
@@ -3349,60 +5503,199 @@ Please recommend the best flight, explain why it matches their preferences, ment
 """
 
             full_prompt = facts_block + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n" + prompt
+            full_prompt, stream_prompt_hard_trimmed = _apply_prompt_hard_limit(
+                full_prompt,
+                hard_limit=PLANNER_LLM_PROMPT_HARD_LIMIT,
+            )
+            if stream_prompt_hard_trimmed:
+                stream_prompt_trimmed = True
 
-            # ADD DEBUG LOGGING FOR STREAMING PROMPT
             logger.debug(
-                "Streaming LLM prompt (first 500 chars): %s",
-                full_prompt[:500].replace('\n', ' ')
+                "Streaming LLM prompt prepared",
+                extra={"prompt_chars": len(full_prompt)},
+            )
+            logger.info(
+                "Streaming LLM explanation request context",
+                extra={
+                    "llm_mode": llm_mode_hint if "llm_mode_hint" in locals() else "unknown",
+                    "prompt_chars": len(full_prompt),
+                    "prompt_trimmed": stream_prompt_trimmed,
+                    "prompt_hard_trimmed": stream_prompt_hard_trimmed,
+                    "flights_in_prompt": stream_flights_in_prompt,
+                    "flights_cap": stream_max_flights_in_prompt,
+                    "all_flights_count": len(all_flights_dicts),
+                    "warnings_count": len(warnings or []),
+                    "has_return_date": bool(intent_dict.get("return_date")),
+                    "has_weather_payload": bool(weather_display),
+                    "has_price_context": bool(
+                        (price_insights_str or "").strip()
+                        or (price_analysis_str or "").strip()
+                        or (price_prediction_str or "").strip()
+                    ),
+                    "trip_description_chars": len(trip_description_for_prompt or ""),
+                },
             )
 
-            # 4. Call LLM in streaming mode with handshake timeout + metrics
+            stream_init_timeout = _resolve_stream_init_timeout()
+            planner_llm_timeout = _resolve_planner_llm_timeout()
+            stream_total_timeout = _resolve_stream_total_timeout(planner_llm_timeout)
+            planner_model = _resolve_planner_llm_model()
+            router_timeout_hint = get_env_float("ROUTER_TIMEOUT", 90.0)
+            router_local_timeout_hint = _resolve_router_local_timeout_hint(planner_llm_timeout)
+            logger.info(
+                "LLM timeout ownership (stream)",
+                extra={
+                    "timeout_owner": "router_stream_first_chunk_timeout",
+                    "stream_init_timeout_hint_sec": stream_init_timeout,
+                    "stream_total_timeout_sec": stream_total_timeout,
+                    "planner_timeout_hint_sec": planner_llm_timeout,
+                    "router_local_timeout_sec": router_local_timeout_hint,
+                    "router_timeout_sec": router_timeout_hint,
+                },
+            )
+
+            # 4. Call LLM in streaming mode.
+            # Router owns first-token and per-chunk timeout boundaries.
             llm_start = time.monotonic()
             try:
-                token_stream = await asyncio.wait_for(
-                    generate(
-                        prompt=full_prompt,
-                        system=system,
-                        model=PLANNER_LLM_MODEL,
-                        stream=True
-                    ),
-                    timeout=STREAM_INIT_TIMEOUT
+                token_stream = await generate(
+                    prompt=full_prompt,
+                    system=system,
+                    model=planner_model,
+                    stream=True,
                 )
-            except asyncio.TimeoutError:
-                await record_llm_failure()
+            except (TimeoutError, asyncio.TimeoutError):
+                await record_llm_failure(
+                    stage="plan_trip_stream_init",
+                    reason="upstream_timeout",
+                    llm_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    effective_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    attempt_count=1,
+                    backend="ollama_or_router",
+                )
                 metrics.record_stream_failure("unknown")  # provider unknown at this point
-                yield "[ERROR] LLM stream initialization timed out"
-                yield "[DONE_JSON]" + json.dumps({"error": "LLM stream initialization timed out"})
+                metrics.record_stream_init_timeout("unknown")
+                metrics.record_stream_fallback("stream_init_timeout", "unknown")
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": "Explanation generation degraded: LLM stream initialization timed out, returning structured flight and weather data."},
+                )
+                async for chunk in _emit_structured_fallback_chunk_if_available():
+                    yield chunk
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason="upstream_timeout",
+                        message=f"LLM stream initialization timed out after {router_local_timeout_hint}s.",
+                        provider="router",
+                    ),
+                    status="degraded",
+                )
                 return
             except AllBackendsFailed as e:
-                await record_llm_failure()
+                status = e.as_dict()
+                failures = status.get("failures") or []
+                single_backend_scope = _is_single_backend_unavailable(e)
+                counter_reason = _primary_router_failure_reason(status)
+                timeout_like = counter_reason in {"timeout", "stream_timeout"}
+                await record_llm_failure(
+                    stage="plan_trip_stream_init",
+                    reason="upstream_timeout" if timeout_like else counter_reason,
+                    llm_mode=status.get("mode"),
+                    effective_mode=status.get("effective_mode"),
+                    attempt_count=max(1, len(failures)),
+                    backend=(
+                        str((failures[0] or {}).get("backend") or "")
+                        if failures and isinstance(failures[0], dict)
+                        else None
+                    ),
+                )
                 metrics.record_stream_failure("unknown")
-                logger.warning("LLM stream unavailable across backends", extra=e.as_dict())
-                yield "[ERROR] LLM temporarily unavailable"
-                done_payload = {"error": "LLM temporarily unavailable", **_backend_status_payload(e)}
-                yield "[DONE_JSON]" + json.dumps(done_payload)
+                metrics.record_stream_fallback("all_backends_failed", "unknown")
+                logger.warning(
+                    (
+                        "LLM stream initialization timed out for configured backend"
+                        if single_backend_scope and timeout_like
+                        else "LLM stream initialization timed out across backends"
+                        if timeout_like
+                        else "LLM stream unavailable for configured backend"
+                        if single_backend_scope
+                        else "LLM stream unavailable across backends"
+                    ),
+                    extra=status,
+                )
+                yield _sse_event(
+                    "reasoning_step",
+                    {
+                        "step": (
+                            "Explanation generation degraded: configured LLM backend stream initialization timed out, returning structured flight and weather data."
+                            if single_backend_scope and timeout_like
+                            else "Explanation generation degraded: LLM backend stream initialization timed out, returning structured flight and weather data."
+                            if timeout_like
+                            else "Explanation generation degraded: configured LLM backend unavailable, returning structured flight and weather data."
+                            if single_backend_scope
+                            else "Explanation generation degraded: LLM backends unavailable, returning structured flight and weather data."
+                        )
+                    },
+                )
+                async for chunk in _emit_structured_fallback_chunk_if_available():
+                    yield chunk
+                if timeout_like:
+                    stream_init_message = (
+                        f"Configured LLM backend stream initialization timed out after {router_local_timeout_hint}s."
+                        if single_backend_scope
+                        else f"LLM backend stream initialization timed out after {router_local_timeout_hint}s."
+                    )
+                else:
+                    stream_init_message = (
+                        "Configured LLM backend unavailable for streaming explanation."
+                        if single_backend_scope
+                        else "LLM backends unavailable for streaming explanation."
+                    )
+
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason="upstream_timeout" if timeout_like else "upstream_unavailable",
+                        message=stream_init_message,
+                        provider="router",
+                        backend_status=status,
+                    ),
+                    status="degraded",
+                )
                 return
 
             # Try to extract provider from token_stream (if available)
             provider = getattr(token_stream, "provider", "unknown")
+            stream_provider = provider
             metrics.record_stream_start(provider)
 
             got_first_token = False
             first_token_time = None
             full_response = ""
+            stream_activity_chunks = 0
+            thinking_heartbeat_chunks = 0
 
-            # 5. Consume stream with total timeout (PLANNER_LLM_TIMEOUT seconds)
+            # 5. Consume stream with optional total timeout.
             try:
-                async with asyncio.timeout(PLANNER_LLM_TIMEOUT):
+                async def _consume_stream() -> None:
+                    nonlocal got_first_token, first_token_time, full_response
+                    nonlocal stream_activity_chunks, thinking_heartbeat_chunks
                     # Handle async stream, sync iterable, or single string gracefully
                     if hasattr(token_stream, "__aiter__"):
                         async for token in token_stream:
                             if not isinstance(token, str):
                                 token = str(token)
+                            if token == "":
+                                # Heartbeat chunk (e.g., model thinking signal) – keep stream alive,
+                                # but don't count as first visible answer token.
+                                stream_activity_chunks += 1
+                                thinking_heartbeat_chunks += 1
+                                continue
+                            stream_activity_chunks += 1
                             if not got_first_token:
                                 first_token_time = time.monotonic() - llm_start
                                 try:
                                     metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
+                                    metrics.observe_llm_first_token(provider, first_token_time)
                                 except Exception:
                                     pass
                                 got_first_token = True
@@ -3412,10 +5705,16 @@ Please recommend the best flight, explain why it matches their preferences, ment
                         for token in token_stream:
                             if not isinstance(token, str):
                                 token = str(token)
+                            if token == "":
+                                stream_activity_chunks += 1
+                                thinking_heartbeat_chunks += 1
+                                continue
+                            stream_activity_chunks += 1
                             if not got_first_token:
                                 first_token_time = time.monotonic() - llm_start
                                 try:
                                     metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
+                                    metrics.observe_llm_first_token(provider, first_token_time)
                                 except Exception:
                                     pass
                                 got_first_token = True
@@ -3426,26 +5725,130 @@ Please recommend the best flight, explain why it matches their preferences, ment
                         token = token_stream
                         if not isinstance(token, str):
                             token = str(token)
+                        if token == "":
+                            stream_activity_chunks += 1
+                            thinking_heartbeat_chunks += 1
+                            return
+                        stream_activity_chunks += 1
                         if not got_first_token:
                             first_token_time = time.monotonic() - llm_start
                             try:
                                 metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
+                                metrics.observe_llm_first_token(provider, first_token_time)
                             except Exception:
                                 pass
                             got_first_token = True
                         yield token
                         full_response += token
-            except asyncio.TimeoutError:
-                await record_llm_failure()
+
+                if stream_total_timeout is not None:
+                    async with asyncio.timeout(stream_total_timeout):
+                        async for token in _consume_stream():
+                            yield token
+                else:
+                    async for token in _consume_stream():
+                        yield token
+            except asyncio.CancelledError:
+                metrics.record_stream_cancellation(provider, "planner_consume")
                 metrics.record_stream_failure(provider)
-                yield f"[ERROR] LLM streaming timed out after {PLANNER_LLM_TIMEOUT}s"
-                yield "[DONE_JSON]" + json.dumps({"error": f"LLM streaming timed out after {PLANNER_LLM_TIMEOUT}s"})
+                raise
+            except asyncio.TimeoutError as e:
+                await record_llm_failure(
+                    stage="plan_trip_stream_consume",
+                    reason="upstream_timeout",
+                    llm_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    effective_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    attempt_count=1,
+                    backend=provider,
+                )
+                metrics.record_stream_failure(provider)
+                metrics.record_stream_fallback("stream_timeout", provider)
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": "Explanation generation degraded: LLM stream timed out, returning structured flight and weather data."},
+                )
+                async for chunk in _emit_structured_fallback_chunk_if_available():
+                    yield chunk
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason="upstream_timeout",
+                        message=(
+                            str(e).strip()
+                            if str(e).strip()
+                            else (
+                                f"LLM streaming timed out after {stream_total_timeout}s."
+                                if stream_total_timeout is not None
+                                else f"LLM streaming timed out after {planner_llm_timeout}s."
+                            )
+                        ),
+                        provider=provider,
+                        partial_llm_response=(full_response or None),
+                    ),
+                    status="degraded",
+                )
+                return
+
+            saw_stream_activity = stream_activity_chunks > 0
+            if not (full_response or "").strip():
+                if saw_stream_activity:
+                    failure_reason = "stream_no_visible_tokens"
+                    degradation_reason = "upstream_stream_no_visible_tokens"
+                    degradation_message = (
+                        "LLM stream stayed alive but produced no visible answer text; deterministic summary preserved."
+                    )
+                else:
+                    failure_reason = "upstream_unavailable"
+                    degradation_reason = "upstream_unavailable"
+                    degradation_message = "LLM stream completed without visible response text; structured fallback preserved."
+                await record_llm_failure(
+                    stage="plan_trip_stream_empty_response",
+                    reason=failure_reason,
+                    llm_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    effective_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                    attempt_count=1,
+                    backend=provider,
+                )
+                metrics.record_stream_failure(provider)
+                metrics.record_stream_fallback(
+                    "stream_no_visible_tokens" if saw_stream_activity else "empty_stream_response",
+                    provider,
+                )
+                logger.info(
+                    "LLM stream completed without visible answer tokens",
+                    extra={
+                        "provider": provider,
+                        "stream_activity_chunks": stream_activity_chunks,
+                        "thinking_heartbeat_chunks": thinking_heartbeat_chunks,
+                        "first_visible_token_seen": got_first_token,
+                    },
+                )
+                yield _sse_event(
+                    "reasoning_step",
+                    {
+                        "step": (
+                            "Explanation generation degraded: LLM stream stayed active but produced no visible answer text; returning structured flight and weather data."
+                            if saw_stream_activity
+                            else "Explanation generation degraded: LLM stream produced no visible answer text; returning structured flight and weather data."
+                        )
+                    },
+                )
+                async for chunk in _emit_structured_fallback_chunk_if_available():
+                    yield chunk
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason=degradation_reason,
+                        message=degradation_message,
+                        provider=provider,
+                    ),
+                    status="degraded",
+                )
                 return
 
             # 6. Success – record metrics, success, build final JSON, and log
             total_time = time.monotonic() - llm_start
             try:
                 metrics.LLM_LATENCY.labels(provider=provider).observe(total_time)
+                metrics.observe_llm_full_response(provider, stream=True, duration_sec=total_time)
             except Exception:
                 pass
             metrics.record_stream_success(provider, total_time)
@@ -3455,7 +5858,7 @@ Please recommend the best flight, explain why it matches their preferences, ment
             final_result["llm_response"] = full_response
             # Remove debug_info if you don't want to expose internal data to the client
             # final_result.pop("debug_info", None)
-            yield "[DONE_JSON]" + json.dumps(final_result)
+            yield done_json_frame(final_result, status="success")
 
             # 7. Log session asynchronously (non‑blocking) using stored filtered_count
             if DB_AVAILABLE:
@@ -3493,13 +5896,59 @@ Please recommend the best flight, explain why it matches their preferences, ment
                 except asyncio.TimeoutError:
                     logger.error("Database write timed out")
 
+        except asyncio.CancelledError:
+            metrics.record_stream_cancellation(stream_provider, "planner_generator")
+            raise
         except Exception as e:
-            await record_llm_failure()
+            err_text = str(e).lower()
+            counter_reason = (
+                "circuit_open"
+                if ("circuit breaker open" in err_text or "circuit breaker is open" in err_text)
+                else "upstream_timeout"
+                if "timeout" in err_text
+                else "upstream_unavailable"
+            )
+            await record_llm_failure(
+                stage="plan_trip_stream",
+                reason=counter_reason,
+                llm_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                effective_mode=llm_mode_hint if "llm_mode_hint" in locals() else None,
+                attempt_count=1,
+                backend=stream_provider,
+            )
+            metrics.record_stream_failure(stream_provider)
+            fallback_reason = "mid_stream_interruption" if got_first_token else "planner_exception"
+            metrics.record_stream_fallback(fallback_reason, stream_provider)
             logger.exception("Error in streaming plan_trip")
             safe_error = _safe_llm_error_message(e)
-            yield f"[ERROR] {safe_error}"
-            done_payload = {"error": safe_error, **_backend_status_payload(e)}
-            yield "[DONE_JSON]" + json.dumps(done_payload)
+            if isinstance(data_result, (PlanResult, MultiCityResult)):
+                yield _sse_event(
+                    "reasoning_step",
+                    {"step": "Explanation generation degraded due to an LLM/backend interruption; structured flight and weather data are still available."},
+                )
+                async for chunk in _emit_structured_fallback_chunk_if_available():
+                    yield chunk
+                reason = "upstream_timeout" if "timeout" in safe_error.lower() else "upstream_unavailable"
+                backend_status = e.as_dict() if isinstance(e, AllBackendsFailed) else None
+                yield done_json_frame(
+                    _degraded_done_payload(
+                        reason=reason,
+                        message=safe_error,
+                        provider=stream_provider,
+                        backend_status=backend_status,
+                    ),
+                    status="degraded",
+                )
+            else:
+                yield f"[ERROR] {safe_error}"
+                done_payload = {
+                    "error": safe_error,
+                    "failure_reason": "upstream_unavailable",
+                    "failure_domain": _failure_domain_from_reason("upstream_unavailable"),
+                    "result_status": "error",
+                    **_backend_status_payload(e),
+                }
+                yield done_json_frame(done_payload, status="error")
 
     return stream_generator()
 
@@ -3545,6 +5994,13 @@ def normalize_airport(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
 
+    tok = text.strip()
+    # Fast path for explicit 3-letter tokens (case-insensitive).
+    if len(tok) == 3 and tok.isalpha():
+        up = tok.upper()
+        if is_iata_token(up):
+            return up
+
     # First try the central resolver which already supports phrases/tokens/n-grams
     try:
         iata = resolve_location(text)
@@ -3553,10 +6009,5 @@ def normalize_airport(text: Optional[str]) -> Optional[str]:
 
     if iata:
         return iata
-
-    # Fallback: if user passed a 3-letter token (e.g., "DEL" or "del"), accept it
-    tok = text.strip()
-    if len(tok) == 3 and tok.isalpha():
-        return tok.upper()
 
     return None

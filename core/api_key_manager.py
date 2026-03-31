@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # File path (override with env if you want)
 STATE_FILE = Path(get_env_str("KEY_STATE_FILE", "data/api_key_state.json"))
-RELOAD_INTERVAL_SECONDS = get_env_int("API_KEY_RELOAD_INTERVAL", 86400)  # 24h (for full env reload)
+STATE_LOCKFILE_PATH = get_env_str("KEY_STATE_LOCKFILE", "/tmp/llm_key_state.lock")
 # How often to refresh environment variables in the background
 REFRESH_INTERVAL = get_env_int("KEY_REFRESH_INTERVAL", 30)  # seconds
 # Lockfile path for multi‑process safety (override via env)
@@ -34,6 +34,7 @@ LOCKFILE_PATH = get_env_str("KEY_REFRESH_LOCKFILE", "/tmp/llm_key_refresh.lock")
 POLICIES = {
     "serpapi": "monthly",
     "openai": "credit",
+    "anthropic": "credit",
     "gemini": "daily",
     "weather": "daily"
 }
@@ -43,6 +44,7 @@ ENV_PATTERNS = {
     "serpapi": re.compile(r"SERPAPI_KEY_(\d+)"),
     "openai": re.compile(r"OPENAI_KEY_(\d+)"),
     "gemini": re.compile(r"GEMINI_KEY_(\d+)"),
+    "anthropic": re.compile(r"ANTHROPIC_KEY_(\d+)"),
     "weather": re.compile(r"WEATHER_KEY_(\d+)")
 }
 
@@ -124,6 +126,29 @@ def _try_acquire_lockfile(lockfile_path: str):
                 pass
         return None
 
+
+@contextlib.contextmanager
+def _exclusive_state_file_lock(lockfile_path: str):
+    """
+    Cross-process lock for state file read/write operations.
+    Keeps persistence updates serialized across workers.
+    """
+    fd = None
+    try:
+        fd = os.open(lockfile_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
 @dataclass
 class KeyEntry:
     """In-memory representation of a single API key."""
@@ -152,6 +177,7 @@ class APIKeyManager:
         self._callbacks: List[Callable[[], Awaitable[None]]] = []  # legacy change callbacks
         self._key_event_listeners: List[Callable[[str, dict], Any]] = []  # event listeners
         self._lockfile_fd: Optional[int] = None              # file descriptor for refresh lock
+        self._last_env_scan_meta: Dict[str, Any] = {}
 
         # ensure state directory exists
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -172,26 +198,36 @@ class APIKeyManager:
         if not STATE_FILE.exists():
             return {}
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with _exclusive_state_file_lock(STATE_LOCKFILE_PATH):
+                if not STATE_FILE.exists():
+                    return {}
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
         except Exception:
             logger.exception("Failed to read key state file; starting with empty state")
             return {}
 
     def _write_state_file(self, state: Dict[str, Any]):
         """Atomically write state (fingerprint -> exhausted_until) to disk, with secure perms."""
-        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp.{os.getpid()}")
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, sort_keys=True)
-            tmp.replace(STATE_FILE)
-            try:
-                STATE_FILE.chmod(0o600)
-            except Exception:
-                logger.debug("Could not set permission on key state file")
-            self._last_state_write = _now_ts()
+            with _exclusive_state_file_lock(STATE_LOCKFILE_PATH):
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2, sort_keys=True)
+                tmp.replace(STATE_FILE)
+                try:
+                    STATE_FILE.chmod(0o600)
+                except Exception:
+                    logger.debug("Could not set permission on key state file")
+                self._last_state_write = _now_ts()
         except Exception:
             logger.exception("Failed to write key state file")
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     async def _persist_exhaustion(self):
         """Snapshot current exhaustion and write to disk safely.
@@ -215,6 +251,11 @@ class APIKeyManager:
         persisted = self._load_state_file()
         # Parse environment
         env_keys = self._parse_env_keys()
+        if self._last_env_scan_meta:
+            logger.info(
+                "API key ingest snapshot",
+                extra=self._last_env_scan_meta,
+            )
         # Build initial _keys from env, using persisted exhaustion where fingerprint matches
         self._keys.clear()
         for service, key_list in env_keys.items():
@@ -232,28 +273,52 @@ class APIKeyManager:
 
     # ---------- environment parsing ----------
     def _parse_env_keys(self) -> Dict[str, List[str]]:
-        """Read .env file directly and return a dict service -> list of keys (in index order).
-           Uses dotenv_values to avoid polluting os.environ."""
-        # find_dotenv() returns the path to the .env file; if not found, it returns ''
-        env_path = find_dotenv()
-        if not env_path:
-            logger.debug("No .env file found, using empty environment")
-            env = {}
-        else:
-            env = dotenv_values(env_path)  # reads the file without modifying os.environ
+        """Read merged key config and return service -> key list (in index order).
+
+        Merge strategy:
+        1) .env file values (if present)
+        2) runtime os.environ overrides .env for matching names
+
+        This keeps key discovery consistent with runtime env injection while retaining
+        .env compatibility for local development.
+        """
+        # Use cwd-based lookup so we read the active deployment/project .env.
+        env_path = find_dotenv(usecwd=True)
+        file_env: Dict[str, Any] = {}
+        if env_path:
+            file_env = dotenv_values(env_path)  # reads file without mutating os.environ
+        runtime_env: Dict[str, str] = dict(os.environ)
+        merged_env: Dict[str, Any] = dict(file_env)
+        merged_env.update(runtime_env)  # runtime env wins
+
         services = {}
+        source_counts: Dict[str, Dict[str, int]] = {
+            service: {"runtime_env": 0, "dotenv": 0}
+            for service in ENV_PATTERNS.keys()
+        }
         for service, prog in ENV_PATTERNS.items():
             # collect keys with their numeric index
             indexed = []
-            for name, value in env.items():
-                m = prog.match(name)
+            for name, value in merged_env.items():
+                m = prog.fullmatch(name)
                 if m and value and value.strip():
                     idx = int(m.group(1))
                     indexed.append((idx, value.strip()))
+                    if name in runtime_env and runtime_env.get(name, "").strip():
+                        source_counts[service]["runtime_env"] += 1
+                    else:
+                        source_counts[service]["dotenv"] += 1
             # sort by index and store values in order
             if indexed:
                 indexed.sort(key=lambda x: x[0])
                 services[service] = [v for _, v in indexed]
+        self._last_env_scan_meta = {
+            "config_source": "merged_env",
+            "env_file_path": env_path or None,
+            "service_key_counts": {svc: len(vals) for svc, vals in services.items()},
+            "service_source_counts": source_counts,
+        }
+        logger.debug("Parsed keys from merged env config", extra=self._last_env_scan_meta)
         return services
 
     # ---------- legacy change notification ----------
@@ -372,7 +437,7 @@ class APIKeyManager:
                 self._lockfile_fd = None
 
     async def _refresh_loop(self):
-        """Periodically refresh keys from the .env file."""
+        """Periodically refresh keys from the merged runtime/.env environment."""
         try:
             while not self._stop_refresh.is_set():
                 try:
@@ -440,10 +505,9 @@ class APIKeyManager:
                 if service not in new_env:
                     self._rr_index.pop(service, None)
 
-            # Determine if any service's fingerprint set changed
-            old_fp_sets = {svc: set(m.values()) for svc, m in old_fingerprint_maps.items()}
-            new_fp_sets = {svc: set(m.values()) for svc, m in new_fingerprint_maps.items()}
-            changed = (old_fp_sets != new_fp_sets)
+            # Treat index shifts as real changes. We compare index->fingerprint maps
+            # directly (not only set equality) so listeners can evict stale idx caches.
+            changed = (old_fingerprint_maps != new_fingerprint_maps)
 
             # Compute affected (service, idx) pairs where fingerprint changed
             affected = []
@@ -471,9 +535,13 @@ class APIKeyManager:
 
         # Outside lock: write state file and notify if changed
         if changed:
-            if persist_state:
-                self._write_state_file(persist_state)
-            logger.info("Key set changed – triggering callbacks")
+            # Always write changed snapshots, including {}.
+            # This prevents stale on-disk exhaustion state from lingering after clears.
+            self._write_state_file(persist_state)
+            logger.info(
+                "Key set changed – triggering callbacks",
+                extra=(self._last_env_scan_meta or None),
+            )
             asyncio.create_task(self._notify_listeners("env_changed", {
                 "old_fingerprint_maps": old_fingerprint_maps,
                 "new_fingerprint_maps": new_fingerprint_maps,
@@ -654,6 +722,7 @@ class APIKeyManager:
     # ---------- clear exhaustion / pending clear ----------
     async def clear_exhausted(self, service: str, idx: int):
         """Manually re-enable a key by clearing its exhaustion flag (and any pending flag)."""
+        persist_state: Optional[Dict[str, Any]] = None
         async with self._lock:
             try:
                 ke = self._keys[service][idx]
@@ -666,10 +735,22 @@ class APIKeyManager:
                     ke._pending_exhaust_until = None
                     changed = True
                 if changed:
-                    await self._persist_exhaustion()
+                    # Snapshot while lock is held; write outside lock to avoid re-entry deadlock.
+                    persist_state = {}
+                    for svc, entries in self._keys.items():
+                        svc_state = {}
+                        for entry in entries:
+                            if entry.exhausted_until is not None:
+                                svc_state[entry.fingerprint] = {
+                                    "exhausted_until": entry.exhausted_until
+                                }
+                        if svc_state:
+                            persist_state[svc] = svc_state
                     logger.info("Key cleared from exhausted state", extra={"service": service, "index": idx})
             except (KeyError, IndexError):
                 pass
+        if persist_state is not None:
+            self._write_state_file(persist_state)
 
     async def mark_key_pending_clear(self, service: str, idx: int):
         """Mark a key for later cleanup (e.g., remove from rotation). When the key is no longer in use,
@@ -757,7 +838,7 @@ class APIKeyManager:
         return await self.status()
 
     async def refresh_from_env(self, sync: bool = False):
-        """Reload keys from .env. Used by health endpoints."""
+        """Reload keys from merged runtime/.env environment. Used by health endpoints."""
         await self._reload_env_keys_if_changed()
 
     async def record_usage(self, service: str, idx: int):

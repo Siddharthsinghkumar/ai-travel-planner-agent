@@ -1,6 +1,7 @@
 import pytest
 import asyncio
 
+import agents.llm_router as llm_router_module
 from agents.llm_router import AllBackendsFailed, LLMRouter
 from core.llm_mode import get_default_cloud_provider, llm_routing_context
 
@@ -55,6 +56,8 @@ async def test_router_ollama_only_never_calls_cloud():
     assert trace == ["ollama"]
     assert len(cloud.calls) == 0
     assert exc.value.mode == "ollama_only"
+    assert "request_id" in ollama.calls[0]
+    assert "timeout" in ollama.calls[0]
 
 
 @pytest.mark.asyncio
@@ -103,6 +106,57 @@ async def test_router_ollama_first_falls_back_to_cloud():
 
 
 @pytest.mark.asyncio
+async def test_router_non_stream_fallback_does_not_emit_stream_fallback_metric(monkeypatch):
+    trace = []
+    fallback_calls: list[tuple[str, str]] = []
+
+    def _capture_stream_fallback(reason: str, provider: str):
+        fallback_calls.append((reason, provider))
+
+    monkeypatch.setattr(llm_router_module.metrics, "record_stream_fallback", _capture_stream_fallback)
+
+    ollama = _FakeOllamaClient(should_fail=True, trace=trace)
+    cloud = _FakeCloudClient(should_fail=False, trace=trace)
+    router = LLMRouter(ollama, cloud)
+
+    with llm_routing_context(llm_mode="ollama_first", cloud_provider=get_default_cloud_provider()):
+        result = await router.generate(prompt="hello", stream=False)
+
+    assert result == "cloud-ok"
+    assert trace == ["ollama", "cloud"]
+    assert fallback_calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_route_usage_metric_uses_serving_backend_on_fallback(monkeypatch):
+    trace = []
+    captured: list[dict[str, str]] = []
+
+    def _capture_route_usage(*, mode: str, effective_mode: str, provider: str, stream: bool):
+        captured.append(
+            {
+                "mode": mode,
+                "effective_mode": effective_mode,
+                "provider": provider,
+                "stream": "true" if stream else "false",
+            }
+        )
+
+    monkeypatch.setattr(llm_router_module.metrics, "record_llm_route_usage", _capture_route_usage)
+
+    ollama = _FakeOllamaClient(should_fail=True, trace=trace)
+    cloud = _FakeCloudClient(should_fail=False, trace=trace)
+    router = LLMRouter(ollama, cloud)
+
+    with llm_routing_context(llm_mode="ollama_first", cloud_provider=get_default_cloud_provider()):
+        result = await router.generate(prompt="hello", stream=False)
+
+    assert result == "cloud-ok"
+    assert trace == ["ollama", "cloud"]
+    assert captured[-1]["provider"] == "cloud"
+
+
+@pytest.mark.asyncio
 async def test_router_cancellation_propagates_without_fallback():
     trace = []
 
@@ -148,22 +202,33 @@ def test_router_effective_mode_derivation():
     assert LLMRouter.derive_effective_mode("cloud_first", cloud_available=True, ollama_available=True) == "cloud_first"
 
 
+def test_router_local_timeout_derives_from_stream_init_hint(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("LOCAL_LLM_TIMEOUT", raising=False)
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "30")
+    monkeypatch.setenv("PLANNER_LLM_TIMEOUT", "45")
+    monkeypatch.setenv("PLANNER_STREAM_INIT_TIMEOUT", "70")
+
+    assert llm_router_module._resolve_local_timeout() == pytest.approx(70.0)
+
+
 @pytest.mark.asyncio
-async def test_router_cloud_only_degrades_to_ollama_when_cloud_unavailable():
+async def test_router_cloud_only_stays_strict_when_cloud_unavailable():
     trace = []
     ollama = _FakeOllamaClient(should_fail=False, trace=trace, available=True)
     cloud = _FakeCloudClient(should_fail=False, trace=trace, available=False)
     router = LLMRouter(ollama, cloud)
 
     with llm_routing_context(llm_mode="cloud_only", cloud_provider=get_default_cloud_provider()):
-        result = await router.generate(prompt="hello", stream=False)
+        with pytest.raises(AllBackendsFailed) as exc:
+            await router.generate(prompt="hello", stream=False)
 
-    assert result == "ollama-ok"
-    assert trace == ["ollama"]
+    assert trace == []
+    assert exc.value.mode == "cloud_only"
+    assert exc.value.effective_mode == "cloud_only"
 
 
 @pytest.mark.asyncio
-async def test_router_ollama_only_degrades_to_cloud_when_ollama_unavailable():
+async def test_router_ollama_only_attempts_local_when_probe_unavailable():
     trace = []
     ollama = _FakeOllamaClient(should_fail=False, trace=trace, available=False)
     cloud = _FakeCloudClient(should_fail=False, trace=trace, available=True)
@@ -172,5 +237,56 @@ async def test_router_ollama_only_degrades_to_cloud_when_ollama_unavailable():
     with llm_routing_context(llm_mode="ollama_only", cloud_provider=get_default_cloud_provider()):
         result = await router.generate(prompt="hello", stream=False)
 
+    assert result == "ollama-ok"
+    assert trace == ["ollama"]
+    assert len(cloud.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_ollama_first_skips_local_when_probe_unavailable():
+    trace = []
+    ollama = _FakeOllamaClient(should_fail=False, trace=trace, available=False)
+    cloud = _FakeCloudClient(should_fail=False, trace=trace, available=True)
+    router = LLMRouter(ollama, cloud)
+
+    with llm_routing_context(llm_mode="ollama_first", cloud_provider=get_default_cloud_provider()):
+        result = await router.generate(prompt="hello", stream=False)
+
     assert result == "cloud-ok"
     assert trace == ["cloud"]
+    assert len(ollama.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_classifies_generic_timeout_exception_without_unexpected_stage():
+    class _TimeoutOllama(_FakeOllamaClient):
+        async def generate(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            self.trace.append("ollama")
+            raise TimeoutError("transport timeout")
+
+    trace = []
+    ollama = _TimeoutOllama(trace=trace)
+    cloud = _FakeCloudClient(should_fail=False, trace=trace)
+    router = LLMRouter(ollama, cloud)
+
+    with llm_routing_context(llm_mode="ollama_only", cloud_provider=get_default_cloud_provider()):
+        with pytest.raises(AllBackendsFailed) as exc:
+            await router.generate(prompt="hello", stream=False)
+
+    details = exc.value.as_dict().get("failures") or []
+    assert details
+    assert details[0]["reason"] == "timeout"
+    assert details[0]["stage"] != "unexpected"
+
+
+def test_router_error_classification_client_contract():
+    reason = LLMRouter._classify_error(
+        TypeError("generate() got an unexpected keyword argument 'timeout'")
+    )
+    assert reason == "client_contract_error"
+
+
+def test_router_error_classification_stream_empty():
+    reason = LLMRouter._classify_error(RuntimeError("ollama stream ended before first chunk"))
+    assert reason == "stream_empty"

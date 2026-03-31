@@ -138,3 +138,47 @@ def test_cloud_admin_enablement_default_and_override(monkeypatch):
 
     monkeypatch.setenv("USE_CLOUD_LLM", "true")
     assert cloud_llm.is_cloud_admin_enabled() is True
+
+
+def test_init_provider_gemini_skips_legacy_helper_when_disabled(monkeypatch):
+    monkeypatch.setattr(cloud_llm, "ENABLE_GEMINI_HELPER", False)
+
+    def _unexpected_import(_name):
+        raise AssertionError("gemini helper import should not be attempted when disabled")
+
+    monkeypatch.setattr(cloud_llm.importlib, "import_module", _unexpected_import)
+    assert cloud_llm._init_provider("gemini") is None
+
+
+def test_resolve_provider_entries_falls_back_when_selected_provider_missing():
+    orig = list(cloud_llm.provider_chain)
+    try:
+        cloud_llm.provider_chain = [("openai", object(), (Exception,))]
+        entries = cloud_llm._resolve_provider_entries("gemini", allow_provider_fallback=True)
+        assert [name for name, _, _ in entries] == ["openai"]
+    finally:
+        cloud_llm.provider_chain = orig
+
+
+def test_resolve_provider_entries_raises_when_selected_provider_missing_and_fallback_disabled():
+    orig = list(cloud_llm.provider_chain)
+    try:
+        cloud_llm.provider_chain = [("openai", object(), (Exception,))]
+        with pytest.raises(cloud_llm.CloudLLMError, match="Selected cloud provider 'gemini' is not configured"):
+            cloud_llm._resolve_provider_entries("gemini", allow_provider_fallback=False)
+    finally:
+        cloud_llm.provider_chain = orig
+
+
+def test_provider_runtime_status_reports_gemini_uninitialized_reason(monkeypatch):
+    monkeypatch.setenv("CLOUD_PROVIDER_CHAIN", "gemini")
+    monkeypatch.setenv("ENABLE_GEMINI_HELPER", "0")
+
+    cloud_llm.refresh_provider_chain_from_env(force=True)
+    status = cloud_llm.get_provider_runtime_status()
+    gemini = (status.get("provider_init_status") or {}).get("gemini") or {}
+
+    assert status.get("configured_provider_source") == "CLOUD_PROVIDER_CHAIN"
+    assert gemini.get("configured") is True
+    assert gemini.get("initialized") is False
+    assert gemini.get("reason") == "gemini_helper_disabled"

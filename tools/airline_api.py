@@ -8,10 +8,11 @@ import time
 import asyncio
 import logging
 import re
+import hashlib
 import base64
 import json
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -25,39 +26,119 @@ from core.circuit_breaker import get_circuit_breaker
 from core.metrics import TOOL_REQUESTS, TOOL_LATENCY, AIRLINE_RETRIES, AIRLINE_ATTEMPTS
 from core.config import TESTING
 from core.api_key_manager import key_manager as api_key_manager
-from core.iata_resolver import resolve_location
+from core.env_config import get_env_bool, get_env_float, get_env_int
+from core.iata_resolver import city_for_iata, resolve_location
 
 load_dotenv()
 
-# ----------------------------------------------------------------------
-# City → Airport mapping for natural language expansion
-# ----------------------------------------------------------------------
-CITY_AIRPORTS = {
-    "delhi": ["DEL", "IGI"],
-    "mumbai": ["BOM"],
-    "pune": ["PNQ"],
-    "bangalore": ["BLR"],
-    "london": ["LHR", "LGW"],
-    "new york": ["JFK", "EWR", "LGA"],
-    # Add more as needed
+_GENERIC_LOCATION_TOKENS = {
+    "city",
+    "airport",
+    "airports",
+    "international",
+    "terminal",
 }
+
+
+def _key_fingerprint(key: str) -> str:
+    if not key:
+        return "none"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+
+
+def _tokens_for_match(text: str) -> set[str]:
+    return {
+        t
+        for t in re.findall(r"[a-z]{3,}", (text or "").lower())
+        if t not in _GENERIC_LOCATION_TOKENS
+    }
+
+
+def _resolution_matches_input(raw_text: str, resolved_iata: str) -> bool:
+    """
+    Guard against overly aggressive fuzzy matches for multi-word free-text input.
+    For phrases with 2+ significant tokens, require token overlap with the
+    resolved city's canonical name.
+    """
+    raw_tokens = _tokens_for_match(raw_text)
+    if len(raw_tokens) <= 1:
+        return True
+
+    resolved_city = city_for_iata(resolved_iata) or ""
+    city_tokens = _tokens_for_match(resolved_city)
+    if not city_tokens:
+        return False
+    return bool(raw_tokens & city_tokens)
+
 
 def expand_airports(city: str) -> str:
     """
-    Convert a city name (e.g., "delhi") into a comma‑separated list of IATA codes.
-    If the city is not in the mapping, return the uppercase original (assumed IATA).
+    Normalize a user-provided location token for SerpAPI.
+    Resolution order:
+      1) If it's a comma-separated list, normalize each token recursively.
+      2) Resolve via central iata_resolver.
+      3) Fallback to uppercase raw token when it already looks like an explicit code.
+      4) Return empty string for unresolved multi-word text (caller should fail clearly).
     """
-    city_lower = city.lower().strip()
-    airports = CITY_AIRPORTS.get(city_lower)
-    if airports:
-        return ",".join(airports)
-    return city.upper()
+    raw = (city or "").strip()
+    if not raw:
+        return ""
+
+    if "," in raw:
+        normalized_parts: List[str] = []
+        seen: set[str] = set()
+        for part in (p.strip() for p in raw.split(",")):
+            normalized = expand_airports(part)
+            if not normalized:
+                continue
+            for token in (t.strip() for t in normalized.split(",")):
+                if token and token not in seen:
+                    seen.add(token)
+                    normalized_parts.append(token)
+        return ",".join(normalized_parts)
+
+    resolved = resolve_location(raw)
+    if resolved and _resolution_matches_input(raw, resolved):
+        return resolved
+
+    upper = raw.upper()
+    if len(upper) == 3 and upper.isalpha():
+        return upper
+
+    # Unresolved long/free-form location should fail fast in caller.
+    return ""
 
 # ----------------------------------------------------------------------
 # Structured logging (configuration left to application)
 # ----------------------------------------------------------------------
 logger = logging.getLogger("airline_api")
 _TESTING_LOGGED = False
+SERPAPI_HTTP_TIMEOUT = get_env_float("SERPAPI_HTTP_TIMEOUT", 10.0)
+SERPAPI_MAX_RETRIES = max(1, get_env_int("SERPAPI_MAX_RETRIES", 3))
+SERPAPI_RETRY_BASE_DELAY = max(0.1, get_env_float("SERPAPI_RETRY_BASE_DELAY", 1.0))
+
+
+def _health_check_non_destructive_mode() -> bool:
+    """
+    Non-destructive health mode for validation runs.
+    When enabled, health checks must not mutate key exhaustion/quarantine state.
+    """
+    return bool(
+        get_env_bool("HEALTHCHECK_NON_DESTRUCTIVE", default=False)
+        or get_env_bool("VALIDATION_NON_DESTRUCTIVE_HEALTH", default=False)
+    )
+
+
+def _redact_request_params(params: dict) -> dict:
+    """Return a copy safe for logs by masking credential-like fields."""
+    redacted = {}
+    for key, value in (params or {}).items():
+        key_l = str(key).lower()
+        if key_l in {"api_key", "authorization", "x-api-key", "appid"}:
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
 
 # ----------------------------------------------------------------------
 # Custom exceptions
@@ -130,7 +211,8 @@ class Flight:
     departure_time: str          # True first-leg departure (HH:MM)
     arrival_time: str            # True last-leg arrival   (HH:MM)
     duration_min: int            # Total trip duration from root total_duration field
-    price_inr: int
+    price_inr: Union[int, str]
+    price_unavailable: bool = False
     stops: int = 0               # Number of stops = len(flights) - 1
     layover_info: str = ""       # Human-readable layover summary, e.g. "1h 30m at BOM"
     layover_airports: List[str] = field(default_factory=list)  # IATA codes of layover airports
@@ -138,6 +220,11 @@ class Flight:
     baggage: str = "Check airline"  # Extracted from SerpAPI extensions/amenities
     booking_token: Optional[str] = None   # SerpAPI booking_token for handoff
     shareable_link: Optional[str] = None  # SerpAPI shareable Google Flights link (fallback to booking_token)
+    provider_link: Optional[str] = None
+    partner_booking_link: Optional[str] = None
+    booking_url: Optional[str] = None
+    booking_request: Optional[Dict[str, Any]] = None
+    booking_options: Optional[List[dict]] = field(default_factory=list)
     carbon_emissions_g: Optional[int] = None  # CO2 in grams from carbon_emissions.this_flight
     legs: List[dict] = field(default_factory=list)  # Raw leg data from SerpAPI (each leg contains airline, flight_number, departure_airport, arrival_airport, etc.)
 
@@ -145,6 +232,32 @@ class Flight:
 # In‑memory bounded cache to reduce duplicate calls
 # ----------------------------------------------------------------------
 _flight_cache = TTLCache(maxsize=1000, ttl=3600)  # 1 hour TTL
+FLIGHT_CACHE_SCHEMA_VERSION = 2
+
+
+def _build_flight_cache_key(
+    departure_ids: str,
+    arrival_ids: str,
+    date: str,
+    return_date: Optional[str],
+    serpapi_type: str,
+    eco_mode: bool,
+    min_layover: Optional[int],
+    max_layover: Optional[int],
+    deep_search: bool,
+) -> Tuple[Any, ...]:
+    return (
+        FLIGHT_CACHE_SCHEMA_VERSION,
+        departure_ids,
+        arrival_ids,
+        date,
+        return_date,
+        serpapi_type,
+        eco_mode,
+        min_layover,
+        max_layover,
+        deep_search,
+    )
 
 # ----------------------------------------------------------------------
 # Per‑key rate limiting (async semaphores with delayed release)
@@ -358,6 +471,10 @@ async def search_flights(
     # --- Expand city names to comma-separated IATA codes ---
     departure_ids = expand_airports(departure)
     arrival_ids = expand_airports(arrival)
+    if not departure_ids:
+        raise AirlineAPIError(f"Could not resolve departure location '{departure}' to a valid airport code.")
+    if not arrival_ids:
+        raise AirlineAPIError(f"Could not resolve arrival location '{arrival}' to a valid airport code.")
 
     # Start latency measurement
     start = time.monotonic()
@@ -408,19 +525,19 @@ async def search_flights(
             base_params["json_restrictor"] = ",".join(fields)
 
         url = "https://serpapi.com/search"
-        MAX_RETRIES = 3
+        MAX_RETRIES = SERPAPI_MAX_RETRIES
 
         # Build cache key from all parameters that affect the result
-        cache_key = (
-            departure_ids,
-            arrival_ids,
-            date,
-            return_date,
-            serpapi_type,
-            eco_mode,
-            min_layover,
-            max_layover,
-            deep_search,
+        cache_key = _build_flight_cache_key(
+            departure_ids=departure_ids,
+            arrival_ids=arrival_ids,
+            date=date,
+            return_date=return_date,
+            serpapi_type=serpapi_type,
+            eco_mode=eco_mode,
+            min_layover=min_layover,
+            max_layover=max_layover,
+            deep_search=deep_search,
         )
 
         # Check cache
@@ -456,6 +573,7 @@ async def search_flights(
                     # Reserve a key for the duration of this attempt.
                     # reserve_key returns (index, key) as per design.
                     async with api_key_manager.reserve_key("serpapi") as (idx, key):
+                        key_fp = _key_fingerprint(key)
                         # For this key, try up to MAX_RETRIES times (network/5xx retries)
                         for attempt in range(MAX_RETRIES):
                             attempt_start = time.monotonic()
@@ -471,24 +589,36 @@ async def search_flights(
                                 # --- Log the outgoing request (with API key redacted) ---
                                 logger.debug("SerpAPI HTTP request", extra={
                                     "params": {k: v for k, v in params.items() if k != "api_key"},
+                                    "key_source": "api_key_manager.reserve_key:serpapi",
+                                    "key_idx": idx,
+                                    "key_fp": key_fp,
+                                    "client_mode": "shared_get_client",
                                 })
 
-                                response = await client.get(url, params=params)
+                                response = await client.get(
+                                    url,
+                                    params=params,
+                                    timeout=SERPAPI_HTTP_TIMEOUT,
+                                )
 
                                 # ----- Handle specific status codes BEFORE raise_for_status -----
                                 status = response.status_code
 
-                                # 1) Invalid key – mark permanently exhausted (30 days)
-                                if status == 401:
+                                # 1) Unauthorized/forbidden key – mark temporarily exhausted.
+                                # Treat 403 the same as 401 to avoid repeatedly selecting a denied key.
+                                if status in (401, 403):
                                     until = (datetime.now(timezone.utc) + timedelta(days=30)).timestamp()
                                     details = (response.text or "")[:1000]
                                     await api_key_manager.mark_exhausted(
                                         "serpapi",
                                         idx,
                                         until=until,
-                                        reason=f"unauthorized | {details}"
+                                        reason=f"unauthorized_http_{status} | {details}"
                                     )
-                                    logger.warning("Key 401 unauthorized, marked exhausted", extra={"key_idx": idx})
+                                    logger.warning(
+                                        "Key unauthorized, marked exhausted",
+                                        extra={"key_idx": idx, "status_code": status},
+                                    )
                                     break  # try next key
 
                                 # 2) Rate limit or payment required – attempt to get reset time
@@ -568,22 +698,32 @@ async def search_flights(
                                         "flight_count": len(best) + len(other),
                                     })
 
-                                    # --- RAW LOGGING (debug only) ---
                                     logger.debug(
-                                        "RAW AIRLINE API TRACE",
+                                        "AIRLINE API TRACE",
                                         extra={
                                             "request_url": url,
-                                            "request_params": params,
-                                            "response_payload": data
-                                        }
+                                            "request_params": _redact_request_params(params),
+                                            "response_keys": sorted(list(data.keys()))[:50] if isinstance(data, dict) else None,
+                                        },
                                     )
                                 except ValueError:
-                                    # Not JSON – maybe HTML error page; treat as failure for this key
-                                    logger.error("SerpAPI returned non‑JSON response", extra={
-                                        "status_code": status,
-                                        "text_preview": text[:200]
-                                    })
-                                    raise AirlineAPIError("Unexpected non‑JSON response from SerpAPI")
+                                    # Non-JSON can be transient upstream HTML/gateway responses.
+                                    logger.warning(
+                                        "SerpAPI returned non-JSON payload",
+                                        extra={
+                                            "status_code": status,
+                                            "attempt": attempt + 1,
+                                            "key_idx": idx,
+                                            "text_preview": text[:200],
+                                        },
+                                    )
+                                    AIRLINE_RETRIES.labels(reason="non_json").inc()
+                                    if attempt == MAX_RETRIES - 1:
+                                        break
+                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
+                                    logger.info("Retry scheduled", extra={"sleep_sec": sleep_time, "reason": "non_json"})
+                                    await asyncio.sleep(sleep_time)
+                                    continue
 
                                 # 5) Check for explicit error in JSON
                                 if "error" in data:
@@ -607,26 +747,44 @@ async def search_flights(
 
                                 # ----- Success path: parse flights -----
                                 # SerpAPI returns best_flights (curated) and other_flights (all others).
-                                # Merge both so we rank across the full candidate pool, not just one bucket.
+                                # For weaker/complex paths (round-trip/deep-search/high-breadth),
+                                # interleave buckets so early parsing is less biased toward one bucket.
                                 # Deduplicate on flight_number + departure_time to prevent double entries.
+                                best_bucket = data.get("best_flights") or []
+                                other_bucket = data.get("other_flights") or []
+                                interleave_complex_route = bool(return_date or deep_search or max_results > 10)
+                                merge_mode = "best_then_other"
+                                ordered_candidates: List[Dict[str, Any]] = []
+                                if interleave_complex_route:
+                                    merge_mode = "interleave_best_other"
+                                    max_bucket_len = max(len(best_bucket), len(other_bucket))
+                                    for i in range(max_bucket_len):
+                                        if i < len(best_bucket):
+                                            ordered_candidates.append(best_bucket[i])
+                                        if i < len(other_bucket):
+                                            ordered_candidates.append(other_bucket[i])
+                                else:
+                                    ordered_candidates.extend(best_bucket)
+                                    ordered_candidates.extend(other_bucket)
                                 _seen_keys: set = set()
                                 flights_combined: list = []
-                                for _bucket in (
-                                    data.get("best_flights") or [],
-                                    data.get("other_flights") or [],
-                                ):
-                                    for _item in _bucket:
-                                        _legs = _item.get("flights") or []
-                                        _key = (
-                                            _legs[0].get("flight_number", "") if _legs else "",
-                                            _legs[0].get("departure_airport", {}).get("time", "") if _legs else "",
-                                        )
-                                        if _key not in _seen_keys:
-                                            _seen_keys.add(_key)
-                                            flights_combined.append(_item)
+                                for _item in ordered_candidates:
+                                    _legs = _item.get("flights") or []
+                                    _key = (
+                                        _legs[0].get("flight_number", "") if _legs else "",
+                                        _legs[0].get("departure_airport", {}).get("time", "") if _legs else "",
+                                    )
+                                    if _key not in _seen_keys:
+                                        _seen_keys.add(_key)
+                                        flights_combined.append(_item)
                                 flights = flights_combined
                                 parsed_results = []
-                                for raw in flights[:max_results * 2]:  # fetch extra for possible layover filtering
+                                raw_candidate_count = len(flights)
+                                parse_window = max_results * (3 if return_date else 2)
+                                missing_price_count = 0
+                                non_numeric_price_count = 0
+                                kept_unavailable_price_count = 0
+                                for raw in flights[:parse_window]:  # fetch extra for possible layover filtering
                                     try:
                                         legs = raw.get("flights")
                                         if not legs or not isinstance(legs, list):
@@ -650,16 +808,31 @@ async def search_flights(
 
                                         # ---- Price ----
                                         price = raw.get("price")
+                                        price_unavailable = False
                                         if price is None:
-                                            logger.warning("Missing price in flight result", extra={
-                                                "flight": first_leg.get("flight_number"),
-                                            })
-                                            continue
+                                            missing_price_count += 1
+                                            price_unavailable = True
+                                            price_value: Union[int, str] = "Price unavailable"
+                                        else:
+                                            try:
+                                                price_int = int(price)
+                                                price_value = price_int
+                                            except (ValueError, TypeError):
+                                                non_numeric_price_count += 1
+                                                price_unavailable = True
+                                                price_value = "Price unavailable"
+
+                                        if price_unavailable:
+                                            kept_unavailable_price_count += 1
+
+                                        # Keep flights with unavailable price in candidate set.
+                                        # Ranking logic will treat these as high-cost/unknown instead of cheapest.
                                         try:
-                                            price_int = int(price)
+                                            if not price_unavailable:
+                                                price_value = int(price_value)
                                         except (ValueError, TypeError):
-                                            logger.warning("Price is not an integer", extra={"price": price})
-                                            continue
+                                            price_value = "Price unavailable"
+                                            price_unavailable = True
 
                                         # ---- True total duration (root field, not first-leg only) ----
                                         raw_duration = raw.get("total_duration") or first_leg.get("duration")
@@ -756,9 +929,18 @@ async def search_flights(
                                                 baggage_str = str(ext).strip()
                                                 break
 
-                                        # ---- Booking token + shareable link ----
+                                        # ---- Booking artifacts for handoff recovery ----
                                         booking_token = raw.get("booking_token") or None
                                         shareable_link = raw.get("shareable_link") or None
+                                        provider_link = raw.get("provider_link") or None
+                                        partner_booking_link = raw.get("partner_booking_link") or None
+                                        booking_url = raw.get("booking_url") or raw.get("url") or None
+                                        booking_request = raw.get("booking_request")
+                                        if not isinstance(booking_request, dict):
+                                            booking_request = None
+                                        booking_options = raw.get("booking_options")
+                                        if not isinstance(booking_options, list):
+                                            booking_options = []
 
                                         # ---- Carbon emissions (grams) ----
                                         carbon_data = raw.get("carbon_emissions") or {}
@@ -777,7 +959,8 @@ async def search_flights(
                                             departure_time=departure_time,
                                             arrival_time=arrival_time,
                                             duration_min=duration_min,
-                                            price_inr=price_int,
+                                            price_inr=price_value,
+                                            price_unavailable=price_unavailable,
                                             stops=stops,
                                             layover_info=layover_info,
                                             layover_airports=layover_airports,
@@ -785,6 +968,11 @@ async def search_flights(
                                             baggage=baggage_str,
                                             booking_token=booking_token,
                                             shareable_link=shareable_link,
+                                            provider_link=provider_link,
+                                            partner_booking_link=partner_booking_link,
+                                            booking_url=booking_url,
+                                            booking_request=booking_request,
+                                            booking_options=booking_options,
                                             carbon_emissions_g=carbon_g,
                                             # Store raw leg data for downstream use
                                             legs=legs,
@@ -800,6 +988,22 @@ async def search_flights(
                                         })
                                         continue
 
+                                if missing_price_count or non_numeric_price_count:
+                                    logger.info(
+                                        "Flights contained unusable pricing fields; retained with price_unavailable markers",
+                                        extra={
+                                            "raw_candidate_count": raw_candidate_count,
+                                            "parsed_candidate_count": len(parsed_results),
+                                            "merge_mode": merge_mode,
+                                            "parse_window": parse_window,
+                                            "missing_price_count": missing_price_count,
+                                            "non_numeric_price_count": non_numeric_price_count,
+                                            "kept_unavailable_price_count": kept_unavailable_price_count,
+                                            "route": f"{departure}->{arrival}",
+                                            "date": date,
+                                        },
+                                    )
+
                                 # ---- Apply layover filtering if requested ----
                                 if layover_city:
                                     layover_iata = resolve_location(layover_city)
@@ -814,12 +1018,28 @@ async def search_flights(
                                         logger.warning("Could not resolve layover city", extra={"city": layover_city})
 
                                 # ---- price_insights (route-level, one per response) ----
-                                price_insights_raw = data.get("price_insights") or None
+                                raw_price_insights = data.get("price_insights") or None
+                                price_insights_raw: Dict[str, Any] = {
+                                    "price_insights": raw_price_insights,
+                                    "_search_meta": {
+                                        "raw_candidate_count": raw_candidate_count,
+                                        "parsed_candidate_count": len(parsed_results),
+                                        "merge_mode": merge_mode,
+                                        "parse_window": parse_window,
+                                        "missing_price_count": missing_price_count,
+                                        "non_numeric_price_count": non_numeric_price_count,
+                                        "kept_unavailable_price_count": kept_unavailable_price_count,
+                                    },
+                                }
 
                                 latency = time.monotonic() - attempt_start
                                 logger.info("SerpAPI attempt succeeded", extra={
                                     "latency_sec": round(latency, 2),
                                     "attempt": attempt + 1,
+                                    "key_source": "api_key_manager.reserve_key:serpapi",
+                                    "key_idx": idx,
+                                    "key_fp": key_fp,
+                                    "client_mode": "shared_get_client",
                                 })
 
                                 # ---- After success, optionally check account usage ----
@@ -829,18 +1049,22 @@ async def search_flights(
                                 await api_key_manager.record_usage("serpapi", idx)
                                 return parsed_results, attempt + 1, price_insights_raw
 
-                            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
                                 latency = time.monotonic() - attempt_start
                                 logger.error("SerpAPI network error", extra={
                                     "error_type": type(e).__name__,
                                     "attempt": attempt + 1,
                                     "latency_sec": round(latency, 2),
+                                    "key_source": "api_key_manager.reserve_key:serpapi",
+                                    "key_idx": idx,
+                                    "key_fp": key_fp,
+                                    "client_mode": "shared_get_client",
                                 })
                                 AIRLINE_RETRIES.labels(reason="network").inc()
                                 if attempt == MAX_RETRIES - 1:
                                     # Exhausted retries for this key → try next key
                                     break
-                                sleep_time = 2 ** attempt
+                                sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
                                 logger.info("Retry scheduled", extra={"sleep_sec": sleep_time})
                                 await asyncio.sleep(sleep_time)
 
@@ -851,6 +1075,10 @@ async def search_flights(
                                     "status_code": status,
                                     "attempt": attempt + 1,
                                     "latency_sec": round(latency, 2),
+                                    "key_source": "api_key_manager.reserve_key:serpapi",
+                                    "key_idx": idx,
+                                    "key_fp": key_fp,
+                                    "client_mode": "shared_get_client",
                                 })
 
                                 # Already handled 401,429,402 above, but catch others
@@ -869,7 +1097,7 @@ async def search_flights(
                                     AIRLINE_RETRIES.labels(reason="http_5xx").inc()
                                     if attempt == MAX_RETRIES - 1:
                                         break
-                                    sleep_time = 2 ** attempt
+                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
                                     logger.info("Server error, retry scheduled", extra={"sleep_sec": sleep_time})
                                     await asyncio.sleep(sleep_time)
                                 else:
@@ -984,9 +1212,15 @@ async def health_check() -> str:
     """
     Performs a minimal test request to verify the airline API is functioning.
 
-    Uses a fixed route (DEL → BOM) for tomorrow's date. Returns "ok" if a successful
-    response is received and parsed; "fail" otherwise.
+    Uses a fixed route (DEL → BOM) for tomorrow's date.
+    Return buckets:
+      - ok: provider responded with valid data
+      - degraded: transient/recoverable upstream issue
+      - unavailable: no active SerpAPI key is currently usable
+      - fail: hard auth/configuration failure
     """
+    health_timeout = max(2.0, get_env_float("AIRLINE_HEALTH_TIMEOUT", 6.0))
+    non_destructive = _health_check_non_destructive_mode()
     # For health checks we use the key manager as well, but without rotation
     try:
         async with api_key_manager.reserve_key("serpapi") as (idx, key):
@@ -1011,25 +1245,128 @@ async def health_check() -> str:
                 "deep_search": "true",
                 "api_key": key,
             }
-            response = await client.get("https://serpapi.com/search", params=params)
+            response = await client.get(
+                "https://serpapi.com/search",
+                params=params,
+                timeout=health_timeout,
+            )
 
             # Handle 401 specially – log but do NOT auto-exhaust; let real requests handle it.
             if response.status_code == 401:
                 logger.error("Health check failed: invalid API key (401); not auto-exhausting here")
                 return "fail"
 
+            if response.status_code in (402, 429):
+                reset_timestamp = None
+                try:
+                    acct_resp = await client.get(
+                        "https://serpapi.com/account.json",
+                        params={"api_key": key},
+                    )
+                    if acct_resp.status_code == 200:
+                        acct_data = acct_resp.json()
+                        if acct_data.get("plan_searches_left") == 0:
+                            reset_at = _estimate_reset_from_account(acct_data)
+                            reset_timestamp = reset_at.timestamp() if reset_at else None
+                except Exception as e:
+                    logger.warning("Health account check failed during quota handling", extra={"error": str(e)})
+
+                until = reset_timestamp or (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
+                details = (response.text or "")[:400]
+                if non_destructive:
+                    logger.info(
+                        "Health check detected exhausted SerpAPI key but skipped quarantine (non-destructive mode)",
+                        extra={"key_idx": idx, "status_code": response.status_code},
+                    )
+                else:
+                    await api_key_manager.mark_exhausted(
+                        "serpapi",
+                        idx,
+                        until=until,
+                        reason=f"health_quota_http_{response.status_code} | {details}",
+                    )
+                    logger.warning(
+                        "Health check quarantined exhausted SerpAPI key",
+                        extra={"key_idx": idx, "status_code": response.status_code},
+                    )
+                return "degraded"
+
+            if 500 <= response.status_code < 600:
+                logger.warning(
+                    "Health check degraded by upstream server error",
+                    extra={"status_code": response.status_code},
+                )
+                return "degraded"
+
             response.raise_for_status()
             data = response.json()
 
             if "error" in data:
+                error_text = str(data.get("error") or "")
+                error_lower = error_text.lower()
+                quota_patterns = [
+                    r'exhaust(ed|ion)?',
+                    r'no more searches',
+                    r'quota (exceeded|limit|reached)',
+                    r'out of searches',
+                ]
+                if any(re.search(p, error_lower) for p in quota_patterns):
+                    until = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
+                    if non_destructive:
+                        logger.info(
+                            "Health check saw quota error payload but skipped key quarantine (non-destructive mode)",
+                            extra={"key_idx": idx},
+                        )
+                    else:
+                        await api_key_manager.mark_exhausted(
+                            "serpapi",
+                            idx,
+                            until=until,
+                            reason=f"health_quota_error | {error_text[:400]}",
+                        )
+                        logger.warning(
+                            "Health check quarantined SerpAPI key based on quota error payload",
+                            extra={"key_idx": idx},
+                        )
+                    return "degraded"
+                transient_patterns = [
+                    "temporarily unavailable",
+                    "timeout",
+                    "timed out",
+                    "internal error",
+                    "try again",
+                    "later",
+                ]
+                if any(tok in error_lower for tok in transient_patterns):
+                    logger.warning(
+                        "Health check degraded by transient provider error payload",
+                        extra={"error": error_text[:200]},
+                    )
+                    return "degraded"
                 logger.error("Health check failed: API returned error", extra={"error": data["error"]})
                 return "fail"
 
             logger.debug("Health check passed")
             return "ok"
     except RuntimeError:
-        logger.error("Health check failed: No SerpAPI keys available")
+        logger.warning("Health check unavailable: No SerpAPI keys available")
+        return "unavailable"
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
+        logger.warning(
+            "Health check degraded by transient network issue",
+            extra={"error": str(e), "error_type": type(e).__name__},
+        )
+        return "degraded"
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status is not None and status >= 500:
+            logger.warning("Health check degraded by HTTP 5xx", extra={"status_code": status})
+            return "degraded"
+        logger.error("Health check failed by HTTP error", extra={"status_code": status, "error": str(e)})
         return "fail"
     except Exception as e:
-        logger.error("Health check failed", extra={"error": str(e)})
-        return "fail"
+        logger.warning(
+            "Health check degraded by unexpected exception",
+            extra={"error": str(e), "error_type": type(e).__name__},
+        )
+        return "degraded"

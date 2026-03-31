@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:review-demo": "node scripts/build-review-demo.mjs",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "export:frozen-demo": "npm run build && node scripts/export-frozen-demo.mjs"
   },
   "dependencies": {
     "framer-motion": "^12.38.0",

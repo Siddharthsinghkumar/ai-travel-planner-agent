@@ -18,6 +18,7 @@ import asyncio
 import logging
 import importlib
 import hashlib
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional, Any, List, Tuple, Dict
 
@@ -27,13 +28,13 @@ from core.circuit_breaker import get_circuit_breaker, CircuitBreakerOpenError, i
 from core.request_context import get_request_id
 from core.api_key_manager import key_manager
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, parse_csv_env
+from core.llm_mode import get_cloud_provider_chain_resolution, get_llm_mode_default, LLM_MODE_OLLAMA_ONLY
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Environment configuration (no longer used directly for API keys)
-CLOUD_PROVIDER = (get_env_str("CLOUD_PROVIDER", "gemini") or "gemini").lower()
-CLOUD_PROVIDER_CHAIN = get_env_str("CLOUD_PROVIDER_CHAIN")
+# Environment configuration defaults (dynamic reads happen at runtime where required)
+ENABLE_GEMINI_HELPER = get_env_bool("ENABLE_GEMINI_HELPER", default=False)
 DEFAULT_MODEL = get_env_str("CLOUD_LLM_MODEL", "gpt-4o-mini")
 DEFAULT_TIMEOUT = get_env_float("CLOUD_LLM_TIMEOUT", 30.0)
 DEFAULT_TEMPERATURE = get_env_float("CLOUD_LLM_TEMPERATURE", 0.7)
@@ -47,6 +48,8 @@ STREAM_CHUNK_TIMEOUT = get_env_float("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", 5.0)
 PROVIDER_FAIL_COOLDOWN = get_env_int("PROVIDER_FAIL_COOLDOWN", 300)  # seconds
 _PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we skip health checks
 # --------------------------------------------------
+
+_provider_chain_lock = threading.Lock()
 
 # ---- Cloud enablement flag ----
 def is_cloud_admin_enabled() -> bool:
@@ -335,6 +338,8 @@ async def on_key_event(event: str, payload: dict):
             new_maps = payload.get("new_fingerprint_maps", {}) or {}
             old_maps = payload.get("old_fingerprint_maps", {}) or {}
             affected = payload.get("affected", [])
+            # Keep provider init/runtime capability aligned with current env config.
+            refresh_provider_chain_from_env(force=True)
             for provider, idx in affected:
                 # try to find the new fingerprint for this provider/idx (fall back to old)
                 expected_fp = None
@@ -662,33 +667,103 @@ class ProviderAdapter:
 # ----------------------------------------------------------------------
 # Build the provider chain
 # ----------------------------------------------------------------------
+_provider_chain_signature: Optional[Tuple[Tuple[str, ...], bool, str]] = None
+_configured_provider_order: List[str] = []
+_configured_provider_source: str = "default"
+_provider_init_status: Dict[str, Dict[str, Any]] = {}
+
+
+def _configured_provider_chain_from_env() -> List[str]:
+    resolution = get_cloud_provider_chain_resolution()
+    return [part.strip().lower() for part in resolution["providers"] if str(part).strip()]
+
+
+def _gemini_helper_enabled() -> bool:
+    # Runtime env is authoritative; keep module snapshot only as fallback default.
+    return get_env_bool("ENABLE_GEMINI_HELPER", default=ENABLE_GEMINI_HELPER)
+
+
+def _cloud_startup_routing_relevant() -> bool:
+    mode = str(get_llm_mode_default() or "").strip().lower()
+    return mode != LLM_MODE_OLLAMA_ONLY
+
+
+def _set_provider_init_status(provider: str, *, initialized: bool, reason: str) -> None:
+    _provider_init_status[provider] = {
+        "configured": True,
+        "initialized": bool(initialized),
+        "reason": reason,
+    }
+
+
+def _provider_runtime_capability_snapshot() -> Dict[str, Any]:
+    return {
+        "configured_providers": list(_configured_provider_order),
+        "configured_provider_source": _configured_provider_source,
+        "available_providers": [name for name, _, _ in provider_chain],
+        "provider_init_status": dict(_provider_init_status),
+        "default_provider": DEFAULT_PROVIDER,
+        "gemini_default_intent": (_configured_provider_order[0] if _configured_provider_order else None) == "gemini",
+    }
+
+
 def _parse_provider_chain() -> List[str]:
-    """Return list of provider names in order of fallback."""
-    if CLOUD_PROVIDER_CHAIN:
-        return [p.strip().lower() for p in CLOUD_PROVIDER_CHAIN.split(",") if p.strip()]
-    else:
-        return [CLOUD_PROVIDER]
+    """Return configured provider order (deduplicated, runtime env aware)."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for provider in _configured_provider_chain_from_env():
+        if provider and provider not in seen:
+            seen.add(provider)
+            out.append(provider)
+    return out
 
 
 def _init_provider(provider: str):
     """Initialise a single provider. Returns (adapter, retry_exceptions) or None if skipped."""
     if provider == "openai":
+        if AsyncOpenAI is None:
+            _set_provider_init_status(provider, initialized=False, reason="sdk_missing_openai")
+            if _cloud_startup_routing_relevant():
+                logger.warning("OpenAI package not installed - skipping provider.")
+            else:
+                logger.debug("OpenAI package not installed - skipping provider (non-routing mode).")
+            return None
         # No client created here; key_manager will provide keys at call time
+        _set_provider_init_status(provider, initialized=True, reason="ok")
         return ProviderAdapter(provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError, OpenAIAuthError)
 
     elif provider == "anthropic":
         # Skip if SDK not installed (but we already have lazy imports)
         if AsyncAnthropic is None:
-            logger.warning("Anthropic package not installed - skipping provider.")
+            _set_provider_init_status(provider, initialized=False, reason="sdk_missing_anthropic")
+            if _cloud_startup_routing_relevant():
+                logger.warning("Anthropic package not installed - skipping provider.")
+            else:
+                logger.debug("Anthropic package not installed - skipping provider (non-routing mode).")
             return None
+        _set_provider_init_status(provider, initialized=True, reason="ok")
         return ProviderAdapter(provider), (AnthroRateLimitError, AnthroConnErr, asyncio.TimeoutError, AnthroAuthError)
 
     elif provider == "gemini":
-        # Try to import the helper; if it fails, skip Gemini.
+        # Legacy Gemini helper path is opt-in only.
+        # This avoids noisy startup warnings when the historical helper module
+        # has already been removed from the deployment.
+        if not _gemini_helper_enabled():
+            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_disabled")
+            logger.debug("Gemini legacy helper disabled (ENABLE_GEMINI_HELPER=0) - skipping provider.")
+            return None
         try:
             gemini_mod = importlib.import_module("gemini_multikey_9_3_helper_script")
+        except ModuleNotFoundError:
+            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_module_missing")
+            logger.debug("Gemini legacy helper module not found - skipping provider.")
+            return None
         except Exception as e:
-            logger.warning("Gemini helper module not importable - skipping provider: %s", e)
+            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_import_failed")
+            if _cloud_startup_routing_relevant():
+                logger.warning("Gemini legacy helper import failed - skipping provider: %s", e)
+            else:
+                logger.debug("Gemini legacy helper import failed - skipping provider in non-routing mode: %s", e)
             return None
 
         # Look for a GeminiClient class, otherwise use module-level generate functions
@@ -707,41 +782,108 @@ def _init_provider(provider: str):
         adapter = ProviderAdapter(provider, gemini_module=gemini_mod, gemini_instance=gemini_instance)
         # Only retry on timeout for Gemini (or other exceptions if we detect)
         gemini_retry_exc = (asyncio.TimeoutError,)
+        _set_provider_init_status(provider, initialized=True, reason="ok")
         return adapter, gemini_retry_exc
 
     else:
-        logger.warning("Unsupported provider %s - skipping.", provider)
+        _set_provider_init_status(provider, initialized=False, reason="unsupported_provider")
+        if _cloud_startup_routing_relevant():
+            logger.warning("Unsupported provider %s - skipping.", provider)
+        else:
+            logger.debug("Unsupported provider %s - skipping in non-routing mode.", provider)
         return None
 
 
-# Build the chain of available providers
 provider_chain: List[Tuple[str, ProviderAdapter, Tuple]] = []
 _adapters = {}  # for closing later
+DEFAULT_PROVIDER = None
+_adapter = None
 
-for prov in _parse_provider_chain():
-    try:
-        res = _init_provider(prov)
-        if res is None:
-            logger.info("Provider %s intentionally skipped (missing config).", prov)
-            continue
-        adapter, retry_exc = res
-        provider_chain.append((prov, adapter, retry_exc))
-        _adapters[prov] = adapter
-        logger.info("Initialised cloud provider", extra={"provider": prov})
-    except Exception as e:
-        logger.warning("Skipping provider %s due to initialization error: %s", prov, e, exc_info=True)
-        continue
 
-if not provider_chain:
-    # Do NOT raise here — allow the application to start even if cloud providers
-    # are not available (e.g. because the app is intended to use Ollama or is in test).
-    logger.error("No cloud providers could be initialised. Check API keys and dependencies.")
-    DEFAULT_PROVIDER = None
-    _adapter = None
-else:
-    # Default to first provider in chain for single-provider operations
-    DEFAULT_PROVIDER = provider_chain[0][0]
-    _adapter = _adapters[DEFAULT_PROVIDER]   # for backward compatibility in health_check
+def refresh_provider_chain_from_env(*, force: bool = False) -> Dict[str, Any]:
+    """Refresh configured/initialised providers from current runtime env."""
+    global provider_chain, _adapters, DEFAULT_PROVIDER, _adapter
+    global _provider_chain_signature, _configured_provider_order, _configured_provider_source
+
+    provider_resolution = get_cloud_provider_chain_resolution()
+    configured = _parse_provider_chain()
+    configured_source = str(provider_resolution.get("source") or "unknown")
+    signature = (tuple(configured), _gemini_helper_enabled(), configured_source)
+    if not force and _provider_chain_signature == signature:
+        return _provider_runtime_capability_snapshot()
+
+    with _provider_chain_lock:
+        # Re-check inside lock to avoid duplicate rebuilds under concurrency.
+        if not force and _provider_chain_signature == signature:
+            return _provider_runtime_capability_snapshot()
+
+        _configured_provider_order = list(configured)
+        _configured_provider_source = configured_source
+        _provider_init_status.clear()
+
+        new_provider_chain: List[Tuple[str, ProviderAdapter, Tuple]] = []
+        new_adapters: Dict[str, ProviderAdapter] = {}
+
+        for prov in configured:
+            try:
+                res = _init_provider(prov)
+                if res is None:
+                    logger.debug("Provider %s intentionally skipped during refresh.", prov)
+                    continue
+                adapter, retry_exc = res
+                new_provider_chain.append((prov, adapter, retry_exc))
+                new_adapters[prov] = adapter
+                logger.info("Initialised cloud provider", extra={"provider": prov})
+            except Exception as e:
+                _set_provider_init_status(prov, initialized=False, reason="init_exception")
+                logger.warning("Skipping provider %s due to initialization error: %s", prov, e, exc_info=True)
+                continue
+
+        provider_chain = new_provider_chain
+        _adapters = new_adapters
+        DEFAULT_PROVIDER = provider_chain[0][0] if provider_chain else None
+        _adapter = _adapters.get(DEFAULT_PROVIDER) if DEFAULT_PROVIDER else None
+        _provider_chain_signature = signature
+
+        snapshot = _provider_runtime_capability_snapshot()
+        routing_relevant = _cloud_startup_routing_relevant()
+        if not provider_chain:
+            if is_cloud_admin_enabled():
+                if routing_relevant:
+                    logger.warning(
+                        "No cloud providers initialised from configured chain in this worker process; cloud routing unavailable.",
+                        extra=snapshot,
+                    )
+                else:
+                    logger.debug(
+                        "No cloud providers initialised in this worker process (non-routing in llm_mode=ollama_only).",
+                        extra=snapshot,
+                    )
+            else:
+                logger.debug(
+                    "Cloud providers not initialised in this worker process because cloud routing is disabled by configuration.",
+                    extra=snapshot,
+                )
+        else:
+            if routing_relevant:
+                logger.info(
+                    "Cloud provider runtime refresh complete",
+                    extra=snapshot,
+                )
+            else:
+                logger.debug(
+                    "Cloud provider runtime refresh complete (non-routing in llm_mode=ollama_only).",
+                    extra=snapshot,
+                )
+        return snapshot
+
+
+def get_provider_runtime_status() -> Dict[str, Any]:
+    refresh_provider_chain_from_env(force=False)
+    return _provider_runtime_capability_snapshot()
+
+# Initial refresh at import to preserve existing module-level behavior.
+refresh_provider_chain_from_env(force=True)
 
 
 class CloudLLMError(Exception):
@@ -773,6 +915,7 @@ def _resolve_provider_entries(
     selected_provider: Optional[str],
     allow_provider_fallback: bool,
 ) -> List[Tuple[str, "ProviderAdapter", Tuple]]:
+    refresh_provider_chain_from_env(force=False)
     entries = list(provider_chain)
     if not entries:
         return []
@@ -783,10 +926,17 @@ def _resolve_provider_entries(
     normalized = selected_provider.strip().lower()
     prioritized = [entry for entry in entries if entry[0] == normalized]
     if not prioritized:
-        available = ", ".join(name for name, _, _ in entries)
+        available = ", ".join(name for name, _, _ in entries) or "(none)"
+        if allow_provider_fallback:
+            logger.warning(
+                "Selected cloud provider '%s' is not initialised; falling back to available providers: %s",
+                selected_provider,
+                available,
+            )
+            return entries
         raise CloudLLMError(
             f"Selected cloud provider '{selected_provider}' is not configured. "
-            f"Available providers: {available or '(none)'}"
+            f"Available providers: {available}"
         )
 
     if not allow_provider_fallback:
@@ -797,6 +947,7 @@ def _resolve_provider_entries(
 
 
 def get_available_providers() -> List[str]:
+    refresh_provider_chain_from_env(force=False)
     return [name for name, _, _ in provider_chain]
 
 
@@ -836,6 +987,7 @@ def _is_key_entry_usable(entry: Any, now_ts: float) -> bool:
 
 
 async def get_provider_usability() -> Dict[str, bool]:
+    refresh_provider_chain_from_env(force=False)
     providers = get_available_providers()
     if not providers:
         return {}
@@ -887,10 +1039,11 @@ async def _check_circuit_breaker(provider: str):
 
 def _estimate_cost(usage) -> float | None:
     """Calculate estimated cost based on token usage."""
-    if COST_PER_1K_TOKENS <= 0 or not usage:
+    cost_per_1k = get_env_float("CLOUD_LLM_COST_PER_1K_TOKENS", COST_PER_1K_TOKENS)
+    if cost_per_1k <= 0 or not usage:
         return None
     total_tokens = getattr(usage, "total_tokens", 0)
-    return (total_tokens / 1000) * COST_PER_1K_TOKENS
+    return (total_tokens / 1000) * cost_per_1k
 
 
 async def _call_adapter_completion(
@@ -977,12 +1130,15 @@ async def generate(
     """
     if not is_cloud_admin_enabled():
         raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
+    refresh_provider_chain_from_env(force=False)
 
     # Handle defaults
-    primary_model = DEFAULT_MODEL if model is None else model
-    temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
-    timeout = DEFAULT_TIMEOUT if timeout is None else timeout
-    max_tokens = DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
+    primary_model = (get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL) if model is None else model
+    temperature = get_env_float("CLOUD_LLM_TEMPERATURE", DEFAULT_TEMPERATURE) if temperature is None else temperature
+    timeout = get_env_float("CLOUD_LLM_TIMEOUT", DEFAULT_TIMEOUT) if timeout is None else timeout
+    max_tokens = get_env_int("CLOUD_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS) if max_tokens is None else max_tokens
+    fallback_models = parse_csv_env("CLOUD_LLM_FALLBACK_MODELS", default=FALLBACK_MODELS)
+    max_cost_per_request = get_env_float("CLOUD_LLM_MAX_COST", MAX_COST_PER_REQUEST)
 
     messages = []
     if system:
@@ -1005,7 +1161,7 @@ async def generate(
             continue
 
         # Build list of models to try: primary + fallbacks
-        models_to_try = [primary_model] + FALLBACK_MODELS
+        models_to_try = [primary_model] + fallback_models
         for attempt_model in models_to_try:
             try:
                 response = await _call_adapter_completion(
@@ -1028,11 +1184,11 @@ async def generate(
                     raise CloudLLMError("Empty completion (content is None)")
 
                 # Cost guardrail
-                if MAX_COST_PER_REQUEST > 0:
+                if max_cost_per_request > 0:
                     usage = getattr(response, "usage", None)
                     cost = _estimate_cost(usage)
-                    if cost and cost > MAX_COST_PER_REQUEST:
-                        raise CloudLLMError(f"Cost exceeded: ${cost:.6f} > ${MAX_COST_PER_REQUEST:.6f}")
+                    if cost and cost > max_cost_per_request:
+                        raise CloudLLMError(f"Cost exceeded: ${cost:.6f} > ${max_cost_per_request:.6f}")
 
                 return content
 
@@ -1071,11 +1227,16 @@ async def generate_stream(
     """
     if not is_cloud_admin_enabled():
         raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
+    refresh_provider_chain_from_env(force=False)
 
-    primary_model = DEFAULT_MODEL if model is None else model
-    temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
-    timeout = DEFAULT_TIMEOUT if timeout is None else timeout
-    max_tokens = DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
+    primary_model = (get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL) if model is None else model
+    temperature = get_env_float("CLOUD_LLM_TEMPERATURE", DEFAULT_TEMPERATURE) if temperature is None else temperature
+    timeout = get_env_float("CLOUD_LLM_TIMEOUT", DEFAULT_TIMEOUT) if timeout is None else timeout
+    max_tokens = get_env_int("CLOUD_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS) if max_tokens is None else max_tokens
+    fallback_models = parse_csv_env("CLOUD_LLM_FALLBACK_MODELS", default=FALLBACK_MODELS)
+    stream_chunk_timeout = get_env_float("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", STREAM_CHUNK_TIMEOUT)
+    max_cost_per_request = get_env_float("CLOUD_LLM_MAX_COST", MAX_COST_PER_REQUEST)
+    cost_per_1k_tokens = get_env_float("CLOUD_LLM_COST_PER_1K_TOKENS", COST_PER_1K_TOKENS)
 
     messages = []
     if system:
@@ -1099,7 +1260,7 @@ async def generate_stream(
             last_exception = e
             continue
 
-        models_to_try = [primary_model] + FALLBACK_MODELS
+        models_to_try = [primary_model] + fallback_models
         tokens_emitted = False
 
         for attempt_model in models_to_try:
@@ -1126,7 +1287,7 @@ async def generate_stream(
                         retry_exceptions=retry_exc,
                     )
                     # Now consume stream with per‑chunk timeout
-                    async for chunk in _aiter_with_timeout(stream, STREAM_CHUNK_TIMEOUT):
+                    async for chunk in _aiter_with_timeout(stream, stream_chunk_timeout):
                         yield chunk
 
                 # Run the whole generator under breaker protection
@@ -1158,9 +1319,9 @@ async def generate_stream(
 
                     # Cost guardrail
                     estimated_tokens += max(1, len(delta) // 4)
-                    if MAX_COST_PER_REQUEST > 0 and COST_PER_1K_TOKENS > 0:
-                        estimated_cost = (estimated_tokens / 1000) * COST_PER_1K_TOKENS
-                        if estimated_cost > MAX_COST_PER_REQUEST:
+                    if max_cost_per_request > 0 and cost_per_1k_tokens > 0:
+                        estimated_cost = (estimated_tokens / 1000) * cost_per_1k_tokens
+                        if estimated_cost > max_cost_per_request:
                             raise CloudLLMError("Streaming cost exceeded")
 
                     if first_token:
@@ -1235,13 +1396,19 @@ async def health_check() -> str:
     if not is_cloud_admin_enabled():
         logger.info("Cloud LLM disabled via USE_CLOUD_LLM=0; skipping cloud health probe.")
         return "disabled"
+    refresh_provider_chain_from_env(force=False)
 
     usable_providers = await get_usable_providers()
     if not usable_providers:
-        logger.info("Cloud LLM enabled but no usable cloud providers available.")
+        logger.info(
+            "Cloud LLM enabled but no usable cloud providers available.",
+            extra=get_provider_runtime_status(),
+        )
         return "unavailable"
 
     now = time.time()
+    ping_model = get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
+    fail_cooldown = get_env_int("PROVIDER_FAIL_COOLDOWN", PROVIDER_FAIL_COOLDOWN)
 
     for prov_name, adapter, _ in provider_chain:
         if prov_name not in usable_providers:
@@ -1254,13 +1421,13 @@ async def health_check() -> str:
             continue
 
         try:
-            await adapter.ping(DEFAULT_MODEL)
+            await adapter.ping(ping_model)
             logger.info("Health check ok", extra={"provider": prov_name})
             return "ok"
         except Exception as e:
             msg = str(e).lower()
             if "ratelimit" in msg or "insufficient_quota" in msg or "429" in msg:
-                _PROVIDER_FAIL_COOLDOWNS[prov_name] = now + PROVIDER_FAIL_COOLDOWN
+                _PROVIDER_FAIL_COOLDOWNS[prov_name] = now + fail_cooldown
             continue
 
     return "fail"

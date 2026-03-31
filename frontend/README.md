@@ -1,4 +1,38 @@
-# React + TypeScript + Vite
+# Frontend (React + TypeScript + Vite)
+
+This file is template-oriented. For project-level run, validation, and operational notes, use the root README:
+
+- `../README.md`
+
+Quick local frontend run:
+
+```bash
+cd frontend
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+Frozen single-file demo export:
+
+```bash
+cd frontend
+npm run export:frozen-demo
+```
+
+This writes `dist/frozen-demo.html` with CSS/JS inlined so the background (including aurora canvas behavior) is preserved in a shareable single HTML file.
+
+Backend-free review artifact (single file):
+
+```bash
+cd frontend
+npm run build:review-demo
+```
+
+This writes `../review-demo.html` (repo root) as a standalone static review file.
+It is intentionally backend-free (no `/ask`, `/health`, `/version`, or `/llm/options` runtime calls) and is meant for design/product review sharing, not live planning.
+
+Required env:
+
+- `VITE_API_BASE_URL` should point to backend API (default expected by this repo: `http://127.0.0.1:8000`).
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 

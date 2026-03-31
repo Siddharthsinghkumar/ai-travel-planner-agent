@@ -3,15 +3,71 @@ import { formatTemperatureC, formatWeatherDate } from "../lib/format";
 type Props = {
   weather?: Record<string, unknown> | null;
   destinationCode?: string;
+  destinationLabel?: string;
+  weatherPresent?: boolean;
+  weatherReason?: string;
   isLoading?: boolean;
 };
+
+function textOrEmpty(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function normalizeIata(code?: string): string {
+  if (!code) return "";
+  const normalized = code.trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(normalized) ? normalized : "";
+}
+
+function formatDestinationLabel(
+  weather: Record<string, unknown> | null | undefined,
+  code?: string,
+  explicitLabel?: string
+): string {
+  const directLabel = textOrEmpty(explicitLabel);
+  if (directLabel) return directLabel;
+
+  const weatherLabel = textOrEmpty(weather?.location_label);
+  if (weatherLabel) return weatherLabel;
+
+  const weatherCity = textOrEmpty(weather?.location_city);
+  const weatherCode = normalizeIata(textOrEmpty(weather?.location));
+  if (weatherCity && weatherCode) return `${weatherCity} (${weatherCode})`;
+
+  const normalized = normalizeIata(code);
+  if (weatherCity && normalized) return `${weatherCity} (${normalized})`;
+  if (normalized) return normalized;
+
+  return "Destination";
+}
 
 function formatValue(value: unknown) {
   if (value === null || value === undefined || value === "") return "N/A";
   return String(value);
 }
 
-export default function WeatherSummary({ weather, destinationCode, isLoading = false }: Props) {
+function weatherAvailabilityHint(reason?: string): string {
+  const normalized = (reason || "").trim().toLowerCase();
+  if (normalized === "forecast_horizon_exceeded") {
+    return "Forecast data is unavailable for this date range yet.";
+  }
+  if (normalized === "api_failure") {
+    return "Weather provider data is temporarily unavailable.";
+  }
+  return "Finalizing forecast details for this destination.";
+}
+
+export default function WeatherSummary({
+  weather,
+  destinationCode,
+  destinationLabel,
+  weatherPresent,
+  weatherReason,
+  isLoading = false,
+}: Props) {
+  const resolvedDestinationLabel = formatDestinationLabel(weather, destinationCode, destinationLabel);
+
   if (!weather || typeof weather !== "object") {
     return (
       <section
@@ -20,7 +76,7 @@ export default function WeatherSummary({ weather, destinationCode, isLoading = f
       >
         <div className="weather-summary__head">
           <h2 className="weather-summary__title">Weather Outlook</h2>
-          <span key={destinationCode || "DEL"} className="best-lbl weather-summary__code">{destinationCode || "DEL"}</span>
+          <span key={resolvedDestinationLabel} className="best-lbl weather-summary__code">{resolvedDestinationLabel}</span>
         </div>
         <div className="weather-summary__grid weather-summary__grid--skeleton">
           <div className="weather-summary__tile-skeleton">
@@ -64,13 +120,16 @@ export default function WeatherSummary({ weather, destinationCode, isLoading = f
     precipText !== "N/A";
 
   if (!hasWeather) {
+    const strictWeatherUnavailable = weatherPresent === false;
     return (
       <section className="weather-summary weather-summary--loading">
         <div className="weather-summary__head">
           <h2 className="weather-summary__title">Weather Outlook</h2>
-          <span key={destinationCode || "DEL"} className="best-lbl weather-summary__code">{destinationCode || "DEL"}</span>
+          <span key={resolvedDestinationLabel} className="best-lbl weather-summary__code">{resolvedDestinationLabel}</span>
         </div>
-        <p className="weather-summary__hint">Finalizing forecast details for this destination.</p>
+        <p className="weather-summary__hint">
+          {strictWeatherUnavailable ? weatherAvailabilityHint(weatherReason) : "Finalizing forecast details for this destination."}
+        </p>
       </section>
     );
   }
@@ -79,7 +138,7 @@ export default function WeatherSummary({ weather, destinationCode, isLoading = f
     <section className="weather-summary weather-summary--ready">
       <div className="weather-summary__head">
         <h2 className="weather-summary__title">Weather Outlook</h2>
-        {destinationCode && <span key={destinationCode} className="best-lbl weather-summary__code">{destinationCode}</span>}
+        <span key={resolvedDestinationLabel} className="best-lbl weather-summary__code">{resolvedDestinationLabel}</span>
       </div>
 
       <div className="weather-summary__grid">

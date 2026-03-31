@@ -12,6 +12,7 @@ from fastapi import APIRouter, Query, Header, Depends, HTTPException
 from core.api_key_manager import key_manager
 from core.env_config import get_env_str
 from agents.cloud_llm import clear_client_cache, is_cloud_admin_enabled, get_usable_providers
+from core.llm_mode import get_llm_mode_default, LLM_MODE_OLLAMA_ONLY
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,8 @@ async def full_health_check() -> Dict[str, Any]:
     """
     results = {}
     messages: Dict[str, str] = {}  # still collected for logging, but not returned
+    llm_mode = (get_llm_mode_default() or "").strip().lower()
+    mode_non_relevant_dependencies = {"openai"} if llm_mode == LLM_MODE_OLLAMA_ONLY else set()
     cloud_admin_enabled = is_cloud_admin_enabled()
     cloud_usable_providers = []
     if cloud_admin_enabled:
@@ -229,9 +232,16 @@ async def full_health_check() -> Dict[str, Any]:
         key_status = {}
 
     has_pending_clear = False
+    key_gate_issues: list[Dict[str, Any]] = []
+    key_status_assumptions: list[Dict[str, Any]] = []
 
     for name, module_path in _HEALTH_PROVIDERS.items():
         try:
+            if name in mode_non_relevant_dependencies:
+                results[name] = "not_relevant"
+                messages[name] = f"Dependency {name} is not required for llm_mode={llm_mode}."
+                continue
+
             if name == "openai" and not cloud_admin_enabled:
                 results[name] = "disabled"
                 messages[name] = "Cloud LLM disabled by configuration (USE_CLOUD_LLM=0)."
@@ -248,23 +258,15 @@ async def full_health_check() -> Dict[str, Any]:
 
             if mapped_services:
                 provider_has_active = False
-                strict_missing_status = name == "openai"
+                missing_key_status_services: list[str] = []
+                unknown_format_services: list[str] = []
                 for svc in mapped_services:
                     svc_status = key_status.get(svc, {})
 
-                    # If there is no key status information for this service (None / empty dict / empty list),
-                    # assume the service has an active key (backwards-compatible for test envs where keys
-                    # aren't provided). This prevents missing key info from causing a readiness failure.
+                    # Missing key-status for a mapped service is treated as unknown/unavailable.
                     if not svc_status:
-                        if strict_missing_status:
-                            logger.debug(
-                                "No key status info for %s (strict cloud readiness mode)", svc
-                            )
-                        else:
-                            logger.debug(
-                                "No key status info for %s — assuming active for readiness check", svc
-                            )
-                            provider_has_active = True
+                        missing_key_status_services.append(svc)
+                        logger.debug("No key status info for %s (provider=%s)", svc, name)
                         continue
 
                     # Handle both list and dict formats
@@ -281,23 +283,38 @@ async def full_health_check() -> Dict[str, Any]:
                             if is_key_pending_clear(status_val):
                                 has_pending_clear = True
                     else:
-                        msg = f"Unexpected key status format for {svc}: {repr(svc_status)}. Assuming active."
+                        unknown_format_services.append(svc)
+                        msg = f"Unexpected key status format for {svc}: {repr(svc_status)}."
                         logger.warning(msg)
                         messages.setdefault(name, "")
                         messages[name] += msg + " "
-                        provider_has_active = True
 
                 if not provider_has_active:
                     status_snapshot = {svc: key_status.get(svc) for svc in mapped_services}
+                    reason = (
+                        "missing_key_status"
+                        if missing_key_status_services
+                        else "unknown_key_status_format"
+                        if unknown_format_services
+                        else "no_usable_keys"
+                    )
                     msg = (
-                        f"No usable keys for provider {name}. "
+                        f"Provider {name} unavailable due to key state ({reason}). "
                         f"Services checked: {mapped_services}. "
                         f"Status: {status_snapshot}"
                     )
-                    # Log the issue but DO NOT fail the provider immediately.
-                    # Some providers (or tests) may not rely on keys.
                     logger.warning(msg)
                     messages[name] = msg
+                    key_gate_issues.append(
+                        {
+                            "provider": name,
+                            "services_checked": mapped_services,
+                            "status_snapshot": status_snapshot,
+                            "reason": reason,
+                        }
+                    )
+                    results[name] = "unavailable"
+                    continue
 
             # Run provider health check (keys may be missing or insufficient, but we still try)
             func = _get_health_func(module_path)
@@ -323,12 +340,52 @@ async def full_health_check() -> Dict[str, Any]:
         messages.setdefault("database", "")
         messages["database"] += "Database health check failed (see logs). "
 
-    overall = "fail" if any(v == "fail" for v in results.values()) else "degraded" if has_pending_clear else "ok"
+    failed_dependencies = sorted([name for name, value in results.items() if value == "fail"])
+    degraded_dependencies = sorted([name for name, value in results.items() if value == "degraded"])
+    unavailable_dependencies = sorted([name for name, value in results.items() if value == "unavailable"])
+    disabled_dependencies = sorted([name for name, value in results.items() if value == "disabled"])
+    not_relevant_dependencies = sorted([name for name, value in results.items() if value == "not_relevant"])
+
+    dependency_degraded = bool(degraded_dependencies or unavailable_dependencies)
+    keying_degraded = bool(has_pending_clear or key_gate_issues or key_status_assumptions)
+
+    overall = (
+        "fail"
+        if failed_dependencies
+        else "degraded"
+        if dependency_degraded or keying_degraded
+        else "ok"
+    )
+
+    status_reasons: list[str] = []
+    if failed_dependencies:
+        status_reasons.append("dependency_failed")
+    if degraded_dependencies:
+        status_reasons.append("dependency_degraded")
+    if unavailable_dependencies:
+        status_reasons.append("dependency_unavailable")
+    if has_pending_clear:
+        status_reasons.append("key_pending_clear")
+    if key_gate_issues:
+        status_reasons.append("provider_key_gate_issue")
+    if key_status_assumptions:
+        status_reasons.append("key_status_assumed")
 
     # Slim return (original contract)
     return {
         "status": overall,
         "dependencies": results,
+        "dependency_summary": {
+            "failed": failed_dependencies,
+            "degraded": degraded_dependencies,
+            "unavailable": unavailable_dependencies,
+            "disabled": disabled_dependencies,
+            "not_relevant": not_relevant_dependencies,
+        },
+        "status_reasons": status_reasons,
+        "key_gate_issues": key_gate_issues,
+        "key_status_assumptions": key_status_assumptions,
+        "messages": messages,
     }
 
 
@@ -337,7 +394,7 @@ async def full_health_check() -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 
 async def full_health_check_verbose() -> Dict[str, Any]:
-    """Extended health check with key details and messages. Used by /health/ready."""
+    """Extended health check with key details and messages (for diagnostics)."""
     slim = await full_health_check()
     # Re-fetch key status for the verbose fields
     try:
@@ -349,7 +406,7 @@ async def full_health_check_verbose() -> Dict[str, Any]:
     return {
         **slim,
         "keys": format_keys_human_readable(key_status),
-        "messages": {},  # placeholder; messages could be collected if needed
+        "messages": slim.get("messages", {}),
     }
 
 

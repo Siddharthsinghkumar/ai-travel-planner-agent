@@ -22,13 +22,44 @@ export interface TripDebugInfo {
   [key: string]: unknown;
 }
 
+export interface MultiCityLeg {
+  llm_response?: string | null;
+  best_flight?: Flight;
+  weather?: Record<string, unknown> | null;
+  warnings?: string[] | null;
+  weather_present?: boolean;
+  weather_reason?: string | null;
+  debug_info?: TripDebugInfo | null;
+  search_date?: string;
+}
+
 export interface TripPlan {
   best_flight?: Flight;
   all_flights?: Flight[];
   weather?: Record<string, unknown> | null;
+  return_trip?: MultiCityLeg | null;
+  warnings?: string[] | null;
+  warning?: string;
+  fallback?: boolean;
   debug_info?: TripDebugInfo | null;
   llm_response?: string;
   error?: string;
+  weather_present?: boolean;
+  weather_reason?: string | null;
+  multicity?: boolean;
+  legs?: MultiCityLeg[];
+  result_status?: "success" | "degraded" | "error";
+  fallback_note?: string;
+  degradation?: {
+    reason?: string;
+    message?: string;
+    provider?: string;
+    [key: string]: unknown;
+  } | null;
+  failure_reason?: string;
+  failure_domain?: string;
+  no_flights_reason?: string;
+  flight_counts?: Record<string, number> | null;
 }
 
 export interface AskPayload {

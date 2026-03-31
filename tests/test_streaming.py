@@ -166,3 +166,34 @@ async def test_streaming_endpoint_emits_early_structured_activity_before_delayed
     assert "event: reasoning_step" in combined
     assert "Token chunk" in combined
     assert combined.find("event: reasoning_step") < combined.find("Token chunk")
+
+
+@pytest.mark.asyncio
+async def test_streaming_wrapper_emits_error_done_json_when_planner_stream_missing_completion(monkeypatch):
+    async def fake_plan_trip(*args, **kwargs):
+        if kwargs.get("stream"):
+            async def _gen():
+                yield "partial token only"
+            return _gen()
+        return {"ok": True}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+    monkeypatch.setattr("agents.planner_agent.plan_trip", fake_plan_trip)
+
+    payload = {"date": "2026-03-15", "user_query": "test", "trip_type": "Business"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream("POST", "/ask?stream=true", json=payload) as resp:
+            assert resp.status_code == 200
+            content = ""
+            async for chunk in resp.aiter_text():
+                if not chunk:
+                    continue
+                content += chunk
+                if "event: done" in content:
+                    break
+
+    assert "partial token only" in content
+    assert "[DONE_JSON]" in content
+    assert "without completion payload" in content.lower()
+    assert "stream_contract_violation" in content
