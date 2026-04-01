@@ -1,5 +1,6 @@
 #tests/test_booking_handoff.py
 import asyncio
+import threading
 import pytest
 import urllib.parse
 from datetime import datetime, timedelta
@@ -2387,8 +2388,25 @@ def test_post_handoff_ttl_floor_supports_manual_first_click_window():
     assert booking_handoff.POST_HANDOFF_TTL_SECONDS >= 180
 
 
-@pytest.mark.asyncio
-async def test_post_handoff_persistent_consume_is_single_winner_under_concurrency():
+def test_post_handoff_persistent_consume_is_single_winner_under_concurrency(monkeypatch, tmp_path):
+    # Keep this test environment-independent: force a deterministic, file-backed DB
+    # so we exercise the persistent consume path regardless of local .env state.
+    sqlite_path = tmp_path / "booking_handoff_concurrency.sqlite3"
+    monkeypatch.setenv("TESTING", "1")
+    monkeypatch.setenv("TESTING_USE_PERSISTENT_DB", "1")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{sqlite_path}")
+    monkeypatch.setenv("POST_HANDOFF_REQUIRE_PERSISTENCE", "1")
+    monkeypatch.setattr(booking_handoff, "POST_HANDOFF_REQUIRE_PERSISTENCE", True)
+
+    import agents.database as database
+
+    # agents.database caches engine/session globals; reset so our test env is honored.
+    monkeypatch.setattr(database, "_engine", None)
+    monkeypatch.setattr(database, "_SessionLocal", None)
+    booking_handoff.ensure_tables()
+
+    # Clear in-memory cache so registration/consume behavior is isolated to this test.
+    booking_handoff._post_handoff_artifacts.clear()
     bridge_url = booking_handoff.register_post_handoff_artifact(
         url="https://www.google.com/travel/clk/f",
         post_data={"token": "atomic-once"},
@@ -2396,19 +2414,57 @@ async def test_post_handoff_persistent_consume_is_single_winner_under_concurrenc
     )
     assert bridge_url is not None
     artifact_id = bridge_url.rsplit("/", 1)[-1]
+    assert sqlite_path.exists()
 
-    # Force both attempts through the persistent consume path.
+    # Verify registration actually reached the persistent table.
+    session = database.SessionLocal()
+    try:
+        row = session.query(booking_handoff.PostHandoffArtifact).filter(
+            booking_handoff.PostHandoffArtifact.artifact_id == artifact_id
+        ).first()
+        assert row is not None
+    finally:
+        session.close()
+
+    # Force both attempts through the persistent consume path (not memory fallback).
     booking_handoff._post_handoff_artifacts.clear()
 
-    def _consume_once():
-        return booking_handoff.consume_post_handoff_artifact(artifact_id)
+    consume_results = []
+    consume_errors = []
+    consume_lock = threading.Lock()
+    start_barrier = threading.Barrier(3)
 
-    first, second = await asyncio.gather(
-        asyncio.to_thread(_consume_once),
-        asyncio.to_thread(_consume_once),
-    )
-    successes = sum(1 for item in (first, second) if item is not None)
-    assert successes == 1
+    def _consume_once():
+        try:
+            start_barrier.wait(timeout=5)
+            result = booking_handoff.consume_post_handoff_artifact_with_diagnostics(artifact_id)
+            with consume_lock:
+                consume_results.append(result)
+        except Exception as exc:
+            with consume_lock:
+                consume_errors.append(exc)
+
+    first_worker = threading.Thread(target=_consume_once, name="post-handoff-consume-1")
+    second_worker = threading.Thread(target=_consume_once, name="post-handoff-consume-2")
+    first_worker.start()
+    second_worker.start()
+    start_barrier.wait(timeout=5)
+    first_worker.join(timeout=5)
+    second_worker.join(timeout=5)
+
+    assert first_worker.is_alive() is False
+    assert second_worker.is_alive() is False
+    assert consume_errors == []
+    assert len(consume_results) == 2
+
+    successes = [item for item in consume_results if item[0] is not None]
+    failures = [item for item in consume_results if item[0] is None]
+
+    assert len(successes) == 1
+    assert successes[0][1]["lookup_result"] == "persistent_hit"
+    assert len(failures) == 1
+    assert failures[0][1]["lookup_result"] in {"already_consumed", "consume_race_lost"}
+    assert failures[0][1]["lookup_result"] != "lookup_failed"
 
 
 def test_register_post_handoff_artifact_rejects_non_persistent_when_required(monkeypatch):
