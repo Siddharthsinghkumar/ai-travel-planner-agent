@@ -80,6 +80,12 @@ This file defines the canonical configuration contract for current runtime behav
 - Used in: `agents/database.py`.
 - Required: recommended in non-local deployments.
 
+`TESTING_USE_PERSISTENT_DB`
+- Purpose: when `TESTING=true`, force DB usage through persistent `DATABASE_URL`/file DB instead of in-memory sqlite.
+- Default: `false` (testing mode uses in-memory sqlite unless enabled).
+- Used in: `agents/database.py`, set by `full_validation.py` temporary env for booking-bridge contract checks.
+- Required: optional; primarily useful for cross-process validation/runtime flows under testing mode.
+
 `ADMIN_TOKEN`
 - Purpose: admin auth for protected debug endpoints.
 - Used in: `api/app.py`, `core/health.py`.
@@ -198,6 +204,7 @@ Note:
 - `app/entrypoint.sh` is retained for compatibility but is not authoritative in the default Docker path.
 - Runtime env precedence follows normal process environment rules: container-injected vars override values loaded from `.env`.
 - Validation flow (`full_validation.py`) may generate `.env.tmp` to run scenario-specific checks; this is test harness behavior, not production config ownership.
+- Validation flow sets `TESTING_USE_PERSISTENT_DB=1` in `.env.tmp` so cross-process booking bridge checks use a shared persistent store.
 
 ## 5a. Timeout Variables (Current)
 Runtime timeout variables currently used in active backend/frontend paths:
@@ -360,7 +367,14 @@ Do not treat these as production runtime config:
 
 - `VALIDATION_USE_CLOUD_LLM`
 - `VALIDATION_MODE`
+- `VALIDATION_PROFILE`
 - `VALIDATION_QUIET`
+- `FRONTEND_VALIDATION_URL`
+- `FRONTEND_VALIDATION_HOST`
+- `FRONTEND_VALIDATION_PORT`
+- `FRONTEND_VALIDATION_QUERY_TIMEOUT`
+- `FRONTEND_VALIDATION_DEBUG`
+- `FRONTEND_VALIDATION_HARD_CAP_S`
 - `SMOKE_TIMEOUT`
 - `SKIP_DOCKER_BUILD`
 - `TESTING`

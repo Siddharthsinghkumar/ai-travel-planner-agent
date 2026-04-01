@@ -1,68 +1,47 @@
 # LLM Travel Agent
 
-Travel planning system with a FastAPI backend, React frontend, SSE streaming, and validation tooling that checks backend and real browser behavior.
+FastAPI + React travel planning app with:
+- non-stream `/ask`
+- streaming `/ask?stream=true` (SSE + final `[DONE_JSON]`)
+- optional async jobs (`/ask?async_job=true`, `/jobs/...`)
+- booking handoff bridge (`/booking/handoff/post/{artifact_id}`)
+- local validation harness (`full_validation.py`)
 
-This repository is currently an **advanced prototype**: strong for demos and portfolio usage, not yet production-ready for real user traffic without additional hardening.
+Current maturity: advanced local/demo prototype, not production-hardened.
 
-## What This Project Does
+## What Exists Today
 
-- Accepts natural-language and/or structured trip inputs.
-- Searches flights and weather, ranks options, and generates an LLM explanation.
-- Supports:
-  - Non-streaming responses (`POST /ask`)
-  - Streaming SSE responses (`POST /ask?stream=true`)
-  - Async job mode (`POST /ask?async_job=true` + `/jobs/...`)
-- Includes backend unit/integration tests and frontend browser validation.
+- Backend API: [api/app.py](api/app.py)
+- Planner and routing: `agents/planner_agent.py`, `agents/llm_router.py`
+- Tools: `tools/airline_api.py`, `tools/weather_api.py`, `tools/booking_handoff.py`
+- Frontend app: `frontend/src/App.tsx`
+- Frontend stream/fallback logic: `frontend/src/hooks/useStreamingPlan.tsx`
+- Validation entrypoint: [full_validation.py](full_validation.py)
+- Browser runtime validator: `validation/frontend_validator.py`
+- Tests: `tests/` (`pytest -q`)
 
-## Architecture (High Level)
+## Quick Start (Local)
 
-1. Frontend submits query to backend `/ask`.
-2. Backend planner resolves intent, calls tools:
-   - Flight search (`tools/airline_api.py`)
-   - Weather (`tools/weather_api.py`)
-3. LLM routing (`agents/llm_router.py`) chooses cloud/local backend by mode.
-4. For streaming mode, backend emits SSE frames and final `[DONE_JSON]{...}` payload.
-5. Frontend parses SSE frames, displays progressive UI, and requires final parseable completion payload.
-
-## Prerequisites
-
-- Python 3.12
-- Node.js 18+
-- npm
-- Optional for local model path: Ollama
-- API keys in env files for live-provider runs
-
-## Configuration Files
-
-- Backend runtime (local): `.env`
-- Frontend runtime: `frontend/.env`
-- Docker variant used in this repo: `.env.laptopdocker`
-- Validation-generated temp file: `.env.tmp` (auto-created by `full_validation.py`)
-
-For full variable details and meanings, see [CONFIG.md](CONFIG.md).
-
-## Local Run Flow
-
-### 1) Backend
+### 1. Backend
 
 ```bash
-# from repo root
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 venv/bin/uvicorn api.app:app --host 127.0.0.1 --port 8000
 ```
 
-### 2) Frontend
+### 2. Frontend
 
 ```bash
-# new terminal
 cd frontend
 npm install
+cp .env.example .env
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-### 3) Quick sanity checks
+### 3. Quick Checks
 
 ```bash
 curl -sS http://127.0.0.1:8000/health
@@ -71,120 +50,91 @@ curl -sS http://127.0.0.1:8000/health/deep
 curl -sS http://127.0.0.1:8000/health/keys
 ```
 
-## Validation Flow
+## Validation Workflow
 
-### Unit tests
+### Unit/integration test suite
 
 ```bash
 venv/bin/pytest -q
 ```
 
-### Full machine validation (backend + checks)
+### Full local harness (default pre-push path)
 
 ```bash
-python full_validation.py --mode machine --r 0
+venv/bin/python full_validation.py --mode machine --r 0
 ```
 
-### Full frontend validation (real UI path)
+### Frontend runtime validation (browser-driven)
 
 ```bash
-python full_validation.py --mode machine --frontend --r 0
+venv/bin/python full_validation.py --mode machine --profile full --frontend --r 0
 ```
 
-### Live-provider run (real external calls)
+Notes:
+- `--frontend` routes selected validations through browser automation and frontend runtime checks.
+- Frontend runtime matrix runs in `--profile full` and `--profile frontend-heavy`.
+- Default `full_validation.py` mode is `--mode both` (machine + docker).
+- Logs are written to `validation_logs/`.
+
+### Live provider mode (non-deterministic, slower)
 
 ```bash
-python full_validation.py --mode machine --frontend --live --r 0
+venv/bin/python full_validation.py --mode machine --live --r 0
 ```
 
-`--live` increases real dependency risk (quota, rate limit, provider outages).
+Use `--live` only when you intentionally want real external provider behavior (keys, quota, rate limits, network effects).
 
-## Health Endpoints: What They Actually Mean
+## Runtime and Health Endpoints
 
-- `GET /health/live`
-  - Process liveness only.
-- `GET /health/ready`
-  - Startup/readiness gate; does not fully validate external dependencies.
-- `GET /health`
-  - Lightweight probe-safe status. Intentionally avoids deep external dependency checks.
-- `GET /health/deep`
-  - Deep dependency check (cloud/tool/backend integration signals).
-- `GET /health/keys`
-  - Key manager status metadata (no secret key values).
+- `GET /health/live`: liveness only
+- `GET /health/ready`: readiness/startup status
+- `GET /health`: lightweight runtime health (stable probe surface)
+- `GET /health/deep`: deeper dependency health
+- `GET /health/keys`: key-manager status metadata
+- `GET /llm/options`: routing/provider/options visibility
+- `GET /version`: commit + file mtime metadata
 
-Operational rule: use `/health` for container probe stability, and `/health/deep` for dependency truth.
+## Frontend and Review Artifacts
 
-## Streaming & Routing Operational Truth
+In `frontend/`:
+- `npm run dev`: Vite dev server
+- `npm run build`: production bundle
+- `npm run build:review-demo`: outputs backend-free review artifact at repo root `review-demo.html`
+- `npm run export:frozen-demo`: outputs single-file static artifact at `frontend/dist/frozen-demo.html`
 
-- `/ask?stream=true` uses SSE frames and a final `[DONE_JSON]` completion payload.
-- `event: done` is terminal framing; completion correctness should be judged by parseable `[DONE_JSON]`.
-- Routing modes: `ollama_only`, `cloud_only`, `cloud_first`, `ollama_first`.
-- **Important limitation**: no true mid-stream provider failover after first token. If a provider fails after stream start, stream interruption is surfaced explicitly.
+These demo/review artifacts are for sharing UI/product review states and are not substitutes for live backend validation.
 
-See ADRs:
-- [docs/adr/0001-llm-routing.md](docs/adr/0001-llm-routing.md)
-- [docs/adr/0002-streaming.md](docs/adr/0002-streaming.md)
+## Docker Path
 
-## Common Failure Modes & Triage
-
-### 1) Keys/quota/rate limit failures
-
-Symptoms:
-- provider unavailable
-- 401/403/429 errors
-- degraded deep health
-
-Check:
+Local make targets:
 
 ```bash
-curl -sS http://127.0.0.1:8000/health/keys
-curl -sS http://127.0.0.1:8000/health/deep
+make build
+make run
 ```
 
-### 2) Frontend stream completion failures
+- Makefile image: `sidd/llm-travel-agent:latest`
+- Env file for make run: `.env.laptopdocker`
 
-Symptoms:
-- missing or unparseable completion payload
-- frontend fallback triggered after stream activity
+`full_validation.py` uses its own docker test image/container flow for validator runs.
 
-Check:
+## Production-Like vs Local/Demo
 
-```bash
-FRONTEND_VALIDATION_DEBUG=1 python full_validation.py --mode machine --frontend --r 0
-```
+- Production-like surfaces:
+  - FastAPI contracts and health/runtime endpoints
+  - planner + tool orchestration
+  - SSE completion contract (`[DONE_JSON]`)
+  - booking bridge one-time artifact flow
+- Local/demo-only conveniences:
+  - TESTING-mode deterministic behavior
+  - standalone review HTML artifacts
+  - validation harness scenario mocks for frontend runtime checks
 
-### 3) Dev server port conflicts (Vite 5173)
+## More Docs
 
-Symptoms:
-- validator cannot bind/start frontend
-
-Check:
-
-```bash
-ss -ltnp | rg 5173
-```
-
-## Safe Demo Flow
-
-1. Start backend and frontend locally.
-2. Verify `/health` and `/llm/options`.
-3. Run `python full_validation.py --mode machine --frontend --r 0`.
-4. Demo queries from frontend UI with debug drawer off unless needed.
-
-## Production Readiness (Current Reality)
-
-Current state: **not production-ready**.
-
-Reasons:
-- External provider reliability/quota behavior still drives user-visible degradation.
-- Mid-stream continuity is bounded (no true post-first-token failover).
-- Operational maturity still requires stronger deployment/alert/SLO process.
-
-## Additional Docs
-
-- Demo quick sheet: [docs/demo-sheet.md](docs/demo-sheet.md)
-- Full backend operator sheet: [docs/operator-sheet.md](docs/operator-sheet.md)
-- Showcase curl command pack: [docs/showcase-commands.sh](docs/showcase-commands.sh)
-- Configuration contract: [CONFIG.md](CONFIG.md)
-- Minimal operations runbook: [docs/runbook.md](docs/runbook.md)
+- Config reference: [CONFIG.md](CONFIG.md)
+- Frontend usage details: [frontend/README.md](frontend/README.md)
+- Operator sheet: [docs/operator-sheet.md](docs/operator-sheet.md)
+- Runbook: [docs/runbook.md](docs/runbook.md)
+- Demo sheet: [docs/demo-sheet.md](docs/demo-sheet.md)
 - Monitoring quickstart: [monitoring/README.md](monitoring/README.md)

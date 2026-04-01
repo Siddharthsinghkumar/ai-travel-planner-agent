@@ -22,6 +22,7 @@ export default function QueryForm({
   onRecentQueriesChange,
   devRoutingOverrides = null,
 }: Props) {
+  const VIA_STOPOVER_INSTRUCTION_RE = /\b(via|stopover|stop over|through|connecting through|with stop in|stop in)\b/i;
   const [query, setQuery] = useState("Find cheap flight Delhi to Mumbai tomorrow");
   const [origin, setOrigin] = useState("");
   const [destination, setDestination] = useState("");
@@ -95,7 +96,7 @@ export default function QueryForm({
   function inferExplicitTripTypeFromQuery(queryText: string, stopoverText: string): "round-trip" | "via-stopover" | null {
     const q = queryText.toLowerCase();
     if (stopoverText.trim()) return "via-stopover";
-    if (/\b(via|stopover|stop over|through|connecting through|stop in)\b/i.test(q)) return "via-stopover";
+    if (VIA_STOPOVER_INSTRUCTION_RE.test(q)) return "via-stopover";
     if (/\b(round[- ]?trip|return(?:ing)?|come back)\b/i.test(q)) return "round-trip";
     return null;
   }
@@ -127,7 +128,7 @@ export default function QueryForm({
 
     if (resolvedTripType === "via-stopover") {
       const stopoverText = stopover.trim();
-      const hasViaInstruction = /\b(via|stopover|through)\b/i.test(finalQuery);
+      const hasViaInstruction = VIA_STOPOVER_INSTRUCTION_RE.test(finalQuery);
       if (!hasViaInstruction && !stopoverText) {
         setFormError("Enter a stopover city or IATA code to run a via-stopover search.");
         setIsSubmitting(false);

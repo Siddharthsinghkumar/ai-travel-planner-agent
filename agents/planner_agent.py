@@ -1916,7 +1916,7 @@ def parse_intent(user_query: str) -> ParsedIntent:
         # "in 2 weeks", "2 weeks from now / after today"
         if not _relative_date_set:
             rel_weeks = re.search(
-                r"\bin\s+(\d+)\s+weeks?\b|(\d+)\s+weeks?\s+(?:from\s+(?:now|today)|after\s+today)\b",
+                r"\bin\s+(\d+)\s+weeks?\b|after\s+(\d+)\s+weeks?\b|(\d+)\s+weeks?\s+(?:from\s+(?:now|today)|after\s+(?:today|now))\b",
                 q_rel,
             )
             if rel_weeks:
@@ -2020,9 +2020,20 @@ def parse_intent(user_query: str) -> ParsedIntent:
             break
 
     # --- Price limit ---
-    price_match = re.search(r'under\s*[₹]?\s*(\d+)', q)
-    if price_match:
-        intent.price_limit = int(price_match.group(1))
+    price_pattern = re.compile(
+        r"\b(?:under|below|within|less\s+than|up\s+to)\s*"
+        r"(?:₹\s*|rs\.?\s*|inr\s*|rupees?\s*)?"
+        r"(?P<amount>\d{1,7})"
+        r"(?:\s*(?:₹|rs\.?|inr|rupees?))?\b",
+        re.IGNORECASE,
+    )
+    for price_match in price_pattern.finditer(q):
+        trailing = q[price_match.end(): price_match.end() + 24]
+        # Avoid treating duration constraints as budgets (for example, "layover under 2 hours").
+        if re.match(r"\s*(?:hours?|hrs?|h|minutes?|mins?|days?|weeks?)\b", trailing):
+            continue
+        intent.price_limit = int(price_match.group("amount"))
+        break
 
     # --- Direct flights ---
     intent.wants_direct = "direct" in q
@@ -2100,7 +2111,10 @@ def parse_intent(user_query: str) -> ParsedIntent:
     if via_match:
         stopover_text = re.sub(r'\s+', ' ', via_match.group(1)).strip(" ,.-")
         stopover_text = re.sub(r'^(?:in)\s+', '', stopover_text, flags=re.IGNORECASE)
-        intent.stopover_city = stopover_text.title()
+        if re.fullmatch(r"[A-Za-z]{3}", stopover_text) and is_iata_token(stopover_text.upper()):
+            intent.stopover_city = stopover_text.upper()
+        else:
+            intent.stopover_city = stopover_text.title()
 
     # --- Flight preference ---
     if "cheapest" in q or "cheap" in q or "lowest price" in q or "budget" in q:
@@ -2339,6 +2353,40 @@ def _enforce_narrative_consistency(
             pass
 
     return text
+
+
+def _ensure_route_grounding(
+    llm_text: str,
+    origin_iata: Optional[str],
+    destination_iata: Optional[str],
+) -> str:
+    """
+    Ensure final prose explicitly grounds the recommendation to canonical route labels.
+    This keeps misspelled-query narratives from drifting into non-canonical city spellings.
+    """
+    text = (llm_text or "").strip()
+    origin = _sanitize_iata_code(origin_iata)
+    destination = _sanitize_iata_code(destination_iata)
+    if not origin or not destination:
+        return text
+
+    origin_city = city_for_iata(origin) or origin
+    destination_city = city_for_iata(destination) or destination
+    text_lower = text.lower()
+
+    def _mentions(label: str, iata: str) -> bool:
+        token = (label or "").strip().lower()
+        if token and token in text_lower:
+            return True
+        return bool(re.search(rf"\b{re.escape(iata.lower())}\b", text_lower))
+
+    if _mentions(origin_city, origin) and _mentions(destination_city, destination):
+        return text
+
+    route_line = f"Route confirmation: {origin_city} ({origin}) to {destination_city} ({destination})."
+    if not text:
+        return route_line
+    return f"{text}\n\n{route_line}"
 
 
 def _safe_llm_error_message(error: Exception) -> str:
@@ -4726,6 +4774,7 @@ async def _plan_trip_internal(
     if skip_llm:
         # Provide a clean summary when LLM is skipped
         llm_text = f"Flight: {best_flight.airline} {best_flight.flight_no} ({best_flight.departure_time} - {best_flight.arrival_time}). Price: {best_flight.price_inr}. Weather: {weather_dict.get('condition')}, {weather_dict.get('temperature_c')}°C."
+        llm_text = _ensure_route_grounding(llm_text, intent.origin_iata, intent.destination_iata)
         llm_degradation = None
         llm_degradation_note = ""
     else:
@@ -4754,6 +4803,7 @@ async def _plan_trip_internal(
             )
             warnings.append(llm_degradation_note)
             debug_info["degradation"] = llm_degradation
+        llm_text = _ensure_route_grounding(llm_text, intent.origin_iata, intent.destination_iata)
 
         # No second LLM call — the combined trip_description already covers both legs.
         # Split llm_text at the RETURN section to give return_trip its own slice.

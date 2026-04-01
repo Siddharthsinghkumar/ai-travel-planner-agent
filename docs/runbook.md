@@ -34,8 +34,7 @@ For broader endpoint usage and copy-paste command sets, also see:
    - `reason` on `stream_fallback_total`
    - `cause` on `llm_router_stream_failures_total`
 3. Check if failures cluster on one backend (`provider` label).
-4. If stream init timeouts spike, verify `STREAM_INIT_TIMEOUT` and backend health.
-   - Runtime variable in this repo is `PLANNER_STREAM_INIT_TIMEOUT` (planner-side floor applied).
+4. If stream init timeouts spike, verify `PLANNER_STREAM_INIT_TIMEOUT` and backend health.
 
 ## 3) First-token latency high
 
@@ -70,3 +69,16 @@ For broader endpoint usage and copy-paste command sets, also see:
 3. If weather or airline failures increase, inspect external API key status:
    - `GET /health/keys`
 4. If needed, run in fallback mode (`ollama_only`/`cloud_only`) to reduce routing noise during triage.
+
+## 6) Local confidence checks before push
+
+1. Run unit/integration suite:
+   - `venv/bin/pytest -q`
+2. Run machine validation harness:
+   - `venv/bin/python full_validation.py --mode machine --r 0`
+3. If UI/runtime behavior matters for your change, also run:
+   - `venv/bin/python full_validation.py --mode machine --profile full --frontend --r 0`
+
+Notes:
+- Harness logs are written to `validation_logs/`.
+- `--live` mode calls real external providers and is intentionally less deterministic.

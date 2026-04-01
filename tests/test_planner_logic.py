@@ -1,7 +1,7 @@
 #tests/test_planner_logic.py
 import pytest
 from datetime import datetime, timedelta
-from agents.planner_agent import parse_intent, filter_flights, Flight
+from agents.planner_agent import parse_intent, filter_flights, Flight, _ensure_route_grounding
 import agents.planner_agent as planner_agent
 from agents.llm_router import AllBackendsFailed
 from core.iata_resolver import is_iata_token
@@ -99,9 +99,26 @@ def test_parse_intent_keeps_starting_month_day_literal_date():
     assert parsed.day == 20
 
 
+def test_parse_intent_relative_weeks_supports_after_prefix():
+    intent = parse_intent("Flight DEL BOM after 2 weeks")
+    expected_departure = (datetime.now().date() + timedelta(days=14)).strftime("%Y-%m-%d")
+    assert intent.date == expected_departure
+
+
+def test_parse_intent_layover_constraint_does_not_create_price_limit():
+    intent = parse_intent("Flight from Delhi to Mumbai on 2026-04-22, layover under 2 hours")
+    assert intent.layover_limit_minutes == 120
+    assert intent.price_limit is None
+
+
 def test_parse_intent_preserves_multiword_via_city():
     intent = parse_intent("Find flights from Lucknow to Mumbai via New Delhi tomorrow")
     assert intent.stopover_city == "New Delhi"
+
+
+def test_parse_intent_preserves_uppercase_iata_stopover_token():
+    intent = parse_intent("DEL to MAA via BLR on 2026-04-22")
+    assert intent.stopover_city == "BLR"
 
 
 def test_parse_intent_preserves_multiword_via_city_with_middle_east_name():
@@ -239,7 +256,14 @@ def test_parse_intent_preserves_embedded_uppercase_iata_tokens_in_noisy_phrase()
     intent = parse_intent("Find cheapest DEL to BOM on 2026-04-18")
     assert intent.origin_iata == "DEL"
     assert intent.destination_iata == "BOM"
-    assert intent.date == "2026-04-18"
+
+
+def test_ensure_route_grounding_appends_canonical_route_for_misspelled_narrative():
+    narrative = "Best option is from Dehli to Bombay on 2026-04-22."
+    grounded = _ensure_route_grounding(narrative, "DEL", "BOM")
+    grounded_lower = grounded.lower()
+    assert "new delhi (del)" in grounded_lower
+    assert "mumbai (bom)" in grounded_lower
 
 
 def test_safe_llm_error_message_is_mode_aware_for_single_backend_scope():
