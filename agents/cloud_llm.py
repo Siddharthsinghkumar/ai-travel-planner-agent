@@ -47,6 +47,9 @@ STREAM_CHUNK_TIMEOUT = get_env_float("CLOUD_LLM_STREAM_CHUNK_TIMEOUT", 5.0)
 # ---- Cooldown globals for health check ----
 PROVIDER_FAIL_COOLDOWN = get_env_int("PROVIDER_FAIL_COOLDOWN", 300)  # seconds
 _PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we skip health checks
+PROVIDER_AUTH_FAIL_COOLDOWN = get_env_int("PROVIDER_AUTH_FAIL_COOLDOWN", 900)
+PROVIDER_TRANSIENT_FAIL_COOLDOWN = get_env_int("PROVIDER_TRANSIENT_FAIL_COOLDOWN", 60)
+PROVIDER_CIRCUIT_OPEN_FAIL_COOLDOWN = get_env_int("PROVIDER_CIRCUIT_OPEN_FAIL_COOLDOWN", 45)
 # --------------------------------------------------
 
 _provider_chain_lock = threading.Lock()
@@ -1386,6 +1389,48 @@ async def generate_stream(
     raise last_exception or CloudLLMError("All streaming providers and models failed")
 
 
+def _classify_provider_health_failure(exc: Exception) -> str:
+    text = str(exc or "").lower()
+    if "circuit breaker open" in text or "circuit_open" in text:
+        return "circuit_open"
+    if any(token in text for token in ("unauthorized", "invalid api key", "invalid key", "forbidden", "401", "403", "auth")):
+        return "auth"
+    if any(token in text for token in ("insufficient_quota", "quota", "billing", "payment required")):
+        return "quota"
+    if any(token in text for token in ("rate limit", "ratelimit", "too many requests", "429")):
+        return "rate_limit"
+    if any(token in text for token in ("timeout", "timed out", "network", "connect", "temporar", "unavailable", "503", "502", "504")):
+        return "transient"
+    return "unknown"
+
+
+def _cooldown_seconds_for_failure_class(reason_class: str) -> int:
+    cls = str(reason_class or "unknown").strip().lower()
+    if cls == "auth":
+        return max(30, int(PROVIDER_AUTH_FAIL_COOLDOWN))
+    if cls in {"quota", "rate_limit"}:
+        return max(30, int(PROVIDER_FAIL_COOLDOWN))
+    if cls == "transient":
+        return max(5, int(PROVIDER_TRANSIENT_FAIL_COOLDOWN))
+    if cls == "circuit_open":
+        return max(5, int(PROVIDER_CIRCUIT_OPEN_FAIL_COOLDOWN))
+    return max(5, int(min(PROVIDER_FAIL_COOLDOWN, 60)))
+
+
+def _prune_provider_fail_cooldowns(now_ts: float, *, configured_providers: Optional[List[str]] = None) -> None:
+    configured = set(configured_providers or [])
+    stale = []
+    for name, until in list(_PROVIDER_FAIL_COOLDOWNS.items()):
+        until_ts = float(until or 0)
+        if until_ts <= now_ts:
+            stale.append(name)
+            continue
+        if configured and name not in configured:
+            stale.append(name)
+    for name in stale:
+        _PROVIDER_FAIL_COOLDOWNS.pop(name, None)
+
+
 async def health_check() -> str:
     """
     Cloud health check.
@@ -1408,7 +1453,8 @@ async def health_check() -> str:
 
     now = time.time()
     ping_model = get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
-    fail_cooldown = get_env_int("PROVIDER_FAIL_COOLDOWN", PROVIDER_FAIL_COOLDOWN)
+    configured_providers = [name for name, _, _ in provider_chain]
+    _prune_provider_fail_cooldowns(now, configured_providers=configured_providers)
 
     for prov_name, adapter, _ in provider_chain:
         if prov_name not in usable_providers:
@@ -1416,18 +1462,35 @@ async def health_check() -> str:
         if adapter is None:
             continue
 
-        cooldown_until = _PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0)
+        cooldown_until = float(_PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0) or 0)
         if now < cooldown_until:
+            logger.debug(
+                "Health check skipping provider due to cooldown",
+                extra={"provider": prov_name, "cooldown_until": cooldown_until},
+            )
             continue
 
         try:
             await adapter.ping(ping_model)
+            _PROVIDER_FAIL_COOLDOWNS.pop(prov_name, None)
             logger.info("Health check ok", extra={"provider": prov_name})
             return "ok"
         except Exception as e:
-            msg = str(e).lower()
-            if "ratelimit" in msg or "insufficient_quota" in msg or "429" in msg:
-                _PROVIDER_FAIL_COOLDOWNS[prov_name] = now + fail_cooldown
+            reason_class = _classify_provider_health_failure(e)
+            cooldown_seconds = _cooldown_seconds_for_failure_class(reason_class)
+            proposed_until = now + float(cooldown_seconds)
+            current_until = float(_PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0) or 0)
+            _PROVIDER_FAIL_COOLDOWNS[prov_name] = max(current_until, proposed_until)
+            logger.warning(
+                "Health check provider failure recorded",
+                extra={
+                    "provider": prov_name,
+                    "reason_class": reason_class,
+                    "cooldown_seconds": cooldown_seconds,
+                    "cooldown_until": _PROVIDER_FAIL_COOLDOWNS[prov_name],
+                    "error": str(e),
+                },
+            )
             continue
 
     return "fail"

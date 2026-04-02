@@ -1,7 +1,10 @@
 import asyncio
+import json
+import time
 import httpx
 import pytest
 from datetime import datetime, timedelta
+import api.app as api_app
 from api.app import app
 import tools.booking_handoff as booking_handoff
 
@@ -26,6 +29,183 @@ async def test_ask_endpoint(monkeypatch):
 
     assert response.status_code == 200
     assert "X-Request-ID" in response.headers
+
+
+@pytest.mark.asyncio
+async def test_ask_duplicate_non_stream_returns_explicit_duplicate_in_progress(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"count": 0}
+
+    async def fake_plan_trip(**_kwargs):
+        calls["count"] += 1
+        started.set()
+        await release.wait()
+        return {"result": "ok"}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+    monkeypatch.setenv("ASK_MAX_INFLIGHT", "8")
+    app.state.ask_runtime_state = {"lock": asyncio.Lock(), "inflight": {}}
+
+    payload = {
+        "origin": "DEL",
+        "destination": "BOM",
+        "date": future_date,
+        "user_query": "Business trip",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        primary_task = asyncio.create_task(client.post("/ask", json=payload))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        duplicate = await client.post("/ask", json=payload)
+        release.set()
+        primary = await primary_task
+
+    assert primary.status_code == 200
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"] == "duplicate_request_in_progress"
+    assert duplicate.headers.get("X-Ask-Admission") == "duplicate_in_progress"
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_duplicate_stream_returns_explicit_duplicate_in_progress(monkeypatch):
+    finish_stream = asyncio.Event()
+    calls = {"count": 0}
+
+    async def fake_plan_trip(**kwargs):
+        calls["count"] += 1
+        if kwargs.get("stream"):
+            async def _gen():
+                yield "partial chunk"
+                await finish_stream.wait()
+                yield "[DONE_JSON]" + '{"result":"ok"}'
+
+            return _gen()
+        return {"result": "ok"}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+    monkeypatch.setenv("ASK_MAX_INFLIGHT", "8")
+    app.state.ask_runtime_state = {"lock": asyncio.Lock(), "inflight": {}}
+
+    req = api_app.AskRequest(
+        origin="DEL",
+        destination="BOM",
+        date=future_date,
+        user_query="Business trip",
+    )
+
+    primary_stream = await api_app.ask(req=req, stream=True, async_job=False)
+    assert primary_stream.status_code == 200
+    stream_iter = primary_stream.body_iterator
+    first_chunk = await stream_iter.__anext__()
+    if isinstance(first_chunk, bytes):
+        assert b"partial chunk" in first_chunk
+    else:
+        assert "partial chunk" in str(first_chunk)
+
+    duplicate = await api_app.ask(req=req, stream=True, async_job=False)
+    assert duplicate.status_code == 409
+    duplicate_payload = json.loads(duplicate.body.decode("utf-8"))
+    assert duplicate_payload["error"] == "duplicate_request_in_progress"
+    assert duplicate.headers.get("X-Ask-Admission") == "duplicate_in_progress"
+
+    finish_stream.set()
+    async for _chunk in stream_iter:
+        pass
+
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_backpressure_returns_429_when_inflight_limit_reached(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"count": 0}
+
+    async def fake_plan_trip(**_kwargs):
+        calls["count"] += 1
+        started.set()
+        await release.wait()
+        return {"result": "ok"}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+    monkeypatch.setenv("ASK_MAX_INFLIGHT", "1")
+    app.state.ask_runtime_state = {"lock": asyncio.Lock(), "inflight": {}}
+
+    primary_payload = {
+        "origin": "DEL",
+        "destination": "BOM",
+        "date": future_date,
+        "user_query": "Business trip",
+    }
+    secondary_payload = {
+        "origin": "DEL",
+        "destination": "BLR",
+        "date": future_date,
+        "user_query": "Holiday trip",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        primary_task = asyncio.create_task(client.post("/ask", json=primary_payload))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        overloaded = await client.post("/ask", json=secondary_payload)
+        release.set()
+        primary = await primary_task
+
+    assert primary.status_code == 200
+    assert overloaded.status_code == 429
+    assert overloaded.json()["error"] == "ask_overloaded"
+    assert overloaded.headers.get("X-Ask-Admission") == "overloaded"
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_stale_inflight_marker_is_pruned_and_does_not_block(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_plan_trip(**_kwargs):
+        calls["count"] += 1
+        return {"result": "fresh"}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+    monkeypatch.setenv("ASK_INFLIGHT_STALE_SECONDS", "1")
+    app.state.ask_runtime_state = {"lock": asyncio.Lock(), "inflight": {}}
+
+    payload = {
+        "origin": "DEL",
+        "destination": "BOM",
+        "date": future_date,
+        "user_query": "Business trip",
+    }
+    fingerprint = api_app._build_ask_request_fingerprint(
+        origin=payload["origin"],
+        destination=payload["destination"],
+        date=payload["date"],
+        user_query=payload["user_query"],
+        trip_type=None,
+        llm_mode=None,
+        cloud_provider=None,
+        stream=False,
+    )
+    app.state.ask_runtime_state["inflight"][fingerprint] = {
+        "owner_request_id": "stale-request",
+        "stream": False,
+        "started_at": time.monotonic() - 500,
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/ask", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "fresh"
+    assert calls["count"] == 1
+    assert app.state.ask_runtime_state["inflight"] == {}
 
 
 @pytest.mark.asyncio

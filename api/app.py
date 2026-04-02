@@ -18,10 +18,11 @@ import os
 import asyncio
 import time
 import html
+import hashlib
 import fcntl                     # for process‑level locking
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -73,6 +74,99 @@ from agents import ollama_client
 
 logger = logging.getLogger(__name__)
 LOG_REQUEST_BODY_DEBUG = get_env_bool("LOG_REQUEST_BODY_DEBUG", default=False)
+
+ASK_MAX_INFLIGHT_DEFAULT = max(1, get_env_int("ASK_MAX_INFLIGHT", 16))
+ASK_DUPLICATE_RETRY_AFTER_DEFAULT = max(1, get_env_int("ASK_DUPLICATE_RETRY_AFTER_SECONDS", 2))
+ASK_OVERLOAD_RETRY_AFTER_DEFAULT = max(1, get_env_int("ASK_OVERLOAD_RETRY_AFTER_SECONDS", 1))
+
+
+def _resolve_ask_max_inflight() -> int:
+    return max(1, get_env_int("ASK_MAX_INFLIGHT", ASK_MAX_INFLIGHT_DEFAULT))
+
+
+def _resolve_ask_duplicate_retry_after_seconds() -> int:
+    return max(
+        1,
+        get_env_int("ASK_DUPLICATE_RETRY_AFTER_SECONDS", ASK_DUPLICATE_RETRY_AFTER_DEFAULT),
+    )
+
+
+def _resolve_ask_overload_retry_after_seconds() -> int:
+    return max(
+        1,
+        get_env_int("ASK_OVERLOAD_RETRY_AFTER_SECONDS", ASK_OVERLOAD_RETRY_AFTER_DEFAULT),
+    )
+
+
+def _resolve_ask_inflight_stale_seconds() -> float:
+    configured = get_env_float("ASK_INFLIGHT_STALE_SECONDS", 0.0)
+    if configured > 0:
+        return max(10.0, configured)
+    return max(10.0, float(_resolve_request_timeout()) + 10.0)
+
+
+def _build_ask_request_fingerprint(
+    *,
+    origin: Optional[str],
+    destination: Optional[str],
+    date: Optional[str],
+    user_query: str,
+    trip_type: Optional[str],
+    llm_mode: Optional[str],
+    cloud_provider: Optional[str],
+    stream: bool,
+) -> str:
+    normalized = {
+        "origin": str(origin or "").strip().upper(),
+        "destination": str(destination or "").strip().upper(),
+        "date": str(date or "").strip(),
+        "user_query": str(user_query or "").strip(),
+        "trip_type": str(trip_type or "").strip().lower(),
+        "llm_mode": str(llm_mode or "").strip().lower(),
+        "cloud_provider": str(cloud_provider or "").strip().lower(),
+        "stream": bool(stream),
+    }
+    serialized = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _ensure_ask_runtime_state(app: FastAPI) -> Dict[str, Any]:
+    state = getattr(app.state, "ask_runtime_state", None)
+    if isinstance(state, dict) and isinstance(state.get("inflight"), dict) and state.get("lock") is not None:
+        return state
+    state = {
+        "lock": asyncio.Lock(),
+        "inflight": {},
+    }
+    app.state.ask_runtime_state = state
+    return state
+
+
+def _prune_stale_ask_inflight_locked(
+    *,
+    inflight: Dict[str, Dict[str, Any]],
+    now_monotonic: float,
+    stale_after_seconds: float,
+) -> int:
+    stale_keys = []
+    for key, value in list(inflight.items()):
+        started_at = float((value or {}).get("started_at") or now_monotonic)
+        if (now_monotonic - started_at) > stale_after_seconds:
+            stale_keys.append(key)
+    for key in stale_keys:
+        inflight.pop(key, None)
+    return len(stale_keys)
+
+
+async def _release_ask_inflight_key(request_fingerprint: Optional[str]) -> None:
+    if not request_fingerprint:
+        return
+    runtime_state = _ensure_ask_runtime_state(app)
+    lock = runtime_state["lock"]
+    inflight = runtime_state["inflight"]
+    async with lock:
+        inflight.pop(request_fingerprint, None)
+        app_metrics.set_ask_inflight(len(inflight))
 
 
 def _legacy_async_llm_client_enabled() -> bool:
@@ -584,6 +678,10 @@ async def lifespan(app: FastAPI):
     app.state.async_job_support = _compute_async_job_support()
     app.state.key_manager_lease_task = None
     app.state.key_manager_refresh_owner = False
+    app.state.ask_runtime_state = {
+        "lock": asyncio.Lock(),
+        "inflight": {},
+    }
 
     # Startup: configure structured JSON logging
     setup_logging()
@@ -1113,6 +1211,10 @@ async def ask(
     else:
         planner_user_query = req.user_query or ""
 
+    ask_request_fingerprint: Optional[str] = None
+    ask_slot_acquired = False
+    stream_cleanup_owner = False
+
     try:
         def _failure_domain_for_reason(reason: Optional[str]) -> str:
             r = str(reason or "").strip().lower()
@@ -1143,6 +1245,106 @@ async def ask(
             if not isinstance(payload, str):
                 return False
             return payload.startswith("event: ") and payload.endswith("\n\n")
+
+        if not async_job:
+            ask_request_fingerprint = _build_ask_request_fingerprint(
+                origin=origin,
+                destination=destination,
+                date=effective_date,
+                user_query=planner_user_query,
+                trip_type=req.trip_type,
+                llm_mode=llm_mode,
+                cloud_provider=cloud_provider,
+                stream=stream,
+            )
+            owner_request_id = get_request_id() or "unknown"
+            runtime_state = _ensure_ask_runtime_state(app)
+            lock = runtime_state["lock"]
+            inflight: Dict[str, Dict[str, Any]] = runtime_state["inflight"]
+            now_monotonic = time.monotonic()
+            stale_after_seconds = _resolve_ask_inflight_stale_seconds()
+            max_inflight = _resolve_ask_max_inflight()
+            duplicate_retry_after = _resolve_ask_duplicate_retry_after_seconds()
+            overload_retry_after = _resolve_ask_overload_retry_after_seconds()
+            duplicate_meta: Optional[Dict[str, Any]] = None
+            overload_meta: Optional[Dict[str, Any]] = None
+
+            async with lock:
+                stale_removed = _prune_stale_ask_inflight_locked(
+                    inflight=inflight,
+                    now_monotonic=now_monotonic,
+                    stale_after_seconds=stale_after_seconds,
+                )
+                if stale_removed:
+                    logger.warning(
+                        "ask_inflight_stale_pruned | removed=%s | stale_after_sec=%.2f",
+                        stale_removed,
+                        stale_after_seconds,
+                    )
+                existing = inflight.get(ask_request_fingerprint)
+                if existing is not None:
+                    duplicate_meta = {
+                        "leader_request_id": str(existing.get("owner_request_id") or "unknown"),
+                        "leader_stream": bool(existing.get("stream")),
+                        "started_at_monotonic": float(existing.get("started_at") or now_monotonic),
+                        "retry_after_seconds": duplicate_retry_after,
+                        "inflight_size": len(inflight),
+                    }
+                elif len(inflight) >= max_inflight:
+                    overload_meta = {
+                        "retry_after_seconds": overload_retry_after,
+                        "inflight_size": len(inflight),
+                        "max_inflight": max_inflight,
+                    }
+                else:
+                    inflight[ask_request_fingerprint] = {
+                        "owner_request_id": owner_request_id,
+                        "stream": bool(stream),
+                        "started_at": now_monotonic,
+                    }
+                    ask_slot_acquired = True
+                app_metrics.set_ask_inflight(len(inflight))
+
+            if duplicate_meta is not None:
+                app_metrics.record_ask_duplicate(stream=stream, outcome="in_progress")
+                app_metrics.record_ask_admission(outcome="rejected_duplicate", stream=stream)
+                response = JSONResponse(
+                    status_code=409,
+                    content={
+                        "detail": "Duplicate /ask request already in progress in this process.",
+                        "error": "duplicate_request_in_progress",
+                        "retry_after_seconds": duplicate_meta["retry_after_seconds"],
+                        "leader_request_id": duplicate_meta["leader_request_id"],
+                        "contract": "single_node_process_local_duplicate_guard",
+                        "result_status": "error",
+                    },
+                )
+                response.headers["Retry-After"] = str(duplicate_meta["retry_after_seconds"])
+                response.headers["X-Ask-Admission"] = "duplicate_in_progress"
+                response.headers["X-Ask-Fingerprint"] = ask_request_fingerprint[:16]
+                response.headers["X-Ask-Contract"] = "single-node-process-local"
+                return response
+
+            if overload_meta is not None:
+                app_metrics.record_ask_admission(outcome="rejected_overload", stream=stream)
+                response = JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": "Request admission temporarily saturated; please retry shortly.",
+                        "error": "ask_overloaded",
+                        "retry_after_seconds": overload_meta["retry_after_seconds"],
+                        "inflight_requests": overload_meta["inflight_size"],
+                        "max_inflight_requests": overload_meta["max_inflight"],
+                        "contract": "single_node_process_local_backpressure",
+                        "result_status": "error",
+                    },
+                )
+                response.headers["Retry-After"] = str(overload_meta["retry_after_seconds"])
+                response.headers["X-Ask-Admission"] = "overloaded"
+                response.headers["X-Ask-Contract"] = "single-node-process-local"
+                return response
+
+            app_metrics.record_ask_admission(outcome="accepted", stream=stream)
 
         # Background job branch
         if async_job:
@@ -1279,7 +1481,11 @@ async def ask(
                         yield _to_sse_data_frame("[ERROR] Streaming pipeline interrupted before completion.")
                         yield _to_sse_data_frame("[DONE_JSON]" + json.dumps(err_payload, ensure_ascii=False))
                     yield "event: done\ndata: \n\n"
+                finally:
+                    if ask_slot_acquired:
+                        await _release_ask_inflight_key(ask_request_fingerprint)
 
+            stream_cleanup_owner = True
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         # Non‑streaming branch: apply global timeout
@@ -1368,6 +1574,9 @@ async def ask(
     except Exception:
         logger.exception("Unexpected error in /ask")
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        if ask_slot_acquired and not stream_cleanup_owner:
+            await _release_ask_inflight_key(ask_request_fingerprint)
 
 
 @app.get("/booking/handoff/post/{artifact_id}", response_class=HTMLResponse)

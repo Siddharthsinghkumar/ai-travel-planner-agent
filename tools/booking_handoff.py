@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import logging
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -73,6 +74,7 @@ _candidate_fallback_log_counts: TTLCache[str, int] = TTLCache(
     maxsize=5000,
     ttl=max(60, get_env_int("BOOKING_CANDIDATE_FALLBACK_LOG_TTL_SECONDS", 600)),
 )
+_handoff_cache_lock = threading.RLock()
 
 
 class BookingOptionsFetchError(RuntimeError):
@@ -116,8 +118,9 @@ def _should_emit_candidate_fallback_log(
         token_fp=token_fp,
         route_type=route_type,
     )
-    occurrence = int(_candidate_fallback_log_counts.get(key, 0)) + 1
-    _candidate_fallback_log_counts[key] = occurrence
+    with _handoff_cache_lock:
+        occurrence = int(_candidate_fallback_log_counts.get(key, 0)) + 1
+        _candidate_fallback_log_counts[key] = occurrence
     if occurrence == 1:
         return True, occurrence
     if occurrence in {5, 10, 20}:
@@ -176,12 +179,15 @@ def _booking_resolution_cache_key(
 
 
 def _cache_booking_resolution(cache_key: str, payload: Dict[str, Any]) -> None:
-    _booking_resolution_cache[cache_key] = payload
+    with _handoff_cache_lock:
+        _booking_resolution_cache[cache_key] = payload
 
 
 def booking_resolution_cache_stats() -> Dict[str, int]:
+    with _handoff_cache_lock:
+        entries = len(_booking_resolution_cache)
     return {
-        "entries": len(_booking_resolution_cache),
+        "entries": entries,
         "ttl_sec": BOOKING_RESOLUTION_CACHE_TTL_SECONDS,
     }
 
@@ -405,11 +411,12 @@ def register_post_handoff_artifact(
         return None
 
     artifact_id = uuid.uuid4().hex
-    _post_handoff_artifacts[artifact_id] = {
-        "url": canonical_url,
-        "post_data": post_data,
-        "headers": headers or {},
-    }
+    with _handoff_cache_lock:
+        _post_handoff_artifacts[artifact_id] = {
+            "url": canonical_url,
+            "post_data": post_data,
+            "headers": headers or {},
+        }
     persisted = _store_post_handoff_artifact_persistent(
         artifact_id=artifact_id,
         url=canonical_url,
@@ -417,7 +424,8 @@ def register_post_handoff_artifact(
         headers=headers or {},
     )
     if not persisted and POST_HANDOFF_REQUIRE_PERSISTENCE:
-        _post_handoff_artifacts.pop(artifact_id, None)
+        with _handoff_cache_lock:
+            _post_handoff_artifacts.pop(artifact_id, None)
         logger.warning(
             "booking_post_bridge_artifact_rejected_non_persistent",
             extra={
@@ -462,7 +470,8 @@ def consume_post_handoff_artifact_with_diagnostics(
         "booking_post_bridge_lookup_requested",
         extra={"artifact_id_prefix": _artifact_log_id(artifact_id)},
     )
-    artifact = _post_handoff_artifacts.pop(artifact_id, None)
+    with _handoff_cache_lock:
+        artifact = _post_handoff_artifacts.pop(artifact_id, None)
     lookup_result = "not_found"
     if isinstance(artifact, dict):
         _mark_post_handoff_artifact_consumed_persistent(artifact_id)
@@ -931,8 +940,9 @@ async def _fetch_booking_options_payload(
     """
 
     route_type = "round_trip" if return_date else "one_way"
+    max_attempts = max(1, min(BOOKING_OPTIONS_RETRIES, BOOKING_OPTIONS_ATTEMPTS_BUDGET))
 
-    for attempt in range(1, BOOKING_OPTIONS_RETRIES + 1):
+    for attempt in range(1, max_attempts + 1):
         attempt_started = time.monotonic()
         response_flags: Dict[str, Optional[bool]] = {
             "response_has_booking_options": None,
@@ -992,14 +1002,15 @@ async def _fetch_booking_options_payload(
                 "key_index": idx,
                 "engine": str(params.get("engine") or ""),
                 "request_timeout_sec": request_timeout,
-                "retry_limit": BOOKING_OPTIONS_RETRIES,
+                "retry_limit": max_attempts,
+                "attempt_budget": BOOKING_OPTIONS_ATTEMPTS_BUDGET,
                 "client_mode": "shared_get_client",
                 "route_type": route_type,
             }
 
             if resp.status_code != 200:
                 transient = resp.status_code in {408, 429} or resp.status_code >= 500
-                if transient and attempt < BOOKING_OPTIONS_RETRIES:
+                if transient and attempt < max_attempts:
                     await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                     continue
                 if resp.status_code in {401, 403}:
@@ -1081,7 +1092,7 @@ async def _fetch_booking_options_payload(
                         "try again",
                     )
                 )
-                if transient_error and attempt < BOOKING_OPTIONS_RETRIES:
+                if transient_error and attempt < max_attempts:
                     await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                     continue
                 if any(tok in error_text for tok in ("unauthorized", "invalid api key", "invalid key", "access denied")):
@@ -1125,7 +1136,7 @@ async def _fetch_booking_options_payload(
         except BookingOptionsFetchError:
             raise
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
-            if attempt < BOOKING_OPTIONS_RETRIES:
+            if attempt < max_attempts:
                 await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                 continue
             exception_bucket = _classify_booking_options_exception(e)
@@ -1381,7 +1392,8 @@ async def resolve_booking_token_with_details(
         outbound_date=outbound_date,
         return_date=return_date,
     )
-    cached = _booking_resolution_cache.get(cache_key)
+    with _handoff_cache_lock:
+        cached = _booking_resolution_cache.get(cache_key)
     if isinstance(cached, dict):
         cached_kind = str(cached.get("kind") or "")
         if cached_kind == "direct_booking":

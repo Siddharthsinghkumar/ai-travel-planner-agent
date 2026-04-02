@@ -63,6 +63,10 @@ WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS = int(os.getenv("WEATHER_UNAUTHORIZED_COOL
 
 # Retry settings (local)
 MAX_RETRIES = 3
+try:
+    WEATHER_TOTAL_ATTEMPT_BUDGET = max(1, int(os.getenv("WEATHER_TOTAL_ATTEMPT_BUDGET", str(MAX_RETRIES))))
+except Exception:
+    WEATHER_TOTAL_ATTEMPT_BUDGET = MAX_RETRIES
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -243,8 +247,9 @@ async def _make_request_raw(
     # request_id is automatically added to logs by logging configuration
 
     unauthorized_seen = 0
+    attempt_budget = max(1, min(MAX_RETRIES, WEATHER_TOTAL_ATTEMPT_BUDGET))
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(attempt_budget):
         # Reserve a key for the duration of this attempt so it isn't rotated out.
         try:
             async with key_manager.reserve_key("weather") as (idx, key):
@@ -400,7 +405,7 @@ async def _make_request_raw(
                         },
                     )
                     # If not last attempt, sleep and continue to next attempt (which will reserve a fresh key)
-                    if attempt < MAX_RETRIES - 1:
+                    if attempt < attempt_budget - 1:
                         wait_time = (2 ** attempt) + random.uniform(0, 0.3)
                         await asyncio.sleep(wait_time)
                         continue
@@ -418,7 +423,9 @@ async def _make_request_raw(
     # If we exit the attempts loop without success
     if unauthorized_seen:
         raise WeatherAPIError("All weather keys unauthorized or pending activation")
-    raise WeatherAPIError(f"Max retries exceeded, last error: {last_exception}")
+    raise WeatherAPIError(
+        f"Max retries exceeded within budget ({attempt_budget} attempts), last error: {last_exception}"
+    )
 
 # ----------------------------------------------------------------------
 # Public request wrapper with circuit breaker

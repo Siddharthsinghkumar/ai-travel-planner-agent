@@ -186,3 +186,27 @@ async def test_make_request_raw_http_429_uses_retry_after_and_marks_exhausted(mo
     assert "http_429" in mark["reason"]
     assert isinstance(mark["until"], int)
     assert mark["until"] >= int(time.time()) + 5
+
+
+@pytest.mark.asyncio
+async def test_make_request_raw_honors_total_attempt_budget_under_repeated_429(monkeypatch):
+    dummy_km = _DummyKeyManager()
+    client = _DummyClient(
+        [
+            _DummyResponse(status_code=429, text="too many requests", headers={"Retry-After": "1"}),
+            _DummyResponse(status_code=429, text="too many requests", headers={"Retry-After": "1"}),
+            _DummyResponse(status_code=429, text="too many requests", headers={"Retry-After": "1"}),
+        ]
+    )
+
+    monkeypatch.setattr(tools.weather_api, "key_manager", dummy_km)
+    monkeypatch.setattr(tools.weather_api, "get_client", lambda: client)
+    monkeypatch.setattr(tools.weather_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(tools.weather_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(tools.weather_api, "MAX_RETRIES", 5)
+    monkeypatch.setattr(tools.weather_api, "WEATHER_TOTAL_ATTEMPT_BUDGET", 2)
+
+    with pytest.raises(WeatherAPIError, match="within budget \\(2 attempts\\)"):
+        await tools.weather_api._make_request_raw("GET", "https://example.test/weather", {"q": "GOI"})
+
+    assert client.calls == 2

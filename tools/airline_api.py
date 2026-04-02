@@ -116,6 +116,10 @@ _TESTING_LOGGED = False
 SERPAPI_HTTP_TIMEOUT = get_env_float("SERPAPI_HTTP_TIMEOUT", 10.0)
 SERPAPI_MAX_RETRIES = max(1, get_env_int("SERPAPI_MAX_RETRIES", 3))
 SERPAPI_RETRY_BASE_DELAY = max(0.1, get_env_float("SERPAPI_RETRY_BASE_DELAY", 1.0))
+SERPAPI_TOTAL_ATTEMPT_BUDGET = max(
+    SERPAPI_MAX_RETRIES,
+    get_env_int("SERPAPI_TOTAL_ATTEMPT_BUDGET", SERPAPI_MAX_RETRIES * 2),
+)
 
 
 def _health_check_non_destructive_mode() -> bool:
@@ -566,9 +570,11 @@ async def search_flights(
         async def _request_with_key_rotation() -> Tuple[List[Flight], int, Optional[dict]]:
             """Attempt request with key rotation and per‑key retries."""
             key_attempts = 0
-            max_key_attempts = 10  # safety bound
+            max_total_attempts = max(1, SERPAPI_TOTAL_ATTEMPT_BUDGET)
+            max_key_attempts = min(10, max_total_attempts)  # safety bound
+            total_attempts = 0
 
-            while key_attempts < max_key_attempts:
+            while key_attempts < max_key_attempts and total_attempts < max_total_attempts:
                 try:
                     # Reserve a key for the duration of this attempt.
                     # reserve_key returns (index, key) as per design.
@@ -576,6 +582,10 @@ async def search_flights(
                         key_fp = _key_fingerprint(key)
                         # For this key, try up to MAX_RETRIES times (network/5xx retries)
                         for attempt in range(MAX_RETRIES):
+                            if total_attempts >= max_total_attempts:
+                                raise AirlineAPIError(
+                                    f"SerpAPI retry budget exhausted ({max_total_attempts} attempts)"
+                                )
                             attempt_start = time.monotonic()
                             try:
                                 # Wait for the per‑key rate limiter
@@ -595,6 +605,7 @@ async def search_flights(
                                     "client_mode": "shared_get_client",
                                 })
 
+                                total_attempts += 1
                                 response = await client.get(
                                     url,
                                     params=params,
@@ -1047,7 +1058,7 @@ async def search_flights(
 
                                 # Record usage and return
                                 await api_key_manager.record_usage("serpapi", idx)
-                                return parsed_results, attempt + 1, price_insights_raw
+                                return parsed_results, total_attempts, price_insights_raw
 
                             except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
                                 latency = time.monotonic() - attempt_start
@@ -1119,6 +1130,8 @@ async def search_flights(
                     raise AirlineAPIError("All SerpAPI keys exhausted or failed") from e
 
             # If we exit the while loop, all keys exhausted or failed
+            if total_attempts >= max_total_attempts:
+                raise AirlineAPIError(f"SerpAPI retry budget exhausted ({max_total_attempts} attempts)")
             raise AirlineAPIError("All SerpAPI keys exhausted or failed")
 
         # Execute the whole operation under circuit breaker protection

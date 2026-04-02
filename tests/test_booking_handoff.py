@@ -1460,6 +1460,44 @@ async def test_fetch_booking_options_retries_transient_payload_error(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_fetch_booking_options_honors_attempt_budget_under_transient_http_errors(monkeypatch):
+    class _FakeResponse:
+        status_code = 503
+
+        def json(self):
+            return {"error": "temporarily unavailable"}
+
+    class _FakeClient:
+        call_count = 0
+
+        async def get(self, *args, **kwargs):
+            _FakeClient.call_count += 1
+            return _FakeResponse()
+
+    class _ReserveCtx:
+        async def __aenter__(self):
+            return (0, "dummy")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeKeyManager:
+        def reserve_key(self, service_name: str):
+            assert service_name == "serpapi"
+            return _ReserveCtx()
+
+    monkeypatch.setattr(booking_handoff, "_get_booking_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(booking_handoff, "api_key_manager", _FakeKeyManager())
+    monkeypatch.setattr(booking_handoff, "BOOKING_OPTIONS_RETRIES", 5)
+    monkeypatch.setattr(booking_handoff, "BOOKING_OPTIONS_ATTEMPTS_BUDGET", 2)
+    monkeypatch.setattr(booking_handoff, "BOOKING_OPTIONS_RETRY_BACKOFF", 0.0)
+
+    options = await booking_handoff.fetch_booking_options("tok_budget")
+    assert options is None
+    assert _FakeClient.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_build_booking_handoff_url_rejects_wrapped_invalid_token_link(monkeypatch):
     async def fake_resolve_details(_booking_token: str):
         return {

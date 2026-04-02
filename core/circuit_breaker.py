@@ -172,6 +172,7 @@ class AsyncCircuitBreaker:
         self._state = BreakerState.OPEN
         self._opened_at = time.monotonic()
         self._failure_count = 0
+        self._half_open_calls = 0
         self._logger.warning(
             "Circuit breaker opened",
             extra={"event": "breaker_open", "threshold": self.failure_threshold}
@@ -183,7 +184,15 @@ class AsyncCircuitBreaker:
         Record a success and close the circuit if in half‑open.
         Must be called while holding the lock.
         """
-        if self._state in (BreakerState.HALF_OPEN, BreakerState.OPEN):
+        if self._state == BreakerState.OPEN:
+            # Late success from an older call must not close an already-open breaker.
+            self._logger.debug(
+                "Ignoring success while circuit is OPEN",
+                extra={"event": "breaker_success_ignored_open"},
+            )
+            return
+
+        if self._state == BreakerState.HALF_OPEN:
             self._state = BreakerState.CLOSED
             self._logger.info(
                 "Circuit breaker closed after successful call",
@@ -192,6 +201,19 @@ class AsyncCircuitBreaker:
 
         self._failure_count = 0
         self._half_open_calls = 0
+
+    async def _release_half_open_slot_neutral(self, *, reason: str) -> None:
+        """
+        Release a HALF_OPEN slot for neutral outcomes (e.g. cancellation/non-failure).
+        Prevents HALF_OPEN limit leaks over long-lived runtimes.
+        Must be called while holding the lock.
+        """
+        if self._state == BreakerState.HALF_OPEN and self._half_open_calls > 0:
+            self._half_open_calls -= 1
+            self._logger.info(
+                "Released HALF_OPEN probe slot for neutral outcome",
+                extra={"event": "breaker_half_open_slot_released", "reason": reason},
+            )
 
     # ----------------------------------------------------------------------
     # Metrics helper
@@ -253,11 +275,10 @@ class AsyncCircuitBreaker:
                     extra={"event": "breaker_cancelled_failure"},
                 )
             else:
-                self._emit_metric("circuit.cancelled", {"cancelled": True})
-                self._logger.info(
-                    "Circuit breaker observed cancellation (neutral)",
-                    extra={"event": "breaker_cancelled"},
-                )
+                async with self._lock:
+                    await self._release_half_open_slot_neutral(reason="cancelled")
+                    self._emit_metric("circuit.cancelled", {"cancelled": True})
+                self._logger.info("Circuit breaker observed cancellation (neutral)", extra={"event": "breaker_cancelled"})
             raise
         except Exception:
             # Failure path
@@ -313,11 +334,15 @@ class AsyncCircuitBreaker:
                 )
             else:
                 # Treat caller cancellation as a neutral outcome unless explicitly configured.
-                self._emit_metric("circuit.cancelled", {"cancel": True})
+                async with self._lock:
+                    await self._release_half_open_slot_neutral(reason="generator_cancelled")
+                    self._emit_metric("circuit.cancelled", {"cancel": True})
                 self._logger.info("Circuit breaker observed cancellation", extra={"event": "breaker_cancelled"})
             raise
         except Exception as exc:
             if non_failure_exceptions and isinstance(exc, non_failure_exceptions):
+                async with self._lock:
+                    await self._release_half_open_slot_neutral(reason="non_failure_exception")
                 raise
             async with self._lock:
                 await self._record_failure()

@@ -30,6 +30,23 @@ HTTP_INFLIGHT = Gauge(
     "In-flight HTTP requests"
 )
 
+ASK_INFLIGHT = Gauge(
+    "ask_inflight_requests",
+    "In-flight /ask requests admitted for execution"
+)
+
+ASK_ADMISSION = Counter(
+    "ask_admission_total",
+    "Admission outcomes for /ask requests",
+    ["outcome", "stream"]
+)
+
+ASK_DUPLICATES = Counter(
+    "ask_duplicates_total",
+    "Duplicate /ask request handling outcomes",
+    ["stream", "outcome"]
+)
+
 # Airline API metrics
 AIRLINE_RETRIES = Counter(
     "airline_retries_total",
@@ -238,6 +255,32 @@ def inc_http_inflight() -> None:
 
 def dec_http_inflight() -> None:
     HTTP_INFLIGHT.dec()
+
+
+def inc_ask_inflight() -> None:
+    ASK_INFLIGHT.inc()
+
+
+def dec_ask_inflight() -> None:
+    ASK_INFLIGHT.dec()
+
+
+def set_ask_inflight(value: int) -> None:
+    ASK_INFLIGHT.set(max(0, int(value)))
+
+
+def record_ask_admission(outcome: str, stream: bool) -> None:
+    ASK_ADMISSION.labels(
+        outcome=(outcome or "unknown"),
+        stream=("true" if stream else "false"),
+    ).inc()
+
+
+def record_ask_duplicate(stream: bool, outcome: str) -> None:
+    ASK_DUPLICATES.labels(
+        stream=("true" if stream else "false"),
+        outcome=(outcome or "unknown"),
+    ).inc()
 
 
 def record_stream_init_timeout(provider: str) -> None:

@@ -1,6 +1,7 @@
 # tests/test_cloud_provider.py
 import pytest
 import types
+import time
 
 import agents.cloud_llm as cloud_llm
 
@@ -11,10 +12,11 @@ def _enable_cloud_by_default(monkeypatch):
 
 
 class FakeAdapter:
-    def __init__(self, name, response=None, raise_on_call=False):
+    def __init__(self, name, response=None, raise_on_call=False, ping_error=None):
         self.provider = name
         self._response = response
         self._raise = raise_on_call
+        self._ping_error = ping_error
 
     async def create_completion(self, model, messages, temperature, max_tokens, timeout):
         if self._raise:
@@ -41,6 +43,18 @@ class FakeAdapter:
                 def __init__(self, delta): self.choices = [FakeChoice(FakeDelta(delta))]
             yield FakeChunk(self._response)
         return gen()
+
+    async def ping(self, _model):
+        if self._ping_error is not None:
+            raise self._ping_error
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider_cooldowns():
+    cloud_llm._PROVIDER_FAIL_COOLDOWNS.clear()
+    yield
+    cloud_llm._PROVIDER_FAIL_COOLDOWNS.clear()
 
 @pytest.mark.asyncio
 async def test_generate_prefers_first_provider():
@@ -182,3 +196,64 @@ def test_provider_runtime_status_reports_gemini_uninitialized_reason(monkeypatch
     assert gemini.get("configured") is True
     assert gemini.get("initialized") is False
     assert gemini.get("reason") == "gemini_helper_disabled"
+
+
+def test_classify_provider_health_failure_reason_classes():
+    assert cloud_llm._classify_provider_health_failure(RuntimeError("401 unauthorized")) == "auth"
+    assert cloud_llm._classify_provider_health_failure(RuntimeError("insufficient_quota")) == "quota"
+    assert cloud_llm._classify_provider_health_failure(RuntimeError("rate limit 429")) == "rate_limit"
+    assert cloud_llm._classify_provider_health_failure(RuntimeError("network timeout")) == "transient"
+    assert cloud_llm._classify_provider_health_failure(RuntimeError("Circuit breaker open")) == "circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_health_check_auth_cooldown_and_recovery(monkeypatch):
+    adapter = FakeAdapter("openai", ping_error=RuntimeError("401 unauthorized"))
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("openai", adapter, (Exception,))])
+    monkeypatch.setattr(cloud_llm, "refresh_provider_chain_from_env", lambda force=False: None)
+    monkeypatch.setattr(cloud_llm, "PROVIDER_AUTH_FAIL_COOLDOWN", 120)
+
+    async def _usable():
+        return ["openai"]
+
+    monkeypatch.setattr(cloud_llm, "get_usable_providers", _usable)
+
+    first = await cloud_llm.health_check()
+    assert first == "fail"
+    cooldown_until = cloud_llm._PROVIDER_FAIL_COOLDOWNS.get("openai", 0)
+    assert cooldown_until > time.time() + 100
+
+    # Provider would now succeed, but active cooldown should defer probing.
+    adapter._ping_error = None
+    second = await cloud_llm.health_check()
+    assert second == "fail"
+
+    # Once cooldown expires, probing resumes and provider can recover to healthy.
+    cloud_llm._PROVIDER_FAIL_COOLDOWNS["openai"] = time.time() - 1
+    third = await cloud_llm.health_check()
+    assert third == "ok"
+    assert "openai" not in cloud_llm._PROVIDER_FAIL_COOLDOWNS
+
+
+@pytest.mark.asyncio
+async def test_health_check_transient_cooldown_and_prunes_unconfigured_entries(monkeypatch):
+    adapter = FakeAdapter("openai", ping_error=RuntimeError("temporary network timeout"))
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("openai", adapter, (Exception,))])
+    monkeypatch.setattr(cloud_llm, "refresh_provider_chain_from_env", lambda force=False: None)
+    monkeypatch.setattr(cloud_llm, "PROVIDER_TRANSIENT_FAIL_COOLDOWN", 7)
+
+    async def _usable():
+        return ["openai"]
+
+    monkeypatch.setattr(cloud_llm, "get_usable_providers", _usable)
+
+    cloud_llm._PROVIDER_FAIL_COOLDOWNS["orphan-provider"] = time.time() + 999
+    started = time.time()
+
+    status = await cloud_llm.health_check()
+
+    assert status == "fail"
+    assert "orphan-provider" not in cloud_llm._PROVIDER_FAIL_COOLDOWNS
+    openai_until = cloud_llm._PROVIDER_FAIL_COOLDOWNS.get("openai", 0)
+    assert openai_until >= started + 5
+    assert openai_until <= started + 15

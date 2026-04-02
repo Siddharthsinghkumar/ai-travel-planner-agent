@@ -39,6 +39,11 @@ POLICIES = {
     "weather": "daily"
 }
 
+RATE_LIMIT_COOLDOWN_SECONDS = max(30, get_env_int("KEY_RATE_LIMIT_COOLDOWN_SECONDS", 3600))
+TRANSIENT_COOLDOWN_SECONDS = max(5, get_env_int("KEY_TRANSIENT_COOLDOWN_SECONDS", 300))
+CIRCUIT_OPEN_COOLDOWN_SECONDS = max(5, get_env_int("KEY_CIRCUIT_OPEN_COOLDOWN_SECONDS", 120))
+AUTH_FAILURE_COOLDOWN_SECONDS = max(300, get_env_int("KEY_AUTH_FAILURE_COOLDOWN_SECONDS", 86400))
+
 # patterns to find numbered keys in env
 ENV_PATTERNS = {
     "serpapi": re.compile(r"SERPAPI_KEY_(\d+)"),
@@ -86,19 +91,69 @@ def _compute_exhaustion_until(service: str, reset_at: Optional[Union[datetime, f
         reset_dt = now_dt + timedelta(days=1)
     return reset_dt.timestamp()
 
+
+def _normalize_reason_class(reason: str) -> str:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return "unknown"
+
+    if any(token in text for token in ("circuit_open", "circuit breaker open", "circuit breaker")):
+        return "circuit_open"
+    if any(token in text for token in ("unauthorized", "invalid_key", "invalid api key", "forbidden", "access denied", "401", "403")):
+        return "auth"
+    if any(token in text for token in ("quota", "insufficient_quota", "billing", "payment required", "plan_searches_left")):
+        return "quota"
+    if any(token in text for token in ("rate_limit", "rate limit", "ratelimit", "too many requests", "429", "http_429")):
+        return "rate_limit"
+    if any(token in text for token in ("timeout", "timed out", "network", "connect", "temporar", "transient", "unavailable", "http_5xx", "5xx", "503", "502", "504")):
+        return "transient"
+    return "unknown"
+
+
+def _future_ts_or_none(value: Optional[Union[float, int]], now_ts: float) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+    except Exception:
+        return None
+    if ts <= now_ts:
+        return None
+    return ts
+
+
+def _merge_exhaustion_until(
+    current_until: Optional[float],
+    candidate_until: Optional[float],
+    now_ts: float,
+) -> Optional[float]:
+    """
+    Keep exhaustion timestamps monotonic for active quarantines.
+    Never shortens an active exhaustion window due to a later weaker signal.
+    """
+    current_future = _future_ts_or_none(current_until, now_ts)
+    candidate_future = _future_ts_or_none(candidate_until, now_ts)
+    if current_future and candidate_future:
+        return max(current_future, candidate_future)
+    return current_future or candidate_future
+
 def _exhaustion_ttl_for_error(service: str, reason: str) -> float:
     """Return an appropriate exhaustion timestamp based on the error reason."""
     now_dt = _now()
-    if reason in ("unauthorized", "invalid_key"):
-        # Permanent until manually fixed
-        return datetime.max.replace(tzinfo=UTC).timestamp()
-    if reason == "rate_limit":
-        # Short backoff (1 hour)
-        return (now_dt + timedelta(hours=1)).timestamp()
-    if reason == "quota_exceeded":
-        # Use service's normal policy (daily/monthly)
+    reason_class = _normalize_reason_class(reason)
+    if reason_class == "auth":
+        # Auth failures are usually configuration/key issues and should not flap rapidly.
+        return (now_dt + timedelta(seconds=AUTH_FAILURE_COOLDOWN_SECONDS)).timestamp()
+    if reason_class == "rate_limit":
+        return (now_dt + timedelta(seconds=RATE_LIMIT_COOLDOWN_SECONDS)).timestamp()
+    if reason_class == "quota":
+        # Quota tracks service policy horizon (daily/monthly/etc).
         return _compute_exhaustion_until(service)
-    # Default fallback
+    if reason_class == "circuit_open":
+        return (now_dt + timedelta(seconds=CIRCUIT_OPEN_COOLDOWN_SECONDS)).timestamp()
+    if reason_class == "transient":
+        return (now_dt + timedelta(seconds=TRANSIENT_COOLDOWN_SECONDS)).timestamp()
+    # Unknown defaults to service policy.
     return _compute_exhaustion_until(service)
 
 def _try_acquire_lockfile(lockfile_path: str):
@@ -162,6 +217,9 @@ class KeyEntry:
     _pending_exhaust_until: Optional[float] = None
     # Pending clear (set when a listener wants to clear/remove key after usage)
     _pending_clear: bool = False
+    last_exhausted_reason: Optional[str] = None
+    last_exhausted_reason_class: Optional[str] = None
+    last_exhausted_at: Optional[float] = None
     # Per‑key lock for atomic in_use operations
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False)
 
@@ -185,6 +243,69 @@ class APIKeyManager:
         # initial load: first from state file, then from environment
         self._load_initial_state()
         # No auto-start of refresh loop – caller must start explicitly
+
+    def _snapshot_exhaustion_state_locked(self) -> Dict[str, Any]:
+        now_ts = _now_ts()
+        state: Dict[str, Any] = {}
+        for service, entries in self._keys.items():
+            svc_state = {}
+            for ke in entries:
+                until_ts = _future_ts_or_none(ke.exhausted_until, now_ts)
+                if until_ts is None:
+                    continue
+                svc_state[ke.fingerprint] = {"exhausted_until": until_ts}
+            if svc_state:
+                state[service] = svc_state
+        return state
+
+    def _sweep_key_invariants_locked(self) -> bool:
+        """
+        Normalize key state for long-lived stability.
+        Returns True when any in-memory state changed.
+        Must be called with self._lock held.
+        """
+        changed = False
+        now_ts = _now_ts()
+
+        for service, entries in self._keys.items():
+            for idx, ke in enumerate(entries):
+                if ke.in_use < 0:
+                    logger.warning(
+                        "Corrected negative in_use count",
+                        extra={"service": service, "index": idx, "in_use_before": ke.in_use},
+                    )
+                    ke.in_use = 0
+                    changed = True
+
+                normalized_exhausted = _future_ts_or_none(ke.exhausted_until, now_ts)
+                if normalized_exhausted != ke.exhausted_until:
+                    ke.exhausted_until = normalized_exhausted
+                    changed = True
+
+                if ke._pending_exhaust:
+                    pending_until = _future_ts_or_none(ke._pending_exhaust_until, now_ts)
+                    if pending_until is None:
+                        ke._pending_exhaust = False
+                        ke._pending_exhaust_until = None
+                        changed = True
+                    elif ke.in_use == 0:
+                        merged = _merge_exhaustion_until(ke.exhausted_until, pending_until, now_ts)
+                        if merged != ke.exhausted_until:
+                            ke.exhausted_until = merged
+                        ke._pending_exhaust = False
+                        ke._pending_exhaust_until = None
+                        changed = True
+                elif ke._pending_exhaust_until is not None:
+                    ke._pending_exhaust_until = None
+                    changed = True
+
+        for service, entries in self._keys.items():
+            if entries:
+                self._rr_index[service] = int(self._rr_index.get(service, 0)) % len(entries)
+            else:
+                self._rr_index[service] = 0
+
+        return changed
 
     # ---------- fingerprint ----------
     @staticmethod
@@ -235,20 +356,15 @@ class APIKeyManager:
            without holding the lock (to avoid blocking other ops)."""
         # Build snapshot under global lock
         async with self._lock:
-            state = {}
-            for service, entries in self._keys.items():
-                svc_state = {}
-                for ke in entries:
-                    if ke.exhausted_until is not None:
-                        svc_state[ke.fingerprint] = {"exhausted_until": ke.exhausted_until}
-                if svc_state:
-                    state[service] = svc_state
+            self._sweep_key_invariants_locked()
+            state = self._snapshot_exhaustion_state_locked()
         # write file (sync) outside lock
         self._write_state_file(state)
 
     def _load_initial_state(self):
         """Load persisted exhaustion data and merge with environment (blocking, called at init)."""
         persisted = self._load_state_file()
+        now_ts = _now_ts()
         # Parse environment
         env_keys = self._parse_env_keys()
         if self._last_env_scan_meta:
@@ -266,7 +382,7 @@ class APIKeyManager:
                 # check persisted state for this fingerprint
                 svc_state = persisted.get(service, {})
                 if fp in svc_state:
-                    exhausted = svc_state[fp].get("exhausted_until")
+                    exhausted = _future_ts_or_none(svc_state[fp].get("exhausted_until"), now_ts)
                 entries.append(KeyEntry(value=key, fingerprint=fp, exhausted_until=exhausted))
             self._keys[service] = entries
             self._rr_index[service] = 0
@@ -416,6 +532,14 @@ class APIKeyManager:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             logger.warning("start_refresh_loop called without a running event loop; skipping.")
+            if self._lockfile_fd is not None:
+                try:
+                    fcntl.flock(self._lockfile_fd, fcntl.LOCK_UN)
+                    os.close(self._lockfile_fd)
+                except Exception:
+                    logger.exception("Error releasing lockfile after loop-start failure")
+                finally:
+                    self._lockfile_fd = None
             return
 
         self._refresh_task = loop.create_task(self._refresh_loop())
@@ -423,6 +547,7 @@ class APIKeyManager:
 
     def stop_refresh_loop(self):
         """Stop the background refresh task and release the lockfile."""
+        self._stop_refresh.set()
         if self._refresh_task:
             self._refresh_task.cancel()
             self._refresh_task = None
@@ -507,7 +632,7 @@ class APIKeyManager:
 
             # Treat index shifts as real changes. We compare index->fingerprint maps
             # directly (not only set equality) so listeners can evict stale idx caches.
-            changed = (old_fingerprint_maps != new_fingerprint_maps)
+            fingerprint_changed = (old_fingerprint_maps != new_fingerprint_maps)
 
             # Compute affected (service, idx) pairs where fingerprint changed
             affected = []
@@ -521,34 +646,31 @@ class APIKeyManager:
                         affected.append((svc, idx))
 
             self._keys = new_keys
-
-            # Build persistence snapshot if changed
+            state_sanitized = self._sweep_key_invariants_locked()
+            changed = bool(fingerprint_changed or state_sanitized)
             persist_state: Dict[str, Any] = {}
             if changed:
-                for svc, entries in new_keys.items():
-                    svc_state = {}
-                    for ke in entries:
-                        if ke.exhausted_until is not None:
-                            svc_state[ke.fingerprint] = {"exhausted_until": ke.exhausted_until}
-                    if svc_state:
-                        persist_state[svc] = svc_state
+                persist_state = self._snapshot_exhaustion_state_locked()
 
         # Outside lock: write state file and notify if changed
         if changed:
             # Always write changed snapshots, including {}.
             # This prevents stale on-disk exhaustion state from lingering after clears.
             self._write_state_file(persist_state)
-            logger.info(
-                "Key set changed – triggering callbacks",
-                extra=(self._last_env_scan_meta or None),
-            )
-            asyncio.create_task(self._notify_listeners("env_changed", {
-                "old_fingerprint_maps": old_fingerprint_maps,
-                "new_fingerprint_maps": new_fingerprint_maps,
-                "affected": affected,
-            }))
+            if fingerprint_changed:
+                logger.info(
+                    "Key set changed – triggering callbacks",
+                    extra=(self._last_env_scan_meta or None),
+                )
+                asyncio.create_task(self._notify_listeners("env_changed", {
+                    "old_fingerprint_maps": old_fingerprint_maps,
+                    "new_fingerprint_maps": new_fingerprint_maps,
+                    "affected": affected,
+                }))
+            else:
+                logger.debug("Key state normalized without keyset fingerprint changes")
 
-        return changed
+        return bool(fingerprint_changed)
 
     # ---------- key selection (round-robin, skip exhausted/in_use/pending_clear) ----------
     async def _pick_active_key(self, service: str) -> Tuple[Optional[int], Optional[KeyEntry]]:
@@ -583,11 +705,20 @@ class APIKeyManager:
                    # use the key
            Raises RuntimeError if no key available.
         """
-        # Step 1: pick a key (under global lock)
+        persist_state: Optional[Dict[str, Any]] = None
+        pending_exhaust_event: Optional[dict] = None
+        key_released_event: Optional[dict] = None
+
+        # Step 1: sweep invariants and pick a key (under global lock)
         async with self._lock:
+            if self._sweep_key_invariants_locked():
+                persist_state = self._snapshot_exhaustion_state_locked()
             idx, ke = await self._pick_active_key(service)
             if ke is None:
                 raise RuntimeError(f"No available keys for service: {service}")
+
+        if persist_state is not None:
+            self._write_state_file(persist_state)
 
         # Step 2: acquire the key's lock and increment in_use
         async with ke.lock:
@@ -598,46 +729,78 @@ class APIKeyManager:
         finally:
             # Step 3: decrement in_use under the key's lock
             async with ke.lock:
-                ke.in_use = max(0, ke.in_use - 1)
+                ke.in_use -= 1
+                if ke.in_use < 0:
+                    logger.warning(
+                        "reserve_key release corrected negative in_use",
+                        extra={"service": service, "index": idx, "in_use_before_correction": ke.in_use},
+                    )
+                    ke.in_use = 0
                 # If there was a pending exhaustion, apply it now that no one is using the key
                 if ke._pending_exhaust and ke.in_use == 0:
-                    ke.exhausted_until = ke._pending_exhaust_until
+                    now_ts = _now_ts()
+                    ke.exhausted_until = _merge_exhaustion_until(
+                        ke.exhausted_until,
+                        ke._pending_exhaust_until,
+                        now_ts,
+                    )
                     ke._pending_exhaust = False
                     ke._pending_exhaust_until = None
-                    await self._persist_exhaustion()
-                    logger.debug("Applied pending exhaustion for key", extra={"service": service, "index": idx})
-                    # Notify listeners that exhaustion was applied
-                    asyncio.create_task(self._notify_listeners("key_exhausted", {
-                        "service": service,
-                        "index": idx,
-                        "reason": "(pending applied)",
-                        "until": datetime.fromtimestamp(ke.exhausted_until, tz=UTC).isoformat(),
-                        "pending": False
-                    }))
+                    if ke.exhausted_until is not None:
+                        pending_exhaust_event = {
+                            "service": service,
+                            "index": idx,
+                            "reason": ke.last_exhausted_reason or "(pending applied)",
+                            "reason_class": ke.last_exhausted_reason_class or "unknown",
+                            "until": datetime.fromtimestamp(ke.exhausted_until, tz=UTC).isoformat(),
+                            "pending": False,
+                        }
+                        logger.debug(
+                            "Applied pending exhaustion for key",
+                            extra={"service": service, "index": idx, "reason_class": pending_exhaust_event["reason_class"]},
+                        )
                 # If there is a pending clear, notify now that usage has ended
                 if ke._pending_clear and ke.in_use == 0:
                     ke._pending_clear = False
-                    asyncio.create_task(self._notify_listeners("key_no_longer_in_use", {
+                    key_released_event = {
                         "service": service,
-                        "index": idx
-                    }))
+                        "index": idx,
+                    }
+
+            if pending_exhaust_event is not None:
+                async with self._lock:
+                    self._sweep_key_invariants_locked()
+                    persist_state = self._snapshot_exhaustion_state_locked()
+                self._write_state_file(persist_state)
+                asyncio.create_task(self._notify_listeners("key_exhausted", pending_exhaust_event))
+
+            if key_released_event is not None:
+                asyncio.create_task(self._notify_listeners("key_no_longer_in_use", key_released_event))
 
     # ---------- legacy: simple get_key (does not reserve) ----------
     async def get_key(self, service: str) -> Tuple[Optional[str], Optional[int]]:
         """Legacy method: returns (key_value, index) for the first available key,
            without incrementing in_use. Prefer reserve_key() for new code."""
+        persist_state: Optional[Dict[str, Any]] = None
+        result: Tuple[Optional[str], Optional[int]] = (None, None)
         async with self._lock:
+            if self._sweep_key_invariants_locked():
+                persist_state = self._snapshot_exhaustion_state_locked()
             entries = self._keys.get(service)
             if not entries:
-                return None, None
-            now = _now_ts()
-            for idx, ke in enumerate(entries):
-                if ke.exhausted_until and ke.exhausted_until > now:
-                    continue
-                if ke._pending_clear:
-                    continue
-                return ke.value, idx
-            return None, None
+                result = (None, None)
+            else:
+                now = _now_ts()
+                for idx, ke in enumerate(entries):
+                    if ke.exhausted_until and ke.exhausted_until > now:
+                        continue
+                    if ke._pending_clear:
+                        continue
+                    result = (ke.value, idx)
+                    break
+        if persist_state is not None:
+            self._write_state_file(persist_state)
+        return result
 
     # ---------- exhaustion marking ----------
     async def mark_exhausted(self, service: str, idx: int, reason: str = "",
@@ -655,6 +818,8 @@ class APIKeyManager:
             reset_at = until
 
         persist_state = None  # will hold snapshot if we need to write disk
+        now_ts = _now_ts()
+        reason_class = _normalize_reason_class(reason)
 
         async with self._lock:
             try:
@@ -674,46 +839,68 @@ class APIKeyManager:
             else:
                 until_ts = _exhaustion_ttl_for_error(service, reason)
 
-            until_iso = datetime.fromtimestamp(until_ts, tz=UTC).isoformat()
+            merged_until = _merge_exhaustion_until(ke.exhausted_until, until_ts, now_ts)
+            pending_merged_until = _merge_exhaustion_until(ke._pending_exhaust_until, until_ts, now_ts)
+            requested_until_iso = datetime.fromtimestamp(until_ts, tz=UTC).isoformat()
+            ke.last_exhausted_reason = reason
+            ke.last_exhausted_reason_class = reason_class
+            ke.last_exhausted_at = now_ts
 
             if ke.in_use > 0:
                 # Defer exhaustion until key is released
-                ke._pending_exhaust = True
-                ke._pending_exhaust_until = until_ts
+                ke._pending_exhaust = pending_merged_until is not None
+                ke._pending_exhaust_until = pending_merged_until
+                pending_until_iso = (
+                    datetime.fromtimestamp(pending_merged_until, tz=UTC).isoformat()
+                    if pending_merged_until is not None
+                    else requested_until_iso
+                )
                 logger.info("Key marked exhausted (pending)", extra={
-                    "service": service, "index": idx, "until": until_iso, "reason": reason
+                    "service": service, "index": idx, "until": pending_until_iso, "reason": reason, "reason_class": reason_class
                 })
                 asyncio.create_task(self._notify_listeners("key_exhausted", {
                     "service": service,
                     "index": idx,
                     "reason": reason,
-                    "until": until_iso,
+                    "reason_class": reason_class,
+                    "until": pending_until_iso,
                     "pending": True
                 }))
             else:
                 # Apply immediately
-                ke.exhausted_until = until_ts
+                ke.exhausted_until = merged_until
+                effective_until_iso = (
+                    datetime.fromtimestamp(ke.exhausted_until, tz=UTC).isoformat()
+                    if ke.exhausted_until is not None
+                    else requested_until_iso
+                )
 
-                # Build disk snapshot NOW while lock is held (avoids re-entering lock)
-                persist_state = {}
-                for svc, entries in self._keys.items():
-                    svc_state = {}
-                    for e in entries:
-                        if e.exhausted_until is not None:
-                            svc_state[e.fingerprint] = {"exhausted_until": e.exhausted_until}
-                    if svc_state:
-                        persist_state[svc] = svc_state
-
-                logger.info("Key marked exhausted", extra={
-                    "service": service, "index": idx, "until": until_iso, "reason": reason
-                })
+                logger.info(
+                    "Key marked exhausted",
+                    extra={
+                        "service": service,
+                        "index": idx,
+                        "until": effective_until_iso,
+                        "reason": reason,
+                        "reason_class": reason_class,
+                        "existing_extended": bool(
+                            _future_ts_or_none(ke.exhausted_until, now_ts)
+                            and _future_ts_or_none(until_ts, now_ts)
+                            and ke.exhausted_until != until_ts
+                        ),
+                    },
+                )
                 asyncio.create_task(self._notify_listeners("key_exhausted", {
                     "service": service,
                     "index": idx,
                     "reason": reason,
-                    "until": until_iso,
+                    "reason_class": reason_class,
+                    "until": effective_until_iso,
                     "pending": False
                 }))
+
+            self._sweep_key_invariants_locked()
+            persist_state = self._snapshot_exhaustion_state_locked()
 
         # ── Outside the lock: write disk safely, no deadlock ──
         if persist_state is not None:
@@ -735,17 +922,8 @@ class APIKeyManager:
                     ke._pending_exhaust_until = None
                     changed = True
                 if changed:
-                    # Snapshot while lock is held; write outside lock to avoid re-entry deadlock.
-                    persist_state = {}
-                    for svc, entries in self._keys.items():
-                        svc_state = {}
-                        for entry in entries:
-                            if entry.exhausted_until is not None:
-                                svc_state[entry.fingerprint] = {
-                                    "exhausted_until": entry.exhausted_until
-                                }
-                        if svc_state:
-                            persist_state[svc] = svc_state
+                    self._sweep_key_invariants_locked()
+                    persist_state = self._snapshot_exhaustion_state_locked()
                     logger.info("Key cleared from exhausted state", extra={"service": service, "index": idx})
             except (KeyError, IndexError):
                 pass
@@ -755,14 +933,21 @@ class APIKeyManager:
     async def mark_key_pending_clear(self, service: str, idx: int):
         """Mark a key for later cleanup (e.g., remove from rotation). When the key is no longer in use,
            the manager will trigger a 'key_no_longer_in_use' event so listeners can act."""
+        release_event: Optional[dict] = None
         async with self._lock:
             try:
                 ke = self._keys[service][idx]
                 if not ke._pending_clear:
                     ke._pending_clear = True
                     logger.info("Key marked pending clear", extra={"service": service, "index": idx})
+                if ke.in_use == 0:
+                    # Do not leave a ghost pending flag when no active holders exist.
+                    ke._pending_clear = False
+                    release_event = {"service": service, "index": idx}
             except (KeyError, IndexError):
                 pass
+        if release_event is not None:
+            asyncio.create_task(self._notify_listeners("key_no_longer_in_use", release_event))
 
     async def clear_pending_flag(self, service: str, idx: int):
         """Manually clear the pending_clear flag (if set)."""
@@ -807,7 +992,10 @@ class APIKeyManager:
     # ---------- debug status ----------
     async def status(self) -> Dict[str, List[Dict]]:
         """Return safe debug info: per service a list of dicts with index, active, in_use, exhausted_until."""
+        persist_state: Optional[Dict[str, Any]] = None
         async with self._lock:
+            if self._sweep_key_invariants_locked():
+                persist_state = self._snapshot_exhaustion_state_locked()
             out = {}
             for svc, entries in self._keys.items():
                 lst = []
@@ -824,9 +1012,17 @@ class APIKeyManager:
                         "exhausted_until": exhausted_iso,
                         "pending_exhaust": ke._pending_exhaust,
                         "pending_clear": ke._pending_clear,
+                        "last_exhausted_reason_class": ke.last_exhausted_reason_class,
+                        "last_exhausted_at": (
+                            datetime.fromtimestamp(ke.last_exhausted_at, tz=UTC).isoformat()
+                            if ke.last_exhausted_at
+                            else None
+                        ),
                     })
                 out[svc] = lst
-            return out
+        if persist_state is not None:
+            self._write_state_file(persist_state)
+        return out
 
     # ---------- public aliases (used by app.py and health.py) ----------
     async def load_env_keys(self):

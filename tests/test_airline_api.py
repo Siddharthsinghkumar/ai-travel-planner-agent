@@ -2,6 +2,7 @@ import contextlib
 from unittest.mock import AsyncMock
 
 import pytest
+import httpx
 
 import tools.airline_api as airline_api
 from tools.airline_api import (
@@ -163,6 +164,40 @@ async def test_search_flights_marks_key_exhausted_on_http_403(monkeypatch):
     assert mark["service"] == "serpapi"
     assert mark["idx"] == 0
     assert "unauthorized_http_403" in mark["reason"]
+
+
+@pytest.mark.asyncio
+async def test_search_flights_honors_total_attempt_budget_under_degraded_network(monkeypatch):
+    dummy_km = _DummyKeyManager()
+
+    class _RaisingClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, *_args, **_kwargs):
+            self.calls += 1
+            raise httpx.TimeoutException("simulated timeout")
+
+    client = _RaisingClient()
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", dummy_km)
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(airline_api, "SERPAPI_MAX_RETRIES", 5)
+    monkeypatch.setattr(airline_api, "SERPAPI_TOTAL_ATTEMPT_BUDGET", 2)
+    monkeypatch.setattr(airline_api, "SERPAPI_RETRY_BASE_DELAY", 0.0)
+
+    with pytest.raises(AirlineAPIError, match="retry budget exhausted"):
+        await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio

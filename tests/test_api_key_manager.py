@@ -143,3 +143,97 @@ async def test_reload_env_keys_writes_empty_state_when_exhaustion_clears(monkeyp
     assert changed is True
     assert writes
     assert writes[-1] == {}
+
+
+@pytest.mark.asyncio
+async def test_mark_exhausted_keeps_monotonic_exhaustion_window(monkeypatch):
+    km = APIKeyManager()
+    first_until = time.time() + 300
+    km._keys = {
+        "openai": [KeyEntry(value="openai-key", fingerprint=km._fingerprint("openai-key"), exhausted_until=first_until)]
+    }
+    km._rr_index = {"openai": 0}
+    monkeypatch.setattr(km, "_write_state_file", lambda _state: None)
+
+    await km.mark_exhausted("openai", 0, until=time.time() + 10, reason="transient timeout")
+
+    assert km._keys["openai"][0].exhausted_until >= (first_until - 0.001)
+
+
+@pytest.mark.asyncio
+async def test_status_sweep_clears_expired_pending_exhaustion(monkeypatch):
+    km = APIKeyManager()
+    key = KeyEntry(value="gemini-key", fingerprint=km._fingerprint("gemini-key"))
+    key.in_use = 1
+    key._pending_exhaust = True
+    key._pending_exhaust_until = time.time() - 5
+    km._keys = {"gemini": [key]}
+    km._rr_index = {"gemini": 0}
+    writes = []
+    monkeypatch.setattr(km, "_write_state_file", lambda state: writes.append(state))
+
+    await km.status()
+
+    assert key._pending_exhaust is False
+    assert key._pending_exhaust_until is None
+    assert writes
+    assert writes[-1] == {}
+
+
+@pytest.mark.asyncio
+async def test_mark_key_pending_clear_does_not_stick_when_not_in_use():
+    km = APIKeyManager()
+    key = KeyEntry(value="anthropic-key", fingerprint=km._fingerprint("anthropic-key"))
+    km._keys = {"anthropic": [key]}
+    km._rr_index = {"anthropic": 0}
+
+    await km.mark_key_pending_clear("anthropic", 0)
+
+    assert key._pending_clear is False
+
+
+def test_load_initial_state_discards_expired_persisted_exhaustion(monkeypatch):
+    km = APIKeyManager()
+    key = "openai-k1"
+    fp = km._fingerprint(key)
+
+    monkeypatch.setattr(
+        km,
+        "_load_state_file",
+        lambda: {"openai": {fp: {"exhausted_until": time.time() - 30}}},
+    )
+    monkeypatch.setattr(km, "_parse_env_keys", lambda: {"openai": [key]})
+
+    km._load_initial_state()
+
+    assert km._keys["openai"][0].exhausted_until is None
+
+
+def test_start_refresh_loop_releases_lockfile_when_event_loop_missing(monkeypatch):
+    km = APIKeyManager()
+    fake_fd = 123
+    lock_calls = {"flock": 0, "close": 0}
+
+    monkeypatch.setattr(key_manager_module, "_try_acquire_lockfile", lambda _path: fake_fd)
+
+    def _raise_no_loop():
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(key_manager_module.asyncio, "get_running_loop", _raise_no_loop)
+
+    def _fake_flock(fd, _op):
+        assert fd == fake_fd
+        lock_calls["flock"] += 1
+
+    def _fake_close(fd):
+        assert fd == fake_fd
+        lock_calls["close"] += 1
+
+    monkeypatch.setattr(key_manager_module.fcntl, "flock", _fake_flock)
+    monkeypatch.setattr(key_manager_module.os, "close", _fake_close)
+
+    km.start_refresh_loop(skip_lock_check=False)
+
+    assert km._lockfile_fd is None
+    assert lock_calls["flock"] >= 1
+    assert lock_calls["close"] == 1
