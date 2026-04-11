@@ -5,6 +5,9 @@ type FlightsListProps = {
   flights?: Flight[];
   bestFlight?: Flight;
   isLoading?: boolean;
+  onHold?: (flight: Flight) => void;
+  onTrack?: (flight: Flight) => void;
+  actionDisabled?: boolean;
 };
 
 function flightIdentity(flight: Flight) {
@@ -54,7 +57,14 @@ function orderFlightsWithBestFirst(flights: Flight[], bestFlight?: Flight): Flig
   return ordered;
 }
 
-export default function FlightsList({ flights, bestFlight, isLoading = false }: FlightsListProps) {
+export default function FlightsList({
+  flights,
+  bestFlight,
+  isLoading = false,
+  onHold,
+  onTrack,
+  actionDisabled = false,
+}: FlightsListProps) {
   if (isLoading) {
     return (
       <div className="flights-shimmer" aria-label="Loading flights">
@@ -105,7 +115,7 @@ export default function FlightsList({ flights, bestFlight, isLoading = false }: 
   const totalFlights = orderedFlights.length;
 
   return (
-    <div className="space-y-2 flights-stack">
+    <div className="space-y-2 flights-stack" data-testid="flights-list">
       {orderedFlights.map((f, i) => (
         <div
           key={i}
@@ -117,6 +127,9 @@ export default function FlightsList({ flights, bestFlight, isLoading = false }: 
             isBest={isBestFlight(f, bestFlight)}
             rank={i + 1}
             total={totalFlights}
+            onHold={onHold}
+            onTrack={onTrack}
+            actionDisabled={actionDisabled}
           />
         </div>
       ))}

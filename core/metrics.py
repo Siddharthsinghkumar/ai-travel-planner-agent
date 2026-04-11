@@ -47,6 +47,12 @@ ASK_DUPLICATES = Counter(
     ["stream", "outcome"]
 )
 
+ASK_INFLIGHT_STALE_PRUNED = Counter(
+    "ask_inflight_stale_pruned_total",
+    "Total stale /ask inflight markers pruned by TTL cleanup",
+    ["reason"]
+)
+
 # Airline API metrics
 AIRLINE_RETRIES = Counter(
     "airline_retries_total",
@@ -80,6 +86,12 @@ WEATHER_BREAKER_OPEN = Counter(
 WEATHER_ATTEMPTS = Histogram(
     "weather_attempts_per_request",
     "Number of attempts used per weather API request"
+)
+
+RETRY_BUDGET_EXHAUSTED = Counter(
+    "retry_budget_exhausted_total",
+    "Retry budget exhausted events by component",
+    ["component"]
 )
 
 # ----------------------------
@@ -197,6 +209,36 @@ CIRCUIT_STATE = Gauge(
     ["service"]
 )
 
+CIRCUIT_TRANSITIONS = Counter(
+    "circuit_transitions_total",
+    "Circuit breaker state transitions",
+    ["transition"]
+)
+
+BOOKING_HANDOFF_CONSUME = Counter(
+    "booking_handoff_consume_total",
+    "Booking handoff consume outcomes",
+    ["lookup_result", "outcome"]
+)
+
+KEY_STATE_EVENTS = Counter(
+    "key_state_events_total",
+    "Key manager state transition events",
+    ["service", "event", "reason_class"]
+)
+
+PROVIDER_HEALTH_FAILURES = Counter(
+    "provider_health_failures_total",
+    "Cloud provider health-check failures by class",
+    ["provider", "reason_class"]
+)
+
+PROVIDER_HEALTH_COOLDOWN_SKIPS = Counter(
+    "provider_health_cooldown_skips_total",
+    "Cloud provider health-check probes skipped due to active cooldown",
+    ["provider"]
+)
+
 # ----------------------------
 # LLM Metric Helper Functions
 # ----------------------------
@@ -283,6 +325,11 @@ def record_ask_duplicate(stream: bool, outcome: str) -> None:
     ).inc()
 
 
+def record_ask_inflight_stale_pruned(removed: int) -> None:
+    for _ in range(max(0, int(removed))):
+        ASK_INFLIGHT_STALE_PRUNED.labels(reason="ttl_expired").inc()
+
+
 def record_stream_init_timeout(provider: str) -> None:
     STREAM_INIT_TIMEOUTS.labels(provider=provider).inc()
 
@@ -322,6 +369,40 @@ def record_stream_done_json(status: str) -> None:
 
 def record_router_stream_failure(cause: str) -> None:
     ROUTER_STREAM_FAILURES.labels(cause=cause or "unknown").inc()
+
+
+def record_retry_budget_exhausted(component: str) -> None:
+    RETRY_BUDGET_EXHAUSTED.labels(component=(component or "unknown")).inc()
+
+
+def record_booking_handoff_consume(lookup_result: str, outcome: str) -> None:
+    BOOKING_HANDOFF_CONSUME.labels(
+        lookup_result=(lookup_result or "unknown"),
+        outcome=(outcome or "unknown"),
+    ).inc()
+
+
+def record_key_state_event(service: str, event: str, reason_class: str = "unknown") -> None:
+    KEY_STATE_EVENTS.labels(
+        service=(service or "unknown"),
+        event=(event or "unknown"),
+        reason_class=(reason_class or "unknown"),
+    ).inc()
+
+
+def record_provider_health_failure(provider: str, reason_class: str) -> None:
+    PROVIDER_HEALTH_FAILURES.labels(
+        provider=(provider or "unknown"),
+        reason_class=(reason_class or "unknown"),
+    ).inc()
+
+
+def record_provider_health_cooldown_skip(provider: str) -> None:
+    PROVIDER_HEALTH_COOLDOWN_SKIPS.labels(provider=(provider or "unknown")).inc()
+
+
+def record_circuit_transition(transition: str) -> None:
+    CIRCUIT_TRANSITIONS.labels(transition=(transition or "unknown")).inc()
 
 
 # --- sanitization helpers for dynamic metrics ---

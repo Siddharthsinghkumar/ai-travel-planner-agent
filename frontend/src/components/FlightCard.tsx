@@ -9,17 +9,36 @@ export default function FlightCard({
   isBest = false,
   rank,
   total,
+  onHold,
+  onTrack,
+  actionDisabled = false,
 }: {
   flight: Flight;
   isBest?: boolean;
   rank?: number;
   total?: number;
+  onHold?: (flight: Flight) => void;
+  onTrack?: (flight: Flight) => void;
+  actionDisabled?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const hasDate = typeof flight.date === "string" && flight.date.trim().length > 0;
   const hasEmissions = typeof flight.carbon_emissions_g === "number";
   const hasHandoff = typeof flight.handoff_url === "string" && flight.handoff_url.trim().length > 0;
   const resolvedHandoffUrl = hasHandoff ? resolveApiUrl(flight.handoff_url as string) : "";
+  const handoffMeta = flight.booking_handoff;
+  const bookingExitQuality = String(handoffMeta?.booking_exit_quality || "").toLowerCase();
+  const sellerName = Array.isArray(flight.booking_sellers) && flight.booking_sellers.length > 0 ? flight.booking_sellers[0] : "";
+  const bookingActionLabel =
+    sellerName && hasHandoff ? `Book with ${sellerName}` : hasHandoff ? "Book now" : "Booking unavailable";
+  const proofNote =
+    bookingExitQuality === "booking_ready"
+      ? "Booking handoff ready"
+      : bookingExitQuality === "deferred"
+        ? "Booking deferred until action"
+        : "Booking unavailable";
+  const marketedAs = Array.isArray(flight.marketed_as) ? flight.marketed_as.join(", ") : "";
+  const separateTicketsWarning = Boolean(flight.separate_tickets);
   const stopLabel = Number(flight.stops) === 0 ? "Direct" : String(flight.stops);
   const routeInfo = flight.layover_info
     ? `Layover: ${flight.layover_info}`
@@ -45,6 +64,7 @@ export default function FlightCard({
       className={`flight-item ${isBest ? "best-pick" : ""} ${
         isBest ? "flight-card--best" : ""
       }`}
+      data-testid={isBest ? "flight-card-best" : "flight-card"}
     >
       <div className="airline-ico">{airlineCode}</div>
       <div className="fl-info">
@@ -60,7 +80,7 @@ export default function FlightCard({
             </span>
           )}
           <span className="flight-proof-note">
-            {hasHandoff ? "Booking handoff ready" : "Handoff available on supported providers"}
+            {proofNote}
           </span>
         </div>
         <p className="fl-route break-words">
@@ -74,6 +94,10 @@ export default function FlightCard({
         <p className="fl-meta break-words">
           Baggage: {flight.baggage || "Check airline"}
         </p>
+        {marketedAs && <p className="fl-meta break-words">Marketed as: {marketedAs}</p>}
+        {separateTicketsWarning && (
+          <p className="fl-meta break-words">Separate tickets may apply. Re-check baggage and transfer rules.</p>
+        )}
         <div className="flight-card__actions">
           {hasHandoff && (
             <>
@@ -83,11 +107,48 @@ export default function FlightCard({
                 rel="noreferrer"
                 className="flight-card__link flight-card__link--primary"
                 title="Secure booking handoff link"
+                data-testid="booking-link"
               >
-                Book now
+                {bookingActionLabel}
               </a>
-              <span className="fl-meta">Provider handoff opens a secure booking flow in a new tab.</span>
+              {sellerName && (
+                <span className="fl-meta" data-testid="booking-seller">
+                  Seller: {sellerName}
+                </span>
+              )}
+              <span className="fl-meta" data-testid="provider-handoff-hint">
+                Provider handoff opens a secure booking flow in a new tab.
+              </span>
             </>
+          )}
+          {!hasHandoff && (
+            <span className="fl-meta" data-testid="checkout-unavailable-note">
+              Provider checkout is unavailable for this option right now.
+            </span>
+          )}
+          {(onHold || onTrack) && (
+            <div className="flight-card__actions-row">
+              {onHold && (
+                <button
+                  onClick={() => onHold(flight)}
+                  className="flight-card__link flight-card__link--secondary"
+                  disabled={actionDisabled}
+                  data-testid="action-hold"
+                >
+                  Hold
+                </button>
+              )}
+              {onTrack && (
+                <button
+                  onClick={() => onTrack(flight)}
+                  className="flight-card__link flight-card__link--secondary"
+                  disabled={actionDisabled}
+                  data-testid="action-track"
+                >
+                  Track price
+                </button>
+              )}
+            </div>
           )}
           <button
             onClick={handleCopy}

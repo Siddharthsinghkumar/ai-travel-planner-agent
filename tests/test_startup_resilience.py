@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,59 @@ async def test_lifespan_does_not_crash_for_unsupported_async_topology_even_when_
         assert support["enabled"] is False
         assert support["reason"] == "unsupported_multi_worker_topology"
         assert support["fail_fast_on_unsupported_topology"] is True
+
+
+@pytest.mark.asyncio
+async def test_lifespan_does_not_block_on_background_serpapi_reconcile(monkeypatch):
+    async def _fake_lock():
+        return "file", None
+
+    async def _fake_load_env_keys():
+        return None
+
+    async def _fake_noop_async(*_args, **_kwargs):
+        return None
+
+    async def _slow_reconcile_once():
+        await asyncio.sleep(0.35)
+        return {"checked": 1, "errors": 0}
+
+    reconcile_task_holder = {"task": None}
+
+    def _fake_start_serpapi_reconcile_loop(interval_seconds: int = 0):
+        reconcile_task_holder["task"] = asyncio.create_task(_slow_reconcile_once())
+        api_app.key_manager._serpapi_reconcile_task = reconcile_task_holder["task"]
+
+    def _fake_stop_serpapi_reconcile_loop():
+        task = reconcile_task_holder.get("task")
+        if task and not task.done():
+            task.cancel()
+        api_app.key_manager._serpapi_reconcile_task = None
+
+    monkeypatch.setenv("RUN_KEY_REFRESH", "1")
+    monkeypatch.setenv("USE_CLOUD_LLM", "0")
+    monkeypatch.setattr(api_app, "_acquire_pluggable_lock", _fake_lock)
+    monkeypatch.setattr(api_app, "init_db", lambda: None)
+    monkeypatch.setattr(api_app, "_should_emit_startup_summary", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(api_app.key_manager, "load_env_keys", _fake_load_env_keys)
+    monkeypatch.setattr(api_app.key_manager, "start_refresh_loop", lambda **_kwargs: None)
+    monkeypatch.setattr(api_app.key_manager, "stop_refresh_loop", lambda: None)
+    monkeypatch.setattr(api_app.key_manager, "start_serpapi_reconcile_loop", _fake_start_serpapi_reconcile_loop)
+    monkeypatch.setattr(api_app.key_manager, "stop_serpapi_reconcile_loop", _fake_stop_serpapi_reconcile_loop)
+    monkeypatch.setattr(api_app.key_manager, "register_key_event_listener", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("api.app.refresh_provider_chain_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr("api.app.is_cloud_admin_enabled", lambda: False)
+    monkeypatch.setattr("api.app.close_client", _fake_noop_async)
+    monkeypatch.setattr("api.app.close_llm_client", _fake_noop_async)
+    monkeypatch.setattr("agents.cloud_llm.close_client", _fake_noop_async)
+
+    started = time.monotonic()
+    async with app.router.lifespan_context(app):
+        startup_elapsed = time.monotonic() - started
+        assert app.state.startup_complete is True
+        assert startup_elapsed < 0.3
+        await asyncio.sleep(0.01)
+        assert reconcile_task_holder["task"] is not None
 
 
 @pytest.mark.asyncio

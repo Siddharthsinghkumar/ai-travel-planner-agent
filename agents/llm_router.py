@@ -286,6 +286,7 @@ class LLMRouter:
         last_error = None
         failure_details: List[Dict[str, str]] = []
         for idx, backend_name in enumerate(backends):
+            attempt_is_last = idx == (len(backends) - 1)
             if backend_name == "cloud" and not cloud_available:
                 unavailable_error = RuntimeError("Cloud backend unavailable")
                 last_error = unavailable_error
@@ -352,7 +353,8 @@ class LLMRouter:
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            logger.warning(f"First chunk from {backend_label} failed (couldn't get generator)", extra={
+                            log_fn = logger.warning if attempt_is_last else logger.info
+                            log_fn(f"First chunk from {backend_label} failed (couldn't get generator)", extra={
                                 "backend": backend_label,
                                 "error": str(e),
                                 "request_id": request_id,
@@ -377,7 +379,8 @@ class LLMRouter:
                         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
                     except StopAsyncIteration:
                         empty_stream_error = RuntimeError(f"{backend_label} stream ended before first chunk")
-                        logger.warning("LLM backend produced empty stream", extra={
+                        log_fn = logger.warning if attempt_is_last else logger.info
+                        log_fn("LLM backend produced empty stream", extra={
                             "backend": backend_label,
                             "request_id": request_id,
                             "attempt_index": idx + 1,
@@ -396,7 +399,8 @@ class LLMRouter:
                     except asyncio.CancelledError:
                         raise
                     except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"First chunk from {backend_label} failed", extra={
+                        log_fn = logger.warning if attempt_is_last else logger.info
+                        log_fn(f"First chunk from {backend_label} failed", extra={
                             "backend": backend_label,
                             "error": str(e),
                             "request_id": request_id,
@@ -426,7 +430,7 @@ class LLMRouter:
                         async for chunk in self._stream_with_timeout(gen, timeout, backend_label, request_id):
                             yield chunk
 
-                    logger.info("LLM streaming started", extra={
+                    logger.debug("LLM streaming started", extra={
                         "backend": backend_label,
                         "request_id": request_id
                     })
@@ -473,7 +477,7 @@ class LLMRouter:
                         )
                     result = await asyncio.wait_for(generate_call, timeout=timeout)
                     latency = time.monotonic() - start
-                    logger.info("LLM backend success", extra={
+                    logger.debug("LLM backend success", extra={
                         "backend": backend_label,
                         "latency_sec": round(latency, 3),
                         "request_id": request_id
@@ -502,7 +506,7 @@ class LLMRouter:
                     return result
 
             except asyncio.CancelledError:
-                logger.info(
+                logger.debug(
                     "LLM request cancelled",
                     extra={"backend": backend_label, "request_id": request_id}
                 )
@@ -510,7 +514,8 @@ class LLMRouter:
                     metrics.record_stream_cancellation(backend_label, "router")
                 raise
             except asyncio.TimeoutError:
-                logger.warning("LLM backend timeout", extra={
+                log_fn = logger.warning if attempt_is_last else logger.info
+                log_fn("LLM backend timeout", extra={
                     "backend": backend_label,
                     "timeout_sec": timeout,
                     "request_id": request_id,
@@ -528,7 +533,8 @@ class LLMRouter:
             except (OllamaError, CloudLLMError) as e:
                 # These are expected errors from the clients (already include circuit breaker failures)
                 failure_reason = self._classify_error(e)
-                logger.warning("LLM backend error", extra={
+                log_fn = logger.warning if attempt_is_last else logger.info
+                log_fn("LLM backend error", extra={
                     "backend": backend_label,
                     "error": str(e),
                     "error_type": type(e).__name__,
@@ -561,7 +567,8 @@ class LLMRouter:
                     stage = "unexpected"
                     metrics.increment("llm.backend.unexpected_error", tags={"backend": backend_label})
                 else:
-                    logger.warning("LLM backend exception (classified)", extra={
+                    log_fn = logger.warning if attempt_is_last else logger.info
+                    log_fn("LLM backend exception (classified)", extra={
                         "backend": backend_label,
                         "error": str(e),
                         "error_type": type(e).__name__,

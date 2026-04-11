@@ -6,13 +6,19 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       TESTING: "true"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -28,6 +34,10 @@ jobs:
       - name: Run tests
         env:
           OLLAMA_BASE_URL: http://localhost:11434
+          SERPAPI_KEY_1: dummy
+          WEATHER_KEY_1: dummy
+          OPENAI_KEY_1: dummy
+          # Backward-compatible dummy vars for any legacy compatibility checks.
           SERPAPI_KEY: dummy
           WEATHER_API_KEY: dummy
           OPENAI_API_KEY: dummy
@@ -37,10 +47,13 @@ jobs:
   docker-build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.ref == 'refs/heads/main'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -69,7 +82,16 @@ jobs:
         with:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/llm-travel-agent:latest
           format: table
+          output: trivy-image-scan.txt
           exit-code: 1
           ignore-unfixed: true
           severity: CRITICAL,HIGH
           vuln-type: os,library
+
+      - name: Upload Trivy scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-scan
+          path: trivy-image-scan.txt
+          retention-days: 14

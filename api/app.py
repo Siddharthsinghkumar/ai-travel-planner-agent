@@ -19,14 +19,19 @@ import asyncio
 import time
 import html
 import hashlib
+import secrets
+import urllib.parse
 import fcntl                     # for process‑level locking
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator, model_validator
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -61,6 +66,7 @@ from core.llm_mode import (
 )
 from core import job_queue                     # background job worker
 from core.api_key_manager import key_manager    # key rotation manager
+from agents.database import init_db
 from agents.cloud_llm import (
     on_key_event,
     get_available_providers,
@@ -78,6 +84,14 @@ LOG_REQUEST_BODY_DEBUG = get_env_bool("LOG_REQUEST_BODY_DEBUG", default=False)
 ASK_MAX_INFLIGHT_DEFAULT = max(1, get_env_int("ASK_MAX_INFLIGHT", 16))
 ASK_DUPLICATE_RETRY_AFTER_DEFAULT = max(1, get_env_int("ASK_DUPLICATE_RETRY_AFTER_SECONDS", 2))
 ASK_OVERLOAD_RETRY_AFTER_DEFAULT = max(1, get_env_int("ASK_OVERLOAD_RETRY_AFTER_SECONDS", 1))
+ASK_RECENT_COMPLETION_TTL_DEFAULT = max(
+    0.0,
+    get_env_float("ASK_RECENT_COMPLETION_TTL_SECONDS", 3.0),
+)
+ASK_RECENT_COMPLETION_MAX_ENTRIES_DEFAULT = max(
+    16,
+    get_env_int("ASK_RECENT_COMPLETION_MAX_ENTRIES", 256),
+)
 
 
 def _resolve_ask_max_inflight() -> int:
@@ -103,6 +117,22 @@ def _resolve_ask_inflight_stale_seconds() -> float:
     if configured > 0:
         return max(10.0, configured)
     return max(10.0, float(_resolve_request_timeout()) + 10.0)
+
+
+def _resolve_ask_recent_completion_ttl_seconds() -> float:
+    configured = get_env_float(
+        "ASK_RECENT_COMPLETION_TTL_SECONDS",
+        ASK_RECENT_COMPLETION_TTL_DEFAULT,
+    )
+    return max(0.0, configured)
+
+
+def _resolve_ask_recent_completion_max_entries() -> int:
+    configured = get_env_int(
+        "ASK_RECENT_COMPLETION_MAX_ENTRIES",
+        ASK_RECENT_COMPLETION_MAX_ENTRIES_DEFAULT,
+    )
+    return max(16, configured)
 
 
 def _build_ask_request_fingerprint(
@@ -133,10 +163,13 @@ def _build_ask_request_fingerprint(
 def _ensure_ask_runtime_state(app: FastAPI) -> Dict[str, Any]:
     state = getattr(app.state, "ask_runtime_state", None)
     if isinstance(state, dict) and isinstance(state.get("inflight"), dict) and state.get("lock") is not None:
+        if not isinstance(state.get("recent_completed"), dict):
+            state["recent_completed"] = {}
         return state
     state = {
         "lock": asyncio.Lock(),
         "inflight": {},
+        "recent_completed": {},
     }
     app.state.ask_runtime_state = state
     return state
@@ -158,6 +191,41 @@ def _prune_stale_ask_inflight_locked(
     return len(stale_keys)
 
 
+def _prune_recent_ask_completions_locked(
+    *,
+    recent_completed: Dict[str, Dict[str, Any]],
+    now_monotonic: float,
+    ttl_seconds: float,
+    max_entries: int,
+) -> int:
+    removed = 0
+    if ttl_seconds <= 0:
+        removed = len(recent_completed)
+        recent_completed.clear()
+        return removed
+
+    stale_keys = []
+    for key, value in list(recent_completed.items()):
+        completed_at = float((value or {}).get("completed_at") or now_monotonic)
+        if (now_monotonic - completed_at) > ttl_seconds:
+            stale_keys.append(key)
+    for key in stale_keys:
+        recent_completed.pop(key, None)
+        removed += 1
+
+    if len(recent_completed) > max_entries:
+        overflow = len(recent_completed) - max_entries
+        oldest = sorted(
+            recent_completed.items(),
+            key=lambda item: float((item[1] or {}).get("completed_at") or now_monotonic),
+        )[:overflow]
+        for key, _ in oldest:
+            recent_completed.pop(key, None)
+            removed += 1
+
+    return removed
+
+
 async def _release_ask_inflight_key(request_fingerprint: Optional[str]) -> None:
     if not request_fingerprint:
         return
@@ -167,6 +235,34 @@ async def _release_ask_inflight_key(request_fingerprint: Optional[str]) -> None:
     async with lock:
         inflight.pop(request_fingerprint, None)
         app_metrics.set_ask_inflight(len(inflight))
+
+
+async def _record_recent_ask_completion(
+    request_fingerprint: Optional[str],
+    completion_snapshot: Optional[Dict[str, Any]],
+) -> None:
+    if not request_fingerprint or not isinstance(completion_snapshot, dict):
+        return
+    runtime_state = _ensure_ask_runtime_state(app)
+    lock = runtime_state["lock"]
+    recent_completed = runtime_state["recent_completed"]
+    now_monotonic = time.monotonic()
+    ttl_seconds = _resolve_ask_recent_completion_ttl_seconds()
+    max_entries = _resolve_ask_recent_completion_max_entries()
+    async with lock:
+        _prune_recent_ask_completions_locked(
+            recent_completed=recent_completed,
+            now_monotonic=now_monotonic,
+            ttl_seconds=ttl_seconds,
+            max_entries=max_entries,
+        )
+        if ttl_seconds <= 0:
+            return
+        recent_completed[request_fingerprint] = {
+            "completed_at": now_monotonic,
+            "status_code": int(completion_snapshot.get("status_code") or 200),
+            "payload": completion_snapshot.get("payload"),
+        }
 
 
 def _legacy_async_llm_client_enabled() -> bool:
@@ -470,6 +566,14 @@ def _get_async_job_support_state(app: FastAPI) -> dict:
     return _compute_async_job_support()
 
 
+def _job_contract_payload() -> Dict[str, Any]:
+    return {
+        "durability": "process_local",
+        "queue": "in_memory_single_worker",
+        "contract": "single_worker_required_process_local_queue",
+    }
+
+
 def _should_run_prewarm(prewarm_enabled: bool, refresh_owner: bool) -> bool:
     if not prewarm_enabled:
         return False
@@ -542,6 +646,40 @@ async def _acquire_pluggable_lock():
     if fd is not None:
         return "file", fd
     return "file", None
+
+
+async def _run_price_tracker_loop(app: FastAPI) -> None:
+    from tools import price_tracker
+
+    interval = max(60, get_env_int("PRICE_TRACKER_INTERVAL_SECONDS", 1800))
+    try:
+        cleanup_summary = await asyncio.to_thread(price_tracker.cleanup_invalid_held_tracking_rows)
+        app.state.price_tracker_status["startup_cleanup"] = cleanup_summary
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        app.state.price_tracker_status["startup_cleanup"] = {
+            "status": "failed",
+            "error": str(exc),
+        }
+        logger.warning(
+            "price_tracker_startup_cleanup_failed",
+            extra={"exception_type": type(exc).__name__},
+        )
+    while getattr(app.state, "price_tracker_enabled", False):
+        try:
+            app.state.price_tracker_status["last_started_at"] = datetime.utcnow().isoformat() + "Z"
+            alerts = await price_tracker.check_held_booking_prices()
+            app.state.price_tracker_status["last_alert_count"] = len(alerts)
+            app.state.price_tracker_status["last_error"] = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app.state.price_tracker_status["last_error"] = str(exc)
+            logger.exception("price_tracker_loop_error")
+        finally:
+            app.state.price_tracker_status["last_completed_at"] = datetime.utcnow().isoformat() + "Z"
+        await asyncio.sleep(interval)
 
 
 async def prewarm_llm():
@@ -653,10 +791,11 @@ async def prewarm_llm():
                 }
 
 
-def require_admin_token(x_admin_token: str = Header(...)):
+def require_admin_token(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
     """Dependency to protect admin endpoints with a token from environment."""
-    expected = get_env_str("ADMIN_TOKEN")
-    if not expected or x_admin_token != expected:
+    expected = (get_env_str("ADMIN_TOKEN") or "").strip()
+    provided = (x_admin_token or "").strip()
+    if not expected or not provided or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -678,10 +817,21 @@ async def lifespan(app: FastAPI):
     app.state.async_job_support = _compute_async_job_support()
     app.state.key_manager_lease_task = None
     app.state.key_manager_refresh_owner = False
+    app.state.key_manager_hydration_task = None
     app.state.ask_runtime_state = {
         "lock": asyncio.Lock(),
         "inflight": {},
+        "recent_completed": {},
     }
+    app.state.price_tracker_enabled = get_env_bool("PRICE_TRACKER_ENABLED", default=True)
+    app.state.price_tracker_status = {
+        "enabled": bool(app.state.price_tracker_enabled),
+        "last_started_at": None,
+        "last_completed_at": None,
+        "last_alert_count": 0,
+        "last_error": None,
+    }
+    app.state.price_tracker_task = None
 
     # Startup: configure structured JSON logging
     setup_logging()
@@ -694,13 +844,38 @@ async def lifespan(app: FastAPI):
             await init_llm_client()
             app.state.legacy_llm_client_initialized = True
         except Exception as e:
-            logger.info("legacy_llm_client_init_skipped: %s", str(e))
+            logger.warning("legacy_llm_client_init_skipped: %s", str(e))
     else:
         logger.debug("legacy_llm_client_disabled_by_config")
 
-    # Load API keys from environment into the key manager
+    # Ensure ORM tables (including provider_key_states) exist before key-manager provider-state IO.
     try:
-        await key_manager.load_env_keys()
+        init_db()
+    except Exception:
+        logger.exception("database_init_failed")
+
+    # Load API keys from environment into the key manager.
+    # Keep startup responsive: if hydration is slow, continue and finish in background.
+    key_load_timeout = max(
+        0.1,
+        float(get_env_float("KEY_MANAGER_STARTUP_LOAD_TIMEOUT_SECONDS", 1.5)),
+    )
+    try:
+        await asyncio.wait_for(key_manager.load_env_keys(), timeout=key_load_timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "key_manager_load_deferred_to_background",
+            extra={"timeout_seconds": key_load_timeout},
+        )
+
+        async def _background_key_manager_load() -> None:
+            try:
+                await key_manager.load_env_keys()
+                logger.info("key_manager_background_load_complete")
+            except Exception:
+                logger.exception("key_manager_background_load_failed")
+
+        app.state.key_manager_hydration_task = asyncio.create_task(_background_key_manager_load())
     except Exception:
         logger.exception("key_manager_load_failed")
 
@@ -773,6 +948,19 @@ async def lifespan(app: FastAPI):
             interval_seconds=refresh_interval,
             skip_lock_check=True      # we already acquired the lock ourselves
         )
+        serpapi_reconcile_interval = max(
+            300,
+            get_env_int("SERPAPI_ACCOUNT_RECONCILE_INTERVAL_SECONDS", 1800),
+        )
+        # Do not block app startup on provider-account reconciliation.
+        # The periodic reconcile loop starts immediately and performs the same check
+        # in the background.
+        key_manager.start_serpapi_reconcile_loop(interval_seconds=serpapi_reconcile_interval)
+        logger.info(
+            "SerpAPI reconcile loop started in background (startup not blocked)",
+            extra={"interval_seconds": serpapi_reconcile_interval},
+        )
+        app.state.serpapi_reconcile_task = key_manager._serpapi_reconcile_task
         # Store the internal task so we can cancel it on shutdown
         app.state.key_manager_task = key_manager._refresh_task
         app.state.key_manager_refresh_owner = True
@@ -786,6 +974,7 @@ async def lifespan(app: FastAPI):
         app.state.key_manager_lock_backend = None
         app.state.key_manager_lock_handle = None
         app.state.key_manager_task = None
+        app.state.serpapi_reconcile_task = None
         app.state.key_manager_refresh_owner = False
 
     if _should_emit_startup_summary(bool(app.state.key_manager_refresh_owner)):
@@ -818,6 +1007,12 @@ async def lifespan(app: FastAPI):
 
     # Start the background job worker loop (always needed)
     app.state.job_worker = asyncio.create_task(job_queue.worker_loop())
+
+    # Start price-tracker loop (single-node, best-effort)
+    if app.state.price_tracker_enabled:
+        app.state.price_tracker_task = asyncio.create_task(_run_price_tracker_loop(app))
+    else:
+        app.state.price_tracker_status["note"] = "disabled_by_config"
 
     if not async_job_support.get("enabled", True):
         if async_job_support.get("fail_fast_on_unsupported_topology"):
@@ -898,6 +1093,17 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("llm_prewarm_task_cancel_failed")
 
+    price_tracker_task = getattr(app.state, "price_tracker_task", None)
+    if price_tracker_task and not price_tracker_task.done():
+        app.state.price_tracker_enabled = False
+        price_tracker_task.cancel()
+        try:
+            await price_tracker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("price_tracker_task_cancel_failed")
+
     # Stop the key manager's background refresh loop only if we started it
     if getattr(app.state, "key_manager_task", None):
         try:
@@ -917,6 +1123,21 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("key_manager_task_cancel_failed")
 
+    if getattr(app.state, "serpapi_reconcile_task", None):
+        try:
+            key_manager.stop_serpapi_reconcile_loop()
+        except Exception:
+            logger.exception("serpapi_reconcile_loop_stop_failed")
+        reconcile_task = app.state.serpapi_reconcile_task
+        if reconcile_task and not reconcile_task.done():
+            reconcile_task.cancel()
+            try:
+                await reconcile_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("serpapi_reconcile_task_cancel_failed")
+
     lease_task = getattr(app.state, "key_manager_lease_task", None)
     if lease_task and not lease_task.done():
         lease_task.cancel()
@@ -926,6 +1147,16 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             logger.exception("key_manager_lease_task_cancel_failed")
+
+    hydration_task = getattr(app.state, "key_manager_hydration_task", None)
+    if hydration_task and not hydration_task.done():
+        hydration_task.cancel()
+        try:
+            await hydration_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("key_manager_hydration_task_cancel_failed")
 
     # Release the lock we acquired (backend-specific)
     backend = getattr(app.state, "key_manager_lock_backend", None)
@@ -966,19 +1197,75 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware – now configurable via environment variable
-# Read production origins from environment, fallback to localhost for dev
-env_origins = get_env_str(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
-)
-allowed_origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
+# Add CORS middleware with strict origin parsing.
+# Production must provide explicit trusted origins (scheme + host + optional port).
+_DEV_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+
+
+def _normalize_cors_origin(origin: str) -> Optional[str]:
+    candidate = str(origin or "").strip()
+    if not candidate or candidate == "*":
+        return None
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not parsed.hostname or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        return None
+    if parsed.path not in {"", "/"}:
+        return None
+
+    host = str(parsed.hostname or "").lower()
+    if not host:
+        return None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host if parsed.port is None else f"{host}:{int(parsed.port)}"
+    return f"{parsed.scheme.lower()}://{netloc}"
+
+
+def _build_allowed_origins() -> list[str]:
+    env_was_set = is_env_set("ALLOWED_ORIGINS")
+    env_origins = get_env_str("ALLOWED_ORIGINS", ",".join(_DEV_ALLOWED_ORIGINS)) or ""
+    allowed: list[str] = []
+    seen: set[str] = set()
+
+    for raw in env_origins.split(","):
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if candidate == "*":
+            logger.warning("ALLOWED_ORIGINS wildcard is not allowed; ignoring '*'")
+            continue
+        normalized = _normalize_cors_origin(candidate)
+        if not normalized:
+            logger.warning(
+                "Ignoring invalid CORS origin in ALLOWED_ORIGINS; expected scheme://host[:port]",
+                extra={"origin": candidate},
+            )
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        allowed.append(normalized)
+
+    if not allowed and env_was_set:
+        logger.warning("No valid ALLOWED_ORIGINS entries parsed; browser cross-origin requests will be denied.")
+        return []
+    return allowed or list(_DEV_ALLOWED_ORIGINS)
+
+
+allowed_origins = _build_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -1166,6 +1453,111 @@ class AskRequest(BaseModel):
         return self
 
 
+class BookingHoldRequest(BaseModel):
+    flight: Dict[str, Any] = Field(default_factory=dict)
+    origin: str
+    destination: str
+    depart_date: str
+    return_date: Optional[str] = None
+    passengers: int = 1
+    hold_minutes: Optional[int] = None
+    passenger: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def normalize(self):
+        self.origin = str(self.origin or "").strip().upper()
+        self.destination = str(self.destination or "").strip().upper()
+        self.depart_date = str(self.depart_date or "").strip()
+        if self.return_date:
+            self.return_date = str(self.return_date).strip()
+        self.passengers = max(1, int(self.passengers or 1))
+        if not self.origin or not self.destination or not self.depart_date:
+            raise ValueError("origin, destination, and depart_date are required")
+        return self
+
+
+class BookingCancelRequest(BaseModel):
+    booking_id: int
+
+    @field_validator("booking_id")
+    @classmethod
+    def validate_booking_id(cls, v):
+        if v is None or int(v) <= 0:
+            raise ValueError("booking_id must be a positive integer")
+        return int(v)
+
+
+class BookingTrackRequest(BookingHoldRequest):
+    pass
+
+
+def _coerce_price_inr(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = text.replace("₹", "").replace(",", "").strip()
+    try:
+        parsed = float(cleaned)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _tracking_detail(*, error: str, reason: str, message: str, **extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "error": error,
+        "reason": reason,
+        "message": message,
+        "contract": "price_tracking_requires_supported_selected_flight",
+    }
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+class ProviderStateOverrideRequest(BaseModel):
+    provider: str
+    scope_type: str
+    scope_identifier: Optional[str] = None
+    key_index: Optional[int] = None
+    override_type: str
+    override_until: Optional[str] = None
+    active_until: Optional[str] = None
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def normalize(self):
+        self.provider = str(self.provider or "").strip().lower()
+        self.scope_type = str(self.scope_type or "").strip().lower()
+        self.scope_identifier = str(self.scope_identifier or "").strip() or None
+        if self.key_index is not None:
+            self.key_index = int(self.key_index)
+        self.override_type = str(self.override_type or "").strip().lower()
+        self.override_until = str(self.override_until or "").strip() or None
+        self.active_until = str(self.active_until or "").strip() or None
+        if self.override_until and self.active_until and self.override_until != self.active_until:
+            raise ValueError("override_until and active_until must match when both are provided")
+        if self.override_until and not self.active_until:
+            self.active_until = self.override_until
+        self.note = str(self.note or "").strip() or None
+        if not self.provider:
+            raise ValueError("provider is required")
+        if not self.scope_type:
+            raise ValueError("scope_type is required")
+        if not self.override_type:
+            raise ValueError("override_type is required")
+        return self
+
+
 @app.post("/ask")
 async def ask(
     req: AskRequest,
@@ -1214,6 +1606,7 @@ async def ask(
     ask_request_fingerprint: Optional[str] = None
     ask_slot_acquired = False
     stream_cleanup_owner = False
+    non_stream_completion_snapshot: Optional[Dict[str, Any]] = None
 
     try:
         def _failure_domain_for_reason(reason: Optional[str]) -> str:
@@ -1261,13 +1654,17 @@ async def ask(
             runtime_state = _ensure_ask_runtime_state(app)
             lock = runtime_state["lock"]
             inflight: Dict[str, Dict[str, Any]] = runtime_state["inflight"]
+            recent_completed: Dict[str, Dict[str, Any]] = runtime_state["recent_completed"]
             now_monotonic = time.monotonic()
             stale_after_seconds = _resolve_ask_inflight_stale_seconds()
+            recent_ttl_seconds = _resolve_ask_recent_completion_ttl_seconds()
+            recent_max_entries = _resolve_ask_recent_completion_max_entries()
             max_inflight = _resolve_ask_max_inflight()
             duplicate_retry_after = _resolve_ask_duplicate_retry_after_seconds()
             overload_retry_after = _resolve_ask_overload_retry_after_seconds()
             duplicate_meta: Optional[Dict[str, Any]] = None
             overload_meta: Optional[Dict[str, Any]] = None
+            replay_meta: Optional[Dict[str, Any]] = None
 
             async with lock:
                 stale_removed = _prune_stale_ask_inflight_locked(
@@ -1275,14 +1672,34 @@ async def ask(
                     now_monotonic=now_monotonic,
                     stale_after_seconds=stale_after_seconds,
                 )
+                _prune_recent_ask_completions_locked(
+                    recent_completed=recent_completed,
+                    now_monotonic=now_monotonic,
+                    ttl_seconds=recent_ttl_seconds,
+                    max_entries=recent_max_entries,
+                )
                 if stale_removed:
                     logger.warning(
                         "ask_inflight_stale_pruned | removed=%s | stale_after_sec=%.2f",
                         stale_removed,
                         stale_after_seconds,
                     )
+                    app_metrics.record_ask_inflight_stale_pruned(stale_removed)
+                if not stream and recent_ttl_seconds > 0:
+                    recent = recent_completed.get(ask_request_fingerprint)
+                    if recent is not None:
+                        replay_meta = {
+                            "status_code": int(recent.get("status_code") or 200),
+                            "payload": recent.get("payload"),
+                            "age_seconds": round(
+                                max(0.0, now_monotonic - float(recent.get("completed_at") or now_monotonic)),
+                                3,
+                            ),
+                        }
                 existing = inflight.get(ask_request_fingerprint)
-                if existing is not None:
+                if replay_meta is not None:
+                    pass
+                elif existing is not None:
                     duplicate_meta = {
                         "leader_request_id": str(existing.get("owner_request_id") or "unknown"),
                         "leader_stream": bool(existing.get("stream")),
@@ -1305,7 +1722,39 @@ async def ask(
                     ask_slot_acquired = True
                 app_metrics.set_ask_inflight(len(inflight))
 
+            if replay_meta is not None:
+                logger.debug(
+                    "ask_admission_recent_replay",
+                    extra={
+                        "request_id": owner_request_id,
+                        "stream": bool(stream),
+                        "replay_age_seconds": replay_meta["age_seconds"],
+                        "contract": "single_node_process_local_recent_replay",
+                    },
+                )
+                app_metrics.record_ask_duplicate(stream=False, outcome="recent_replay")
+                app_metrics.record_ask_admission(outcome="replayed_recent", stream=False)
+                response = JSONResponse(
+                    status_code=replay_meta["status_code"],
+                    content=replay_meta["payload"],
+                )
+                response.headers["X-Ask-Admission"] = "replayed_recent"
+                response.headers["X-Ask-Contract"] = "single-node-process-local"
+                response.headers["X-Ask-Replay-Age-Seconds"] = str(replay_meta["age_seconds"])
+                return response
+
             if duplicate_meta is not None:
+                logger.info(
+                    "ask_admission_duplicate_rejected",
+                    extra={
+                        "request_id": owner_request_id,
+                        "stream": bool(stream),
+                        "leader_request_id": duplicate_meta["leader_request_id"],
+                        "inflight_size": duplicate_meta["inflight_size"],
+                        "retry_after_seconds": duplicate_meta["retry_after_seconds"],
+                        "contract": "single_node_process_local_duplicate_guard",
+                    },
+                )
                 app_metrics.record_ask_duplicate(stream=stream, outcome="in_progress")
                 app_metrics.record_ask_admission(outcome="rejected_duplicate", stream=stream)
                 response = JSONResponse(
@@ -1326,6 +1775,17 @@ async def ask(
                 return response
 
             if overload_meta is not None:
+                logger.warning(
+                    "ask_admission_overload_rejected",
+                    extra={
+                        "request_id": owner_request_id,
+                        "stream": bool(stream),
+                        "inflight_size": overload_meta["inflight_size"],
+                        "max_inflight": overload_meta["max_inflight"],
+                        "retry_after_seconds": overload_meta["retry_after_seconds"],
+                        "contract": "single_node_process_local_backpressure",
+                    },
+                )
                 app_metrics.record_ask_admission(outcome="rejected_overload", stream=stream)
                 response = JSONResponse(
                     status_code=429,
@@ -1345,6 +1805,16 @@ async def ask(
                 return response
 
             app_metrics.record_ask_admission(outcome="accepted", stream=stream)
+            logger.debug(
+                "ask_admission_accepted",
+                extra={
+                    "request_id": owner_request_id,
+                    "stream": bool(stream),
+                    "inflight_size": len(inflight),
+                    "max_inflight": max_inflight,
+                    "contract": "single_node_process_local_backpressure",
+                },
+            )
 
         # Background job branch
         if async_job:
@@ -1486,7 +1956,15 @@ async def ask(
                         await _release_ask_inflight_key(ask_request_fingerprint)
 
             stream_cleanup_owner = True
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+            release_failsafe = None
+            if ask_slot_acquired:
+                # Defensive release if stream iteration exits early before generator cleanup.
+                release_failsafe = BackgroundTask(_release_ask_inflight_key, ask_request_fingerprint)
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                background=release_failsafe,
+            )
 
         # Non‑streaming branch: apply global timeout
         with llm_routing_context(llm_mode=llm_mode, cloud_provider=cloud_provider):
@@ -1501,37 +1979,60 @@ async def ask(
                 timeout=GLOBAL_TIMEOUT
             )
 
+        response_status_code = 200
+        response_payload: Any = result
+
         # If the planner returns a dict with a terminal error/warning payload, treat it as non-success.
         if isinstance(result, dict):
+            handoff_meta = result.get("booking_handoff")
+            handoff_rows = result.get("top_flights")
+            contract_payload: Dict[str, Any] = {}
+            if isinstance(handoff_meta, dict):
+                contract_payload["booking_handoff"] = handoff_meta
+            if isinstance(handoff_rows, list):
+                contract_payload["top_flights"] = handoff_rows
+            if contract_payload.get("booking_handoff") or contract_payload.get("top_flights") is not None:
+                compact_debug: Dict[str, Any] = {}
+                if contract_payload.get("top_flights") is not None:
+                    compact_debug["top_flights"] = contract_payload.get("top_flights")
+                if compact_debug:
+                    contract_payload["debug_info"] = compact_debug
+
             if "error" in result:
                 detail = str(result.get("error") or "").strip() or "Planner failed to produce a complete response."
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "detail": detail,
-                        "failure_reason": result.get("failure_reason") or "planner_error",
-                        "failure_domain": _failure_domain_for_reason(result.get("failure_reason") or "planner_error"),
-                        "no_flights_reason": result.get("no_flights_reason"),
-                        "flight_counts": result.get("flight_counts"),
-                        "search_date": result.get("search_date"),
-                        "result_status": result.get("result_status") or "error",
-                    },
-                )
-            if result.get("fallback") and "warning" in result:
+                response_status_code = 400
+                response_payload = {
+                    "detail": detail,
+                    "failure_reason": result.get("failure_reason") or "planner_error",
+                    "failure_domain": _failure_domain_for_reason(result.get("failure_reason") or "planner_error"),
+                    "no_flights_reason": result.get("no_flights_reason"),
+                    "flight_counts": result.get("flight_counts"),
+                    "search_date": result.get("search_date"),
+                    "result_status": result.get("result_status") or "error",
+                }
+                if contract_payload:
+                    response_payload.update(contract_payload)
+            elif result.get("fallback") and "warning" in result:
                 detail = str(result.get("warning") or "").strip() or "No live flights found."
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "detail": detail,
-                        "failure_reason": result.get("failure_reason") or "no_flights",
-                        "failure_domain": _failure_domain_for_reason(result.get("failure_reason") or "no_flights"),
-                        "no_flights_reason": result.get("no_flights_reason") or "unknown",
-                        "flight_counts": result.get("flight_counts"),
-                        "search_date": result.get("search_date"),
-                        "result_status": result.get("result_status") or "error",
-                    },
-                )
-        return result
+                response_status_code = 400
+                response_payload = {
+                    "detail": detail,
+                    "failure_reason": result.get("failure_reason") or "no_flights",
+                    "failure_domain": _failure_domain_for_reason(result.get("failure_reason") or "no_flights"),
+                    "no_flights_reason": result.get("no_flights_reason") or "unknown",
+                    "flight_counts": result.get("flight_counts"),
+                    "search_date": result.get("search_date"),
+                    "result_status": result.get("result_status") or "error",
+                }
+                if contract_payload:
+                    response_payload.update(contract_payload)
+
+        encoded_payload = jsonable_encoder(response_payload)
+        non_stream_completion_snapshot = {
+            "status_code": response_status_code,
+            "payload": encoded_payload,
+        }
+        return JSONResponse(status_code=response_status_code, content=encoded_payload)
 
     except asyncio.TimeoutError:
         logger.error(f"Request timed out after {GLOBAL_TIMEOUT} seconds")
@@ -1577,10 +2078,15 @@ async def ask(
     finally:
         if ask_slot_acquired and not stream_cleanup_owner:
             await _release_ask_inflight_key(ask_request_fingerprint)
+        if ask_slot_acquired and non_stream_completion_snapshot is not None:
+            await _record_recent_ask_completion(
+                ask_request_fingerprint,
+                non_stream_completion_snapshot,
+            )
 
 
 @app.get("/booking/handoff/post/{artifact_id}", response_class=HTMLResponse)
-async def booking_post_handoff_bridge(artifact_id: str):
+async def booking_post_handoff_bridge(artifact_id: str, request: Request):
     """
     One-time bridge for provider-managed POST booking artifacts.
     Accepts only server-issued artifact ids (no open redirect/proxy behavior).
@@ -1588,6 +2094,8 @@ async def booking_post_handoff_bridge(artifact_id: str):
     from tools.booking_handoff import consume_post_handoff_artifact_with_diagnostics
 
     artifact, consume_meta = consume_post_handoff_artifact_with_diagnostics(artifact_id)
+    accept_header = str(request.headers.get("accept") or "").lower()
+    browser_prefers_html = "text/html" in accept_header
     if not artifact:
         lookup_result = str((consume_meta or {}).get("lookup_result") or "not_found")
         detail_message = {
@@ -1598,6 +2106,32 @@ async def booking_post_handoff_bridge(artifact_id: str):
             "invalid_artifact_id": "booking handoff artifact id is invalid",
             "lookup_failed": "booking handoff artifact unavailable due to lookup failure",
         }.get(lookup_result, "booking handoff artifact not found or expired")
+        status_code = {
+            "already_consumed": 410,
+            "consume_race_lost": 410,
+            "expired": 410,
+            "lookup_failed": 503,
+            "invalid_artifact_id": 404,
+            "not_found": 404,
+        }.get(lookup_result, 404)
+        if browser_prefers_html:
+            html_body = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>Booking Link Unavailable</title></head><body>"
+                "<h1>Booking Link Unavailable</h1>"
+                "<p>This one-time booking handoff link is no longer available.</p>"
+                f"<p><strong>Reason:</strong> {html.escape(detail_message)}</p>"
+                "<p>Please return to your latest search results and open a fresh booking link.</p>"
+                "</body></html>"
+            )
+            return HTMLResponse(
+                content=html_body,
+                status_code=status_code,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Booking-Bridge-Consume-Result": lookup_result,
+                },
+            )
         raise HTTPException(
             status_code=404,
             detail={
@@ -1653,6 +2187,252 @@ async def booking_post_handoff_bridge(artifact_id: str):
     )
 
 
+@app.post("/booking/hold")
+async def booking_hold(req: BookingHoldRequest):
+    """Create a HELD booking for the selected flight."""
+    from tools.booking_handoff import hold_booking
+
+    hold_minutes = req.hold_minutes or get_env_int("BOOKING_HOLD_MINUTES", 15)
+    try:
+        held = await hold_booking(
+            flight=req.flight,
+            origin=req.origin,
+            destination=req.destination,
+            depart_date=req.depart_date,
+            return_date=req.return_date,
+            passengers=req.passengers,
+            passenger=req.passenger,
+            hold_minutes=hold_minutes,
+        )
+    except Exception as exc:
+        logger.warning(
+            "booking_hold_creation_failed",
+            extra={"exception_type": type(exc).__name__},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "booking_hold_failed",
+                "reason": "hold_creation_failed",
+                "message": "Could not create a local hold record for this selection.",
+            },
+        )
+    checkout_ready = bool((held or {}).get("checkout_ready"))
+    checkout_status = str((held or {}).get("checkout_status") or ("booking_ready" if checkout_ready else "provider_handoff_unavailable"))
+    hold_outcome = str((held or {}).get("hold_outcome") or ("held_with_checkout" if checkout_ready else "held_local_only"))
+    return {
+        "action": "hold_booking",
+        "success": True,
+        "hold_created": True,
+        "checkout_ready": checkout_ready,
+        "checkout_status": checkout_status,
+        "hold_outcome": hold_outcome,
+        "message": (
+            "Flight held successfully. Provider checkout link is ready."
+            if checkout_ready
+            else "Flight held locally, but provider checkout is currently unavailable."
+        ),
+        "booking": held,
+        "best_flight": req.flight,
+    }
+
+
+@app.post("/booking/track-price")
+async def booking_track_price(req: BookingTrackRequest):
+    """Create a HELD local record and enable price tracking for the selected flight."""
+    if not getattr(app.state, "price_tracker_enabled", False):
+        raise HTTPException(
+            status_code=503,
+            detail=_tracking_detail(
+                error="price_tracking_disabled",
+                reason="disabled_by_configuration",
+                message="Price tracking is disabled by configuration.",
+            ),
+        )
+    from tools.booking_handoff import hold_booking
+    from tools.booking_handoff import get_booking
+    from tools.booking_handoff import cancel_booking
+    from tools.price_tracker import record_price_snapshot
+
+    hold_minutes = req.hold_minutes or get_env_int("PRICE_TRACK_HOLD_MINUTES", 43200)
+    baseline_price = _coerce_price_inr(req.flight.get("price_inr"))
+    if baseline_price is None:
+        raise HTTPException(
+            status_code=422,
+            detail=_tracking_detail(
+                error="price_tracking_unsupported_selection",
+                reason="selected_flight_price_unavailable",
+                message="Price tracking requires a selected flight with a numeric fare.",
+            ),
+        )
+
+    held = await hold_booking(
+        flight=req.flight,
+        origin=req.origin,
+        destination=req.destination,
+        depart_date=req.depart_date,
+        return_date=req.return_date,
+        passengers=req.passengers,
+        passenger=req.passenger,
+        hold_minutes=hold_minutes,
+    )
+    booking_id_raw = held.get("id")
+    booking_id: Optional[int] = None
+    try:
+        if booking_id_raw is not None:
+            booking_id = int(booking_id_raw)
+    except Exception:
+        booking_id = None
+
+    persisted_booking = None
+    if booking_id is not None:
+        with contextlib.suppress(Exception):
+            persisted_booking = await asyncio.to_thread(get_booking, booking_id)
+
+    persisted_flight = (
+        persisted_booking.get("flight")
+        if isinstance(persisted_booking, dict) and isinstance(persisted_booking.get("flight"), dict)
+        else {}
+    )
+    tracking_missing_fields: list[str] = []
+    if not (persisted_flight.get("origin") or persisted_flight.get("departure_iata")):
+        tracking_missing_fields.append("origin")
+    if not (persisted_flight.get("destination") or persisted_flight.get("arrival_iata")):
+        tracking_missing_fields.append("destination")
+    if not persisted_flight.get("date"):
+        tracking_missing_fields.append("travel_date")
+    if _coerce_price_inr(persisted_flight.get("price_inr")) is None:
+        tracking_missing_fields.append("held_price")
+    if booking_id is None:
+        tracking_missing_fields.append("booking_id")
+    if not persisted_booking:
+        tracking_missing_fields.append("held_booking_record")
+
+    if tracking_missing_fields:
+        cancelled = False
+        if booking_id is not None:
+            try:
+                cancelled = bool(await asyncio.to_thread(cancel_booking, booking_id))
+            except Exception:
+                logger.exception("tracking_setup_cleanup_cancel_failed")
+        raise HTTPException(
+            status_code=503,
+            detail=_tracking_detail(
+                error="price_tracking_setup_failed",
+                reason="held_tracking_prerequisites_missing",
+                message="Price tracking setup failed because HELD booking prerequisites were incomplete.",
+                booking_id=booking_id,
+                missing_fields=tracking_missing_fields,
+                cleanup_cancelled=cancelled,
+            ),
+        )
+
+    try:
+        snapshot_id = record_price_snapshot(
+            origin=req.origin,
+            destination=req.destination,
+            travel_date=req.depart_date,
+            price_inr=baseline_price,
+        )
+        if not isinstance(snapshot_id, int) or snapshot_id <= 0:
+            raise RuntimeError("snapshot_persist_failed")
+    except Exception as exc:
+        booking_id = held.get("id")
+        cancelled = False
+        if booking_id is not None:
+            try:
+                cancelled = bool(await asyncio.to_thread(cancel_booking, int(booking_id)))
+            except Exception:
+                logger.exception("tracking_setup_cleanup_cancel_failed")
+        logger.warning(
+            "record_price_snapshot failed for tracking setup",
+            extra={
+                "booking_id": booking_id,
+                "exception_type": type(exc).__name__,
+                "cleanup_cancelled": cancelled,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=_tracking_detail(
+                error="price_tracking_setup_failed",
+                reason="snapshot_persist_failed",
+                message="Price tracking setup failed before monitoring could start.",
+                booking_id=booking_id,
+                cleanup_cancelled=cancelled,
+            ),
+        )
+    return {
+        "action": "track_price",
+        "success": True,
+        "message": "Price tracking activated for this itinerary.",
+        "booking": held,
+        "best_flight": req.flight,
+        "monitoring_active": True,
+        "tracking_state": {
+            "booking_id": booking_id,
+            "baseline_snapshot_id": snapshot_id,
+            "route_tracking_ready": True,
+            "checkout_dependency": "not_required",
+        },
+    }
+
+
+@app.post("/booking/cancel")
+async def booking_cancel(req: BookingCancelRequest):
+    """Cancel a local booking follow-up record."""
+    from tools.booking_handoff import cancel_booking
+    ok = await asyncio.to_thread(cancel_booking, req.booking_id)
+    return {
+        "action": "cancel_booking",
+        "booking_id": req.booking_id,
+        "success": ok,
+        "message": "Booking cancelled." if ok else "Booking could not be cancelled.",
+    }
+
+
+@app.get("/bookings/{booking_id}")
+async def booking_get(booking_id: int):
+    from tools.booking_handoff import get_booking
+    booking = await asyncio.to_thread(get_booking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="booking not found")
+    return booking
+
+
+@app.get("/bookings")
+async def booking_list(status: Optional[str] = None, limit: int = Query(100, ge=1, le=500)):
+    from tools.booking_handoff import list_bookings
+    bookings = await asyncio.to_thread(list_bookings, status, limit)
+    return {"count": len(bookings), "items": bookings}
+
+
+@app.get("/price-tracking/status")
+async def price_tracking_status():
+    status = getattr(app.state, "price_tracker_status", {}) or {}
+    return {
+        "enabled": bool(getattr(app.state, "price_tracker_enabled", False)),
+        "status": status,
+        "contract": _job_contract_payload(),
+    }
+
+
+@app.get("/price-tracking/alerts")
+async def price_tracking_alerts(booking_id: Optional[int] = None):
+    from tools.price_tracker import get_unacknowledged_alerts
+    alerts = await asyncio.to_thread(get_unacknowledged_alerts, booking_id)
+    return {"count": len(alerts), "items": alerts}
+
+
+@app.post("/price-tracking/alerts/{alert_id}/ack")
+async def price_tracking_ack(alert_id: int):
+    from tools.price_tracker import acknowledge_alert
+    ok = await asyncio.to_thread(acknowledge_alert, alert_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="alert not found")
+    return {"alert_id": alert_id, "acknowledged": True}
+
+
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     """Retrieve the current status and result of a background job."""
@@ -1660,7 +2440,10 @@ async def get_job(job_id: str):
     job = await get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+    payload = dict(job)
+    payload.pop("event_seq", None)
+    payload["contract"] = _job_contract_payload()
+    return payload
 
 
 @app.get("/jobs/{job_id}/events")
@@ -1697,18 +2480,138 @@ async def job_events(request: Request, job_id: str):
                 return str(obj)                          # fallback
 
             evt = to_serializable(evt)
+            event_name = str(evt.get("event") or "job_event")
 
             # Send event as SSE data (client will parse JSON)
-            yield f"data: {json.dumps(evt)}\n\n"
+            yield f"event: {event_name}\n" + f"data: {json.dumps(evt)}\n\n"
 
             # Close stream on terminal event
-            if evt.get("type") in ("closed", "done", "error"):
+            if evt.get("event") in ("closed", "done", "error", "cancelled"):
                 break
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Request cancellation for a queued or running job."""
+    result = await job_queue.request_cancel_job(job_id)
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="job not found")
+    payload = dict(result)
+    job = payload.get("job") or {}
+    if isinstance(job, dict):
+        job.pop("event_seq", None)
+        job["contract"] = _job_contract_payload()
+        payload["job"] = job
+    return payload
+
+
 # Admin‑protected debug endpoints
+def _iter_key_status_entries(status_payload: Dict[str, Any]):
+    for service, entries in (status_payload or {}).items():
+        if isinstance(entries, list):
+            iterable = enumerate(entries)
+        elif isinstance(entries, dict):
+            iterable = []
+            for k, v in entries.items():
+                try:
+                    idx = int(k)
+                except Exception:
+                    idx = len(iterable)
+                iterable.append((idx, v))
+        else:
+            iterable = [(0, entries)]
+        yield service, iterable
+
+
+def _sanitize_debug_key_status(status_payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for service, iterable in _iter_key_status_entries(status_payload):
+        rows = []
+        for idx, entry in iterable:
+            if isinstance(entry, dict):
+                row = {
+                    "index": int(entry.get("index", idx) or idx),
+                    "active": bool(entry.get("active", False)),
+                    "in_use": int(entry.get("in_use", 0) or 0),
+                    "exhausted_until": entry.get("exhausted_until"),
+                    "pending_exhaust": bool(entry.get("pending_exhaust", False)),
+                    "pending_clear": bool(entry.get("pending_clear", False)),
+                    "failure_classification": entry.get("failure_classification"),
+                }
+                if service == "serpapi":
+                    row["searches_left"] = entry.get("searches_left")
+                    row["last_checked_at"] = entry.get("last_checked_at")
+                rows.append(row)
+            elif isinstance(entry, str):
+                rows.append(
+                    {
+                        "index": idx,
+                        "active": entry == "active",
+                        "in_use": 0,
+                        "exhausted_until": None,
+                        "pending_exhaust": False,
+                        "pending_clear": False,
+                        "failure_classification": None,
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "index": idx,
+                        "active": False,
+                        "in_use": 0,
+                        "exhausted_until": None,
+                        "pending_exhaust": False,
+                        "pending_clear": False,
+                        "failure_classification": None,
+                    }
+                )
+        sanitized[service] = rows
+    return sanitized
+
+
+def _sanitize_serpapi_reconcile_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    return {
+        "running": bool(meta.get("running", False)),
+        "last_status": meta.get("last_status"),
+        "last_started_at": meta.get("last_started_at"),
+        "last_completed_at": meta.get("last_completed_at"),
+    }
+
+
+def _sanitize_health_key_status(status_payload: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for service, iterable in _iter_key_status_entries(status_payload):
+        rows = []
+        for idx, entry in iterable:
+            if isinstance(entry, dict):
+                active = bool(entry.get("active", False))
+                rows.append(
+                    {
+                        "index": int(entry.get("index", idx) or idx),
+                        "active": active,
+                        "state": "active" if active else "exhausted",
+                    }
+                )
+            elif isinstance(entry, str):
+                active = entry == "active"
+                rows.append(
+                    {
+                        "index": idx,
+                        "active": active,
+                        "state": "active" if active else "exhausted",
+                    }
+                )
+            else:
+                rows.append({"index": idx, "active": False, "state": "exhausted"})
+        out[service] = rows
+    return out
+
+
 @app.get("/debug/keys", dependencies=[Depends(require_admin_token)])
 async def debug_keys():
     """Return masked keys and their status (active/exhausted until). Requires admin token."""
@@ -1717,7 +2620,12 @@ async def debug_keys():
         status = key_manager.status()
         if asyncio.iscoroutine(status):
             status = await status
-        return status
+        return {
+            "services": _sanitize_debug_key_status(status),
+            "serpapi_reconciliation": _sanitize_serpapi_reconcile_meta(
+                key_manager.serpapi_reconcile_status()
+            ),
+        }
     except Exception:
         logger.exception("debug_keys_failed")
         raise HTTPException(status_code=500, detail="key manager error")
@@ -1732,6 +2640,81 @@ async def reload_keys_endpoint():
     except Exception:
         logger.exception("debug_keys_reload_failed")
         raise HTTPException(status_code=500, detail="reload failed")
+
+
+@app.get("/debug/provider-state/overrides", dependencies=[Depends(require_admin_token)])
+async def debug_provider_state_overrides(
+    provider: Optional[str] = Query(None),
+    include_inactive: bool = Query(False),
+):
+    try:
+        rows = await key_manager.list_provider_state_overrides(
+            provider=provider,
+            include_inactive=include_inactive,
+        )
+        return {"overrides": rows}
+    except Exception:
+        logger.exception("debug_provider_state_overrides_failed")
+        raise HTTPException(status_code=500, detail="provider state override query failed")
+
+
+@app.post("/debug/provider-state/overrides", dependencies=[Depends(require_admin_token)])
+async def debug_provider_state_override_upsert(req: ProviderStateOverrideRequest):
+    try:
+        scope_identifier = req.scope_identifier
+        if req.scope_type == "key" and not scope_identifier:
+            if req.key_index is None:
+                raise HTTPException(status_code=400, detail="scope_identifier or key_index is required for key scope")
+            scope_identifier = await key_manager.key_scope_identifier(req.provider, int(req.key_index))
+            if not scope_identifier:
+                raise HTTPException(status_code=404, detail="provider key index not found for key scope override")
+        row = await key_manager.set_provider_state_override(
+            provider=req.provider,
+            scope_type=req.scope_type,
+            scope_identifier=scope_identifier,
+            override_type=req.override_type,
+            active_until=req.active_until,
+            note=req.note,
+        )
+        return {"status": "ok", "override": row}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("debug_provider_state_override_upsert_failed")
+        raise HTTPException(status_code=500, detail="provider state override upsert failed")
+
+
+@app.post("/debug/provider-state/overrides/{override_id}/disable", dependencies=[Depends(require_admin_token)])
+async def debug_provider_state_override_disable(override_id: int):
+    try:
+        disabled = await key_manager.disable_provider_state_override(override_id)
+        if not disabled:
+            raise HTTPException(status_code=404, detail="override not found")
+        return {"status": "disabled", "override_id": int(override_id)}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("debug_provider_state_override_disable_failed")
+        raise HTTPException(status_code=500, detail="provider state override disable failed")
+
+
+@app.post("/debug/provider-state/reconcile/serpapi", dependencies=[Depends(require_admin_token)])
+async def debug_provider_state_reconcile_serpapi(
+    key_name_fingerprints: Optional[list[str]] = None,
+):
+    try:
+        normalized = {
+            str(item or "").strip()
+            for item in (key_name_fingerprints or [])
+            if str(item or "").strip()
+        }
+        result = await key_manager.reconcile_serpapi_account_state(
+            key_name_fingerprints=normalized or None
+        )
+        return {"status": "ok", "result": result}
+    except Exception:
+        logger.exception("debug_provider_state_reconcile_serpapi_failed")
+        raise HTTPException(status_code=500, detail="serpapi reconcile failed")
 
 
 @app.get("/health/live")
@@ -1751,20 +2734,6 @@ async def readiness():
             media_type="application/json"
         )
     prewarm = getattr(app.state, "llm_prewarm", {}) or {}
-    if prewarm.get("enabled") and prewarm.get("status") in {"scheduled", "running"}:
-        health = {
-            "status": "warming",
-            "llm_prewarm": {
-                "enabled": True,
-                "best_effort": bool(prewarm.get("best_effort", True)),
-                "status": prewarm.get("status"),
-            },
-        }
-        return Response(
-            content=json.dumps(health),
-            status_code=503,
-            media_type="application/json"
-        )
     return {
         "status": "ok",
         "llm_prewarm": {
@@ -2186,57 +3155,9 @@ async def health_deep():
 
 @app.get("/health/keys")
 async def health_keys():
-    """Return key manager metadata status (no secret values)."""
+    """Return high-level key status (public, no detailed operational metadata)."""
     status = await key_manager.get_status()
-
-    out = {}
-    for service, entries in (status or {}).items():
-        rows = []
-        if isinstance(entries, list):
-            iterable = enumerate(entries)
-        elif isinstance(entries, dict):
-            # Backward compatibility if a dict shape is returned.
-            iterable = []
-            for k, v in entries.items():
-                try:
-                    idx = int(k)
-                except Exception:
-                    idx = len(iterable)
-                iterable.append((idx, v))
-        else:
-            iterable = [(0, entries)]
-
-        for idx, entry in iterable:
-            if isinstance(entry, dict):
-                rows.append(
-                    {
-                        "index": entry.get("index", idx),
-                        "active": bool(entry.get("active", False)),
-                        "in_use": int(entry.get("in_use", 0) or 0),
-                        "exhausted_until": entry.get("exhausted_until"),
-                    }
-                )
-            elif isinstance(entry, str):
-                rows.append(
-                    {
-                        "index": idx,
-                        "active": entry == "active",
-                        "in_use": 0,
-                        "exhausted_until": None,
-                    }
-                )
-            else:
-                rows.append(
-                    {
-                        "index": idx,
-                        "active": False,
-                        "in_use": 0,
-                        "exhausted_until": None,
-                    }
-                )
-        out[service] = rows
-
-    return out
+    return _sanitize_health_key_status(status)
 
 
 @app.get("/metrics")

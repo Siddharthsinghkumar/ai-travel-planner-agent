@@ -13,6 +13,8 @@ type Props = {
   resultVersion?: number;
   onRecentQueriesChange?: (queries: string[]) => void;
   devRoutingOverrides?: DevRoutingOverrides | null;
+  asyncMode?: boolean;
+  onAsyncModeChange?: (next: boolean) => void;
 };
 
 export default function QueryForm({
@@ -21,6 +23,8 @@ export default function QueryForm({
   resultVersion = 0,
   onRecentQueriesChange,
   devRoutingOverrides = null,
+  asyncMode = false,
+  onAsyncModeChange,
 }: Props) {
   const VIA_STOPOVER_INSTRUCTION_RE = /\b(via|stopover|stop over|through|connecting through|with stop in|stop in)\b/i;
   const [query, setQuery] = useState("Find cheap flight Delhi to Mumbai tomorrow");
@@ -28,6 +32,10 @@ export default function QueryForm({
   const [destination, setDestination] = useState("");
   const [stopover, setStopover] = useState("");
   const [date, setDate] = useState("");
+  const [returnDate, setReturnDate] = useState("");
+  const [directOnly, setDirectOnly] = useState(false);
+  const [cabin, setCabin] = useState<"any" | "economy" | "premium" | "business" | "first">("any");
+  const [baggagePref, setBaggagePref] = useState<"any" | "hand" | "checked">("any");
   const [tripType, setTripType] = useState<"one-way" | "round-trip" | "via-stopover">("one-way");
   const [tabChoiceEverExplicit, setTabChoiceEverExplicit] = useState(false);
   const [manualTabChangedSinceLastResult, setManualTabChangedSinceLastResult] = useState(false);
@@ -51,6 +59,9 @@ export default function QueryForm({
   const QUERY_MAX_HEIGHT = 280;
   const datePreview = date
     ? new Date(`${date}T00:00:00`).toLocaleDateString("en-GB")
+    : "dd/mm/yyyy";
+  const returnDatePreview = returnDate
+    ? new Date(`${returnDate}T00:00:00`).toLocaleDateString("en-GB")
     : "dd/mm/yyyy";
 
   useEffect(() => {
@@ -126,6 +137,12 @@ export default function QueryForm({
       setTripType(resolvedTripType);
     }
 
+    if (resolvedTripType === "round-trip" && date.trim() && returnDate.trim() && returnDate < date) {
+      setFormError("Return date must be the same day or after the departure date.");
+      setIsSubmitting(false);
+      return;
+    }
+
     if (resolvedTripType === "via-stopover") {
       const stopoverText = stopover.trim();
       const hasViaInstruction = VIA_STOPOVER_INSTRUCTION_RE.test(finalQuery);
@@ -142,6 +159,36 @@ export default function QueryForm({
       } else if (!hasViaInstruction && stopoverText) {
         finalQuery = `${finalQuery} via ${stopoverText}`.trim();
       }
+    }
+
+    if (resolvedTripType === "round-trip" && returnDate.trim()) {
+      const hasReturnHint = /\b(return|returning|come back)\b/i.test(finalQuery);
+      if (!hasReturnHint) {
+        finalQuery = `${finalQuery} returning on ${returnDate.trim()}`.trim();
+      }
+      payload.return_date = returnDate.trim();
+    }
+
+    if (directOnly && !/\b(direct|nonstop|non-stop)\b/i.test(finalQuery)) {
+      finalQuery = `${finalQuery} direct flights only`.trim();
+    }
+    if (cabin !== "any") {
+      const cabinPhrase =
+        cabin === "premium" ? "premium economy class" : `${cabin} class`;
+      if (!new RegExp(`\\b${cabin.replace("-", " ")}\\b|\\bcabin\\b|\\bclass\\b`, "i").test(finalQuery)) {
+        finalQuery = `${finalQuery} ${cabinPhrase}`.trim();
+      }
+      payload.cabin = cabin;
+    }
+    if (baggagePref !== "any") {
+      const baggagePhrase = baggagePref === "hand" ? "cabin baggage only" : "checked baggage included";
+      if (!/\b(baggage|luggage|carry-on|carry on)\b/i.test(finalQuery)) {
+        finalQuery = `${finalQuery} ${baggagePhrase}`.trim();
+      }
+      payload.baggage_pref = baggagePref;
+    }
+    if (directOnly) {
+      payload.direct_only = true;
     }
 
     if (finalQuery) {
@@ -168,7 +215,7 @@ export default function QueryForm({
   }
 
   return (
-    <form onSubmit={handleSubmit} className="glass-form planner-form">
+    <form onSubmit={handleSubmit} className="glass-form planner-form" data-testid="planner-form">
       <div className="trip-tabs">
         <button
           type="button"
@@ -178,6 +225,7 @@ export default function QueryForm({
             if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
           }}
           className={`trip-tab ${tripType === "one-way" ? "active" : ""}`}
+          data-testid="trip-tab-one-way"
         >
           One-way
         </button>
@@ -189,6 +237,7 @@ export default function QueryForm({
             if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
           }}
           className={`trip-tab ${tripType === "round-trip" ? "active" : ""}`}
+          data-testid="trip-tab-round-trip"
         >
           Round-trip
         </button>
@@ -200,6 +249,7 @@ export default function QueryForm({
             if (resultVersion > 0) setManualTabChangedSinceLastResult(true);
           }}
           className={`trip-tab ${tripType === "via-stopover" ? "active" : ""}`}
+          data-testid="trip-tab-via-stopover"
         >
           Via / Stopover
         </button>
@@ -222,9 +272,10 @@ export default function QueryForm({
             onChange={(e) => setQuery(e.target.value)}
             rows={1}
             className="nl-input"
+            data-testid="query-input"
           />
         </div>
-        <button type="submit" className="nl-send" disabled={disabled} aria-label="Submit query">
+        <button type="submit" className="nl-send" disabled={disabled} aria-label="Submit query" data-testid="submit-query">
           <span className="nl-send__arrow" aria-hidden="true">→</span>
         </button>
       </div>
@@ -241,6 +292,7 @@ export default function QueryForm({
             value={origin}
             onChange={(e) => setOrigin(e.target.value)}
             className="f-input"
+            data-testid="input-origin"
           />
         </label>
         <label className="field-group">
@@ -250,6 +302,7 @@ export default function QueryForm({
             value={destination}
             onChange={(e) => setDestination(e.target.value)}
             className="f-input"
+            data-testid="input-destination"
           />
         </label>
         <label className="field-group">
@@ -263,9 +316,27 @@ export default function QueryForm({
               onChange={(e) => setDate(e.target.value)}
               className="date-native f-date"
               lang="en-GB"
+              data-testid="input-date"
             />
           </div>
         </label>
+        {tripType === "round-trip" && (
+          <label className="field-group">
+            <span className="field-label">Return date</span>
+            <div className="date-shell">
+              <span className={`date-display ${returnDate ? "date-display--value" : ""}`}>{returnDatePreview}</span>
+              <span className="date-icon" aria-hidden="true">↩</span>
+              <input
+                type="date"
+                value={returnDate}
+                onChange={(e) => setReturnDate(e.target.value)}
+                className="date-native f-date"
+                lang="en-GB"
+                data-testid="input-return-date"
+              />
+            </div>
+          </label>
+        )}
         {tripType === "via-stopover" && (
           <label className="field-group">
             <span className="field-label">Stopover</span>
@@ -274,13 +345,71 @@ export default function QueryForm({
               value={stopover}
               onChange={(e) => setStopover(e.target.value)}
               className="f-input"
+              data-testid="input-stopover"
             />
           </label>
         )}
       </div>
-      {formError && <div className="notice notice--error notice--inline">{formError}</div>}
+      <div className="fields-row">
+        <label className="field-group">
+          <span className="field-label">Cabin</span>
+          <select
+            value={cabin}
+            onChange={(e) => setCabin(e.target.value as "any" | "economy" | "premium" | "business" | "first")}
+            className="f-input"
+            data-testid="select-cabin"
+          >
+            <option value="any">Any cabin</option>
+            <option value="economy">Economy</option>
+            <option value="premium">Premium economy</option>
+            <option value="business">Business</option>
+            <option value="first">First</option>
+          </select>
+        </label>
+        <label className="field-group">
+          <span className="field-label">Baggage</span>
+          <select
+            value={baggagePref}
+            onChange={(e) => setBaggagePref(e.target.value as "any" | "hand" | "checked")}
+            className="f-input"
+            data-testid="select-baggage"
+          >
+            <option value="any">Any</option>
+            <option value="hand">Cabin baggage only</option>
+            <option value="checked">Checked bag</option>
+          </select>
+        </label>
+        <label className="field-group">
+          <span className="field-label">Direct only</span>
+          <input
+            type="checkbox"
+            checked={directOnly}
+            onChange={(e) => setDirectOnly(e.target.checked)}
+            className="f-input"
+            data-testid="toggle-direct-only"
+          />
+        </label>
+      </div>
+      {formError && <div className="notice notice--error notice--inline" data-testid="notice-error">{formError}</div>}
 
       <div className="card-footer min-w-0">
+        <div className="async-toggle">
+          <label className="inline-flex items-center gap-2 text-xs text-slate-400">
+            <input
+              type="checkbox"
+              checked={asyncMode}
+              onChange={(e) => onAsyncModeChange?.(e.target.checked)}
+              disabled={disabled}
+              data-testid="toggle-async"
+            />
+            Run in background (async job)
+          </label>
+          {asyncMode && (
+            <span className="form-hint">
+              Async jobs run in-process and clear on restart. Keep this tab open until results load.
+            </span>
+          )}
+        </div>
         <button
           type="submit"
           disabled={disabled || isSubmitting}

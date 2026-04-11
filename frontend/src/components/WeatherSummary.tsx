@@ -73,6 +73,7 @@ export default function WeatherSummary({
       <section
         className="weather-summary weather-summary--loading"
         aria-label={isLoading ? "Loading weather" : "Weather placeholder"}
+        data-testid="weather-summary"
       >
         <div className="weather-summary__head">
           <h2 className="weather-summary__title">Weather Outlook</h2>
@@ -135,7 +136,7 @@ export default function WeatherSummary({
   }
 
   return (
-    <section className="weather-summary weather-summary--ready">
+    <section className="weather-summary weather-summary--ready" data-testid="weather-summary" data-weather-ready="true">
       <div className="weather-summary__head">
         <h2 className="weather-summary__title">Weather Outlook</h2>
         <span key={resolvedDestinationLabel} className="best-lbl weather-summary__code">{resolvedDestinationLabel}</span>

@@ -70,7 +70,7 @@ export default function AIReasoningPanel({ finalJson, isStreaming, reasoningStep
   const showFooter = isStreaming || visibleReasoning.length === 0;
 
   return (
-    <div className="reasoning-panel">
+    <div className="reasoning-panel" data-testid="reasoning-panel">
       <h3 className="reasoning-title">Selection evidence</h3>
 
       {visibleReasoning.length > 0 ? (

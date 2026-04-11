@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import time
+import contextlib
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Optional, Dict, Any, Tuple
 
@@ -44,6 +45,7 @@ from core.retry import retry_async, RetryConfig
 from core.circuit_breaker import AsyncCircuitBreaker as CircuitBreaker
 # Metrics – Prometheus-style counters and histograms
 from core.metrics import LLM_REQUESTS, LLM_LATENCY, increment as _increment_metric
+from core.api_key_manager import key_manager
 
 logger = logging.getLogger(__name__)
 _legacy_runtime_notice_logged = False
@@ -99,16 +101,30 @@ class LLMClientInterface(ABC):
 _client_instance: Optional["AsyncLLMClient"] = None
 _init_lock = asyncio.Lock()
 
+
+async def _legacy_resolve_provider_key(service: str) -> Optional[str]:
+    """
+    Legacy compatibility helper: acquire one provider key via key manager.
+    This avoids direct environment credential reads in legacy async client init.
+    """
+    with contextlib.suppress(Exception):
+        await key_manager.load_env_keys()
+    try:
+        async with key_manager.reserve_key(service) as (_idx, key):
+            return key
+    except Exception:
+        return None
+
 async def init_llm_client() -> "AsyncLLMClient":
     """
     Async‑safe singleton initializer. Returns the global LLM client instance.
     Legacy compatibility initializer.
 
-    Reads configuration from environment variables:
+    Reads runtime mode configuration from environment variables.
+    Provider credentials are resolved through key manager pools.
         CLOUD_PROVIDER      - "openai", "anthropic", etc. (default "openai")
-        OPENAI_API_KEY      - required if CLOUD_PROVIDER == "openai"
-        ANTHROPIC_API_KEY   - required if CLOUD_PROVIDER == "anthropic"
-        (modern runtime path uses key-manager pools and provider adapters instead)
+        OPENAI_KEY_n / ANTHROPIC_KEY_n pools are loaded by key manager
+        (modern runtime path still uses router + cloud provider adapters)
         CLOUD_BASE_URL      - optional base URL override for cloud API
         OLLAMA_BASE_URL     - required (local Ollama endpoint)
     Raises ValueError if required variables are missing.
@@ -127,18 +143,22 @@ async def init_llm_client() -> "AsyncLLMClient":
             cloud_provider = os.getenv("CLOUD_PROVIDER", "openai").lower()
             ollama_base_url = os.getenv("OLLAMA_BASE_URL")
             cloud_base_url = os.getenv("CLOUD_BASE_URL")  # optional
-            openai_key = os.getenv("OPENAI_API_KEY")
-            anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+            openai_key = None
+            anthropic_key = None
 
             # Ollama is always required (local fallback)
             if not ollama_base_url:
                 raise ValueError("OLLAMA_BASE_URL environment variable must be set")
 
-            # Validate cloud credentials based on chosen provider
-            if cloud_provider == "openai" and not openai_key:
-                raise ValueError("OPENAI_API_KEY environment variable must be set for openai provider")
-            if cloud_provider == "anthropic" and not anthropic_key:
-                raise ValueError("ANTHROPIC_API_KEY environment variable must be set for anthropic provider")
+            # Validate cloud credentials based on chosen provider, resolving through key manager.
+            if cloud_provider == "openai":
+                openai_key = await _legacy_resolve_provider_key("openai")
+                if not openai_key:
+                    raise ValueError("No usable OpenAI key available from key manager for openai provider")
+            if cloud_provider == "anthropic":
+                anthropic_key = await _legacy_resolve_provider_key("anthropic")
+                if not anthropic_key:
+                    raise ValueError("No usable Anthropic key available from key manager for anthropic provider")
             # For other providers (e.g., "none", "gemini"), no key required here
 
             _client_instance = AsyncLLMClient(
@@ -229,14 +249,14 @@ class AsyncLLMClient(LLMClientInterface):
             if cloud_api_key:
                 headers["Authorization"] = f"Bearer {cloud_api_key}"
             else:
-                logger.warning("OPENAI_API_KEY not set – cloud calls may fail authentication")
+                logger.warning("No OpenAI key available in legacy async client initialization")
         elif self.cloud_provider == "anthropic":
             if anthropic_api_key:
                 headers["x-api-key"] = anthropic_api_key
                 # Anthropic may also require a version header; add if needed.
                 # headers["anthropic-version"] = "2023-06-01"
             else:
-                logger.warning("ANTHROPIC_API_KEY not set – cloud calls may fail authentication")
+                logger.warning("No Anthropic key available in legacy async client initialization")
         else:
             # For other providers, assume no auth or handled elsewhere.
             pass

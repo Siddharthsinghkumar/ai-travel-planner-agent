@@ -60,6 +60,7 @@ _last_call = 0.0
 _rate_lock = asyncio.Lock()
 RATE_LIMIT_SECONDS = float(os.getenv("WEATHER_RATE_LIMIT_SECONDS", "1.0"))
 WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS = int(os.getenv("WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS", "3600"))
+WEATHER_QUOTA_DEFAULT_COOLDOWN_SECONDS = int(os.getenv("WEATHER_QUOTA_DEFAULT_COOLDOWN_SECONDS", "3600"))
 
 # Retry settings (local)
 MAX_RETRIES = 3
@@ -256,7 +257,7 @@ async def _make_request_raw(
                 if not key:
                     raise WeatherAPIError("Weather provider keys exhausted (service unavailable)")
 
-                logger.info("[WEATHER] using key index: %s", idx)
+                logger.debug("[WEATHER] using key index: %s", idx)
 
                 # Add API key to params
                 params_with_key = dict(params)
@@ -268,7 +269,7 @@ async def _make_request_raw(
                     resp = await client.request(method, url, params=params_with_key)
                     latency = time.monotonic() - attempt_start
 
-                    logger.info(
+                    logger.debug(
                         "Weather API request attempt",
                         extra={
                             "url": url,
@@ -279,7 +280,7 @@ async def _make_request_raw(
                             "key_idx": idx,
                         },
                     )
-                    logger.info("[WEATHER] response status: %s (key index: %s)", resp.status_code, idx)
+                    logger.debug("[WEATHER] response status: %s (key index: %s)", resp.status_code, idx)
 
                     # SUCCESS
                     if resp.status_code == 200:
@@ -313,7 +314,9 @@ async def _make_request_raw(
                                 )
                                 continue
                             if cod == "429" or "limit" in msg or "quota" in msg:
-                                reset_ts = int((datetime.now() + timedelta(days=1)).timestamp())
+                                # Product-plan limits vary across OpenWeather products; use a short
+                                # operator-tunable hold unless upstream provides a precise reset hint.
+                                reset_ts = int(datetime.now().timestamp()) + max(300, WEATHER_QUOTA_DEFAULT_COOLDOWN_SECONDS)
                                 details = (data.get("message") or "")[:1000]
                                 await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason=f"quota | {details}")
                                 logger.warning("Weather key quota exceeded (text) — marked exhausted", extra={"key_idx": idx})
@@ -323,7 +326,7 @@ async def _make_request_raw(
                         await key_manager.record_usage("weather", idx)
 
                         total_time = time.monotonic() - overall_start
-                        logger.info(
+                        logger.debug(
                             "Weather API request successful (total)",
                             extra={
                                 "total_latency_sec": round(total_time, 3),
@@ -575,7 +578,7 @@ async def get_current_weather(
     global _TESTING_LOGGED
     if TESTING:
         if not _TESTING_LOGGED:
-            logger.info("TESTING mode enabled — returning fake weather results")
+            logger.debug("TESTING mode enabled — returning fake weather results")
             _TESTING_LOGGED = True
         return Weather(
             location=location,
@@ -926,7 +929,7 @@ async def get_forecast_for_date(
                 continue
 
     if best is not None:
-        logger.info(
+        logger.debug(
             "get_forecast_for_date: matched forecast",
             extra={"target": travel_date, "matched": best.forecast_date, "delta_days": best_delta}
         )

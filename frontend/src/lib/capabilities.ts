@@ -33,7 +33,7 @@ export const FEATURE_CAPABILITIES: FeatureCapability[] = [
     id: "booking-actions",
     title: "Booking actions in chat",
     description:
-      "Basic confirm/cancel/hold actions are available through explicit natural-language prompts in the query box; dedicated action buttons are not yet available.",
+      "Local hold/cancel actions are available through explicit natural-language prompts in the query box; real booking completion still happens on provider checkout pages.",
     status: "partial",
     note: "Chat-driven flow for now.",
   },

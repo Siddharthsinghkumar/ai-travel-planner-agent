@@ -1,8 +1,11 @@
 import contextlib
+import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 import httpx
+from prometheus_client import generate_latest
 
 import tools.airline_api as airline_api
 from tools.airline_api import (
@@ -201,6 +204,53 @@ async def test_search_flights_honors_total_attempt_budget_under_degraded_network
 
 
 @pytest.mark.asyncio
+async def test_search_flights_retry_budget_is_stable_across_repeated_degraded_calls(monkeypatch):
+    class _AlwaysKeyManager:
+        @contextlib.asynccontextmanager
+        async def reserve_key(self, _service):
+            yield 0, "serpapi-key-stable"
+
+        async def mark_exhausted(self, *_args, **_kwargs):
+            return None
+
+        async def record_usage(self, *_args, **_kwargs):
+            return None
+
+    class _RaisingClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, *_args, **_kwargs):
+            self.calls += 1
+            raise httpx.TimeoutException("simulated repeated timeout")
+
+    client = _RaisingClient()
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", _AlwaysKeyManager())
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(airline_api, "SERPAPI_MAX_RETRIES", 5)
+    monkeypatch.setattr(airline_api, "SERPAPI_TOTAL_ATTEMPT_BUDGET", 2)
+    monkeypatch.setattr(airline_api, "SERPAPI_RETRY_BASE_DELAY", 0.0)
+
+    for _ in range(3):
+        with pytest.raises(AirlineAPIError, match="retry budget exhausted"):
+            await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert client.calls == 6
+
+    metrics_text = generate_latest().decode()
+    assert 'retry_budget_exhausted_total{component="airline_search_flights"}' in metrics_text
+
+
+@pytest.mark.asyncio
 async def test_search_flights_rejects_unresolved_location_before_http(monkeypatch):
     monkeypatch.setattr(airline_api, "TESTING", False)
     monkeypatch.delenv("TESTING", raising=False)
@@ -248,8 +298,9 @@ async def test_search_flights_logs_key_source_and_masked_fingerprint(monkeypatch
     monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
     monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
     monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", True)
 
-    with caplog.at_level("INFO"):
+    with caplog.at_level("DEBUG"):
         flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
 
     assert flights
@@ -258,6 +309,118 @@ async def test_search_flights_logs_key_source_and_masked_fingerprint(monkeypatch
     assert record.client_mode == "shared_get_client"
     assert isinstance(record.key_fp, str)
     assert len(record.key_fp) == 10
+
+
+@pytest.mark.asyncio
+async def test_search_flights_success_account_check_non_200_is_non_blocking_info(monkeypatch, caplog):
+    dummy_km = _DummyKeyManager()
+    airline_api._last_account_check.clear()
+    client = _DummyClient(
+        [
+            _DummyResponse(
+                status_code=200,
+                json_data={
+                    "best_flights": [
+                        {
+                            "price": "6200",
+                            "total_duration": 120,
+                            "flights": [
+                                {
+                                    "airline": "TraceAir",
+                                    "flight_number": "TR100",
+                                    "departure_airport": {"time": "2026-03-20 06:00", "id": "DEL"},
+                                    "arrival_airport": {"time": "2026-03-20 08:00", "id": "BOM"},
+                                    "duration": 120,
+                                }
+                            ],
+                        }
+                    ],
+                    "other_flights": [],
+                },
+            ),
+            _DummyResponse(status_code=401, text="unauthorized"),
+        ]
+    )
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", dummy_km)
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", True)
+
+    with caplog.at_level("INFO"):
+        flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert flights
+    for _ in range(5):
+        if any(r.message == "Post-success account check skipped (non-blocking)" for r in caplog.records):
+            break
+        await asyncio.sleep(0)
+    assert all(record.message != "Account check failed" for record in caplog.records)
+    assert not any(
+        record.levelno >= logging.WARNING and "account check" in record.message.lower()
+        for record in caplog.records
+    )
+    deferred_records = [
+        r for r in caplog.records if r.message == "Post-success account check skipped (non-blocking)"
+    ]
+    if deferred_records:
+        assert deferred_records[0].status == 401
+
+
+@pytest.mark.asyncio
+async def test_search_flights_success_skips_post_success_account_check_when_disabled(monkeypatch):
+    dummy_km = _DummyKeyManager()
+    airline_api._last_account_check.clear()
+    client = _DummyClient(
+        [
+            _DummyResponse(
+                status_code=200,
+                json_data={
+                    "best_flights": [
+                        {
+                            "price": "6200",
+                            "total_duration": 120,
+                            "flights": [
+                                {
+                                    "airline": "TraceAir",
+                                    "flight_number": "TR100",
+                                    "departure_airport": {"time": "2026-03-20 06:00", "id": "DEL"},
+                                    "arrival_airport": {"time": "2026-03-20 08:00", "id": "BOM"},
+                                    "duration": 120,
+                                }
+                            ],
+                        }
+                    ],
+                    "other_flights": [],
+                },
+            ),
+            _DummyResponse(status_code=429, text="quota should not be checked in success hot path"),
+        ]
+    )
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", dummy_km)
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", False)
+
+    flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert flights
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio
@@ -583,3 +746,103 @@ async def test_search_flights_cache_round_trip_preserves_booking_artifacts(monke
     assert flights_2[0].shareable_link == "https://partner.example/share/abc"
     assert flights_2[0].booking_request["url"] == "https://partner.example/checkout/abc"
     assert client.calls == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_search_flights_extracts_nested_booking_artifacts_when_root_missing(monkeypatch):
+    dummy_km = _DummyKeyManager()
+    response = _DummyResponse(
+        status_code=200,
+        json_data={
+            "best_flights": [
+                {
+                    "price": "7100",
+                    "total_duration": 126,
+                    "flights": [
+                        {
+                            "airline": "NestedAir",
+                            "flight_number": "NA222",
+                            "departure_airport": {"time": "2026-03-20 08:10", "id": "DEL"},
+                            "arrival_airport": {"time": "2026-03-20 10:16", "id": "BOM"},
+                            "duration": 126,
+                            "booking_token": "tok_nested_leg",
+                            "shareable_link": "https://partner.example/share/nested",
+                            "booking_request": {
+                                "method": "POST",
+                                "url": "https://partner.example/checkout/nested",
+                                "post_data": {"token": "n1"},
+                            },
+                        }
+                    ],
+                }
+            ],
+            "other_flights": [],
+        },
+    )
+    client = _DummyClient([response])
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", dummy_km)
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+
+    flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert len(flights) == 1
+    assert flights[0].flight_no == "NA222"
+    assert flights[0].booking_token == "tok_nested_leg"
+    assert flights[0].shareable_link == "https://partner.example/share/nested"
+    assert flights[0].booking_request["url"] == "https://partner.example/checkout/nested"
+    assert flights[0].booking_request["method"] == "POST"
+    assert flights[0].booking_request["post_data"]["token"] == "n1"
+
+
+@pytest.mark.asyncio
+async def test_search_flights_does_not_promote_generic_nested_url_as_provider_artifact(monkeypatch):
+    dummy_km = _DummyKeyManager()
+    response = _DummyResponse(
+        status_code=200,
+        json_data={
+            "best_flights": [
+                {
+                    "price": "7200",
+                    "total_duration": 132,
+                    "flights": [
+                        {
+                            "airline": "NoiseAir",
+                            "flight_number": "NA401",
+                            "departure_airport": {"time": "2026-03-20 09:00", "id": "DEL"},
+                            "arrival_airport": {"time": "2026-03-20 11:12", "id": "BOM"},
+                            "duration": 132,
+                            "url": "https://partner.example/generic-unverified-url",
+                        }
+                    ],
+                }
+            ],
+            "other_flights": [],
+        },
+    )
+    client = _DummyClient([response])
+
+    async def _fake_get_circuit_breaker(_name: str):
+        return _DummyCircuitBreaker()
+
+    monkeypatch.setattr(airline_api, "TESTING", False)
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.setattr(airline_api, "api_key_manager", dummy_km)
+    monkeypatch.setattr(airline_api, "get_client", lambda: client)
+    monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
+    monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
+    monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
+
+    flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
+
+    assert len(flights) == 1
+    assert flights[0].provider_link is None
+    assert flights[0].booking_url is None

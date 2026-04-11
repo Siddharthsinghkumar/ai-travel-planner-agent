@@ -15,6 +15,7 @@ import logging
 import inspect
 from enum import Enum
 from typing import Callable, Awaitable, TypeVar, Optional, AsyncGenerator, Dict
+import core.metrics as app_metrics
 
 T = TypeVar("T")  # Return type of the protected function
 
@@ -143,6 +144,7 @@ class AsyncCircuitBreaker:
             if self._opened_at is not None and (time.monotonic() - self._opened_at) >= self.recovery_timeout:
                 self._state = BreakerState.HALF_OPEN
                 self._half_open_calls = 0
+                app_metrics.record_circuit_transition("open_to_half_open")
                 self._logger.info(
                     "Circuit breaker transitioned to HALF_OPEN after timeout",
                     extra={"event": "breaker_half_open", "timeout": self.recovery_timeout}
@@ -173,6 +175,7 @@ class AsyncCircuitBreaker:
         self._opened_at = time.monotonic()
         self._failure_count = 0
         self._half_open_calls = 0
+        app_metrics.record_circuit_transition("closed_or_half_open_to_open")
         self._logger.warning(
             "Circuit breaker opened",
             extra={"event": "breaker_open", "threshold": self.failure_threshold}
@@ -194,6 +197,7 @@ class AsyncCircuitBreaker:
 
         if self._state == BreakerState.HALF_OPEN:
             self._state = BreakerState.CLOSED
+            app_metrics.record_circuit_transition("half_open_to_closed")
             self._logger.info(
                 "Circuit breaker closed after successful call",
                 extra={"event": "breaker_closed"}

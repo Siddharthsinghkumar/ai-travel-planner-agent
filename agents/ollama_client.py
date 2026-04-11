@@ -636,7 +636,7 @@ async def generate(
     elif thinking_mode == "force":
         payload["options"]["think"] = True
 
-    logger.info(
+    logger.debug(
         "Ollama request started",
         extra={
             "model": resolved_model,
@@ -665,14 +665,14 @@ async def generate(
                 success = True
             except asyncio.CancelledError:
                 cancelled = True
-                logger.info("ollama_stream_cancelled", extra={"request_id": request_id})
+                logger.debug("ollama_stream_cancelled", extra={"request_id": request_id})
                 increment_llm_cancelled("ollama")
                 raise
             except Exception:
                 raise
             finally:
                 latency = time.monotonic() - start_time
-                logger.info(
+                logger.debug(
                     "Ollama streaming completed",
                     extra={"request_id": request_id, "latency_sec": latency}
                 )
@@ -688,7 +688,7 @@ async def generate(
             result = await _non_streaming_call(payload, request_id, resolved_timeout)
         except asyncio.CancelledError:
             # Client cancelled – increment cancellation metric and re-raise
-            logger.info("ollama_request_cancelled", extra={"request_id": request_id})
+            logger.debug("ollama_request_cancelled", extra={"request_id": request_id})
             increment_llm_cancelled("ollama")
             raise
         except Exception:
@@ -697,7 +697,7 @@ async def generate(
             raise
         else:
             latency = time.monotonic() - start_time
-            logger.info(
+            logger.debug(
                 "Ollama request succeeded",
                 extra={"request_id": request_id, "latency_sec": latency}
             )

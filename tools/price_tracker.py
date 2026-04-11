@@ -25,6 +25,7 @@ Two distinct capabilities:
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -515,6 +516,66 @@ def get_price_history(
 # 3. Background price-drop monitoring for HELD bookings
 # ----------------------------------------------------------------------
 
+def cleanup_invalid_held_tracking_rows() -> Dict[str, Any]:
+    """
+    One-shot cleanup for legacy HELD rows missing route/date tracking prerequisites.
+    This is intended for startup hygiene so recurring tracker warning churn is avoided.
+    """
+    from tools.booking_handoff import (
+        get_active_held_bookings,
+        expire_held_booking_for_tracking_invalid_data,
+    )
+
+    held_rows = get_active_held_bookings()
+    summary: Dict[str, Any] = {
+        "scanned": len(held_rows),
+        "expired": 0,
+        "expired_booking_ids": [],
+    }
+    if not held_rows:
+        return summary
+
+    for booking in held_rows:
+        booking_id = booking.get("id")
+        flight_dict = booking.get("flight", {}) if isinstance(booking.get("flight"), dict) else {}
+        origin = flight_dict.get("origin") or flight_dict.get("departure_iata") or ""
+        destination = flight_dict.get("destination") or flight_dict.get("arrival_iata") or ""
+        travel_date = flight_dict.get("date") or ""
+        missing_fields = []
+        if not origin:
+            missing_fields.append("origin")
+        if not destination:
+            missing_fields.append("destination")
+        if not travel_date:
+            missing_fields.append("travel_date")
+        if not missing_fields:
+            continue
+        if booking_id is None:
+            continue
+        with contextlib.suppress(Exception):
+            expired = bool(
+                expire_held_booking_for_tracking_invalid_data(
+                    int(booking_id),
+                    reason=f"startup_missing_tracking_fields:{','.join(missing_fields)}",
+                    emit_warning=False,
+                )
+            )
+            if expired:
+                summary["expired"] += 1
+                summary["expired_booking_ids"].append(int(booking_id))
+
+    if summary["expired"]:
+        logger.warning(
+            "Expired legacy held bookings with invalid tracking prerequisites during startup cleanup",
+            extra={
+                "scanned": summary["scanned"],
+                "expired": summary["expired"],
+                "expired_booking_ids": summary["expired_booking_ids"][:20],
+            },
+        )
+    return summary
+
+
 async def check_held_booking_prices() -> list[dict]:
     """
     Background job: re-query flight prices for every active HELD booking and
@@ -539,7 +600,11 @@ async def check_held_booking_prices() -> list[dict]:
     """
     # Lazy imports to avoid circular dependencies at module load time
     from tools.airline_api import search_flights, search_with_booking_token, AirlineAPIError
-    from tools.booking_handoff import get_active_held_bookings, build_booking_handoff_url
+    from tools.booking_handoff import (
+        get_active_held_bookings,
+        build_booking_handoff_url,
+        expire_held_booking_for_tracking_invalid_data,
+    )
 
     held = get_active_held_bookings()
     if not held:
@@ -557,10 +622,35 @@ async def check_held_booking_prices() -> list[dict]:
         held_price  = _extract_price_inr(flight_dict.get("price_inr"))
         booking_token = flight_dict.get("booking_token")  # may be None
 
-        if not origin or not destination or not travel_date or held_price is None:
+        missing_fields = []
+        if not origin:
+            missing_fields.append("origin")
+        if not destination:
+            missing_fields.append("destination")
+        if not travel_date:
+            missing_fields.append("travel_date")
+        if held_price is None:
+            missing_fields.append("held_price")
+
+        if missing_fields:
+            invalidation_applied = False
+            # Quarantine legacy malformed holds with missing route/date so the same
+            # rows don't repeatedly trigger tracker warnings.
+            if any(field in {"origin", "destination", "travel_date"} for field in missing_fields):
+                with contextlib.suppress(Exception):
+                    invalidation_applied = bool(
+                        expire_held_booking_for_tracking_invalid_data(
+                            int(booking["id"]),
+                            reason=f"missing_tracking_fields:{','.join(missing_fields)}",
+                        )
+                    )
             logger.warning(
-                "Skipping held booking: missing route data",
-                extra={"booking_id": booking["id"]}
+                "Skipping held booking: missing tracking prerequisites",
+                extra={
+                    "booking_id": booking["id"],
+                    "missing_fields": ",".join(missing_fields),
+                    "expired_legacy_invalid_row": invalidation_applied,
+                },
             )
             continue
 

@@ -3,20 +3,18 @@
 Booking Handoff Tool
 
 Responsibilities:
-- Hold, confirm, cancel, and expire booking records in the database
-- Resolve the best possible deep-link for a flight using (in priority order):
-    1. SerpAPI booking_token  → calls /search?engine=google_flights_booking to get
-                                airline-native checkout URL (exact itinerary, best UX)
-    2. shareable_link         → direct Google Flights shareable link (still pre-filled)
-    3. Google Flights fallback→ clean HTTPS search URL (last resort, no guessing)
+- Hold, cancel, and expire local booking-follow-up records in the database
+- Resolve booking handoff strictly through SerpAPI booking-token artifacts:
+    1. SerpAPI booking_token  → /search?engine=google_flights_booking follow-ups
+       that produce a replayable non-Google provider checkout URL.
+    2. If provider checkout cannot be resolved, booking handoff is unavailable.
 
-NOTE: The old AIRLINE_BOOKING_URLS dict that guessed airline homepages is removed.
-      Those URLs just dumped the user on a generic search page, which is worse than
-      the Google Flights fallback. The SerpAPI token gives us the real checkout page.
+No Google Flights fallback/search-assist URL is emitted by booking flows.
 """
 
 import asyncio
 import contextlib
+import html
 import hashlib
 import logging
 import re
@@ -25,7 +23,7 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 
 import httpx
 from cachetools import TTLCache
@@ -35,16 +33,17 @@ from core.api_key_manager import key_manager as api_key_manager
 from core.env_config import get_env_bool, get_env_float, get_env_int
 from core.http_client import get_client
 from core.request_context import get_request_id
+import core.metrics as app_metrics
 
 logger = logging.getLogger(__name__)
 BOOKING_OPTIONS_HTTP_TIMEOUT = get_env_float("BOOKING_OPTIONS_HTTP_TIMEOUT", 2.2)
-BOOKING_OPTIONS_RETRIES = max(1, get_env_int("BOOKING_OPTIONS_RETRIES", 3))
+BOOKING_OPTIONS_RETRIES = max(1, get_env_int("BOOKING_OPTIONS_RETRIES", 2))
 BOOKING_OPTIONS_RETRY_BACKOFF = get_env_float("BOOKING_OPTIONS_RETRY_BACKOFF", 0.15)
 BOOKING_OPTIONS_ROUND_TRIP_TIMEOUT_BONUS = max(
     0.0,
     get_env_float("BOOKING_OPTIONS_ROUND_TRIP_TIMEOUT_BONUS", 0.35),
 )
-BOOKING_OPTIONS_ATTEMPTS_BUDGET = min(2, BOOKING_OPTIONS_RETRIES)
+BOOKING_OPTIONS_ATTEMPTS_BUDGET = max(2, min(4, BOOKING_OPTIONS_RETRIES + 1))
 BOOKING_TOKEN_RESOLVE_TIMEOUT_FLOOR = (
     BOOKING_OPTIONS_HTTP_TIMEOUT * BOOKING_OPTIONS_ATTEMPTS_BUDGET
     + BOOKING_OPTIONS_RETRY_BACKOFF * max(0, BOOKING_OPTIONS_ATTEMPTS_BUDGET - 1)
@@ -57,6 +56,10 @@ BOOKING_TOKEN_RESOLVE_TIMEOUT = max(
 BOOKING_REQUEST_HTTP_TIMEOUT = get_env_float("BOOKING_REQUEST_HTTP_TIMEOUT", 2.0)
 BOOKING_REQUEST_RETRIES = max(1, get_env_int("BOOKING_REQUEST_RETRIES", 2))
 BOOKING_REQUEST_RETRY_BACKOFF = get_env_float("BOOKING_REQUEST_RETRY_BACKOFF", 0.12)
+BOOKING_REQUEST_RESPONSE_SNIPPET_BYTES = max(
+    1200,
+    get_env_int("BOOKING_REQUEST_RESPONSE_SNIPPET_BYTES", 12000),
+)
 POST_HANDOFF_TTL_SECONDS = max(180, get_env_int("POST_HANDOFF_TTL_SECONDS", 900))
 POST_HANDOFF_MAX_ENTRIES = max(50, get_env_int("POST_HANDOFF_MAX_ENTRIES", 1000))
 POST_HANDOFF_REQUIRE_PERSISTENCE = get_env_bool("POST_HANDOFF_REQUIRE_PERSISTENCE", default=True)
@@ -75,6 +78,10 @@ _candidate_fallback_log_counts: TTLCache[str, int] = TTLCache(
     ttl=max(60, get_env_int("BOOKING_CANDIDATE_FALLBACK_LOG_TTL_SECONDS", 600)),
 )
 _handoff_cache_lock = threading.RLock()
+_META_REFRESH_TAG_RE = re.compile(
+    r"<meta[^>]*http-equiv\s*=\s*['\"]?\s*refresh\s*['\"]?[^>]*>",
+    re.IGNORECASE,
+)
 
 
 class BookingOptionsFetchError(RuntimeError):
@@ -97,7 +104,11 @@ def _token_fingerprint(token: str) -> str:
 
 def _candidate_fallback_log_key(*, exception_bucket: str, token_fp: str, route_type: str) -> str:
     request_id = get_request_id() or "unknown"
-    return f"{request_id}:{exception_bucket}:{token_fp}:{route_type}"
+    # Keep throttle scope request-level so candidate bursts do not spam logs.
+    # `token_fp` is still recorded in log extras for diagnostics.
+    if request_id == "unknown":
+        return f"{request_id}:{exception_bucket}:{route_type}:{token_fp}"
+    return f"{request_id}:{exception_bucket}:{route_type}"
 
 
 def _should_emit_candidate_fallback_log(
@@ -123,7 +134,7 @@ def _should_emit_candidate_fallback_log(
         _candidate_fallback_log_counts[key] = occurrence
     if occurrence == 1:
         return True, occurrence
-    if occurrence in {5, 10, 20}:
+    if occurrence in {8, 16, 32}:
         return True, occurrence
     return False, occurrence
 
@@ -151,6 +162,20 @@ def _classify_booking_options_exception(exc: Exception) -> str:
     return "unexpected"
 
 
+def _classify_http_status(status_code: Optional[int]) -> str:
+    if status_code in {401, 403}:
+        return "auth_failure"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code is None:
+        return "unknown_failure"
+    if 400 <= int(status_code) < 500:
+        return "request_failure"
+    if int(status_code) >= 500:
+        return "provider_failure"
+    return "unknown_failure"
+
+
 def _get_booking_http_client() -> httpx.AsyncClient:
     """
     Keep booking-options transport aligned with flight-search transport.
@@ -165,6 +190,12 @@ def _booking_resolution_cache_key(
     arrival_id: Optional[str],
     outbound_date: Optional[str],
     return_date: Optional[str],
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> str:
     raw = "|".join(
         [
@@ -173,6 +204,12 @@ def _booking_resolution_cache_key(
             str(arrival_id or ""),
             str(outbound_date or ""),
             str(return_date or ""),
+            str(include_airlines or ""),
+            "1" if deep_search else "0",
+            str(travel_class or ""),
+            str(adults or ""),
+            str(currency or ""),
+            str(hl or ""),
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -231,8 +268,199 @@ def _canonicalize_handoff_url(value: Optional[str], *, _depth: int = 0) -> Optio
     return raw
 
 
+def _is_brittle_google_tracker_url(value: Optional[str]) -> bool:
+    canonical = _canonicalize_handoff_url(value)
+    if not canonical:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(canonical)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if not _is_google_domain(host):
+        return False
+    return bool(re.match(r"^/travel/clk(?:/|$)", path))
+
+
 def _is_usable_handoff_url(value: Optional[str]) -> bool:
-    return _canonicalize_handoff_url(value) is not None
+    canonical = _canonicalize_handoff_url(value)
+    if not canonical:
+        return False
+    if _is_brittle_google_tracker_url(canonical):
+        return False
+    if _is_google_search_fallback_url(canonical):
+        return False
+    return True
+
+
+def _bridge_target_domain_path(value: Optional[str]) -> Tuple[str, str]:
+    canonical = _canonicalize_handoff_url(value)
+    if not canonical:
+        return "unknown", "unknown"
+    try:
+        parsed = urllib.parse.urlparse(canonical)
+    except Exception:
+        return "unknown", "unknown"
+    domain = (parsed.netloc or "unknown").lower()
+    path = parsed.path or "/"
+    return domain, path
+
+
+def _is_google_domain(host: Optional[str]) -> bool:
+    normalized = str(host or "").strip().lower()
+    if not normalized:
+        return False
+    return bool(re.search(r"(^|\.)google\.[a-z.]+$", normalized))
+
+
+def _domain_for_url(value: Optional[str]) -> Optional[str]:
+    canonical = _canonicalize_handoff_url(value)
+    if not canonical:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(canonical)
+    except Exception:
+        return None
+    host = (parsed.netloc or "").strip().lower()
+    return host or None
+
+
+def _iter_link_domains(payload: Any) -> Dict[str, int]:
+    link_keys = {"url", "link", "booking_url", "booking_link", "deeplink", "redirect_link", "endpoint"}
+    domain_counts: Dict[str, int] = {}
+    queue: List[Any] = [payload]
+    while queue:
+        node = queue.pop(0)
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and key.lower() in link_keys:
+                    domain = _domain_for_url(value)
+                    if domain:
+                        domain_counts[domain] = int(domain_counts.get(domain, 0)) + 1
+                elif isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+    return domain_counts
+
+
+def _option_sort_key(option: Dict[str, Any]) -> Tuple[int, float]:
+    price = option.get("price")
+    if isinstance(price, (int, float)):
+        return 0, float(price)
+    return 1, float("inf")
+
+
+def _select_best_replayable_partner_option(options: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not options:
+        return None
+    sorted_options = sorted(options, key=_option_sort_key)
+    for option in sorted_options:
+        link = str(option.get("link") or "").strip()
+        if not _is_usable_handoff_url(link):
+            continue
+        domain = _domain_for_url(link)
+        if not domain or _is_google_domain(domain):
+            continue
+        return option
+    return None
+
+
+def _summarize_booking_artifact_graph(
+    *,
+    payload: Dict[str, Any],
+    options: List[Dict[str, Any]],
+    booking_request: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    option_domains: Dict[str, int] = {}
+    replayable_partner_domains: Dict[str, int] = {}
+    google_tracker_options = 0
+    for option in options:
+        link = str(option.get("link") or "").strip()
+        domain = _domain_for_url(link)
+        if domain:
+            option_domains[domain] = int(option_domains.get(domain, 0)) + 1
+        if _is_brittle_google_tracker_url(link):
+            google_tracker_options += 1
+        if _is_usable_handoff_url(link) and domain and not _is_google_domain(domain):
+            replayable_partner_domains[domain] = int(replayable_partner_domains.get(domain, 0)) + 1
+
+    booking_request_domain = _domain_for_url((booking_request or {}).get("url"))
+    all_domain_counts = _iter_link_domains(payload)
+    non_google_domains = sorted([d for d in all_domain_counts.keys() if not _is_google_domain(d)])
+
+    return {
+        "inspected_sources": [
+            "booking_options[].link",
+            "booking_options[].together.link",
+            "booking_options[].booking_request",
+            "selected_flights[].booking_request",
+            "nested_provider_url_fields",
+        ],
+        "booking_options_count": len(options),
+        "booking_option_domains": sorted(option_domains.items(), key=lambda item: item[1], reverse=True)[:10],
+        "booking_option_google_tracker_count": google_tracker_options,
+        "replayable_partner_option_domains": sorted(
+            replayable_partner_domains.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:10],
+        "booking_request_present": bool(booking_request),
+        "booking_request_domain": booking_request_domain,
+        "booking_request_method": str((booking_request or {}).get("method") or "").upper() or None,
+        "booking_request_has_post_data": bool(
+            booking_request and booking_request.get("post_data") not in (None, "", {}, [])
+        ),
+        "all_url_domain_counts": sorted(all_domain_counts.items(), key=lambda item: item[1], reverse=True)[:12],
+        "all_non_google_domains": non_google_domains[:20],
+        "has_replayable_partner_option": bool(replayable_partner_domains),
+        "has_any_non_google_domain": bool(non_google_domains),
+        "only_google_click_or_google_domains": bool(all_domain_counts) and not bool(non_google_domains),
+    }
+
+
+def _build_unverified_google_tracker_post_bridge_payload(
+    *,
+    bridge_url: str,
+    reason: str,
+    request_url: str,
+    cache_hit: bool,
+    artifact_inspection: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    target_domain, target_path = _bridge_target_domain_path(request_url)
+    payload = {
+        "url": None,
+        "diagnostic_handoff_url": bridge_url,
+        "source": "booking_token",
+        "reason": reason,
+        "status": "unavailable",
+        "provider": "serpapi",
+        "handoff_mode": "unavailable",
+        "landing_guarantee": "none",
+        "artifact_field": "booking_request.post_followup_bridge",
+        "requires_browser_post": True,
+        "browser_landing_verdict": "unknown_unverified",
+        "bridge_target_domain": target_domain,
+        "bridge_target_path": target_path,
+        "is_exact_handoff": False,
+        "is_search_fallback": False,
+        "is_provider_managed": False,
+        "is_booking_quality_exit": False,
+        "booking_exit_quality": "unavailable",
+        "booking_availability": "unavailable_from_upstream_artifacts",
+        "booking_unavailability_reason": "no_replayable_partner_booking_url_from_upstream",
+        "provider_data_limited": True,
+        "cache_hit": cache_hit,
+    }
+    if isinstance(artifact_inspection, dict):
+        payload["artifact_inspection"] = artifact_inspection
+        payload["proof_only_google_artifacts"] = bool(
+            artifact_inspection.get("only_google_click_or_google_domains")
+        ) and not bool(artifact_inspection.get("has_replayable_partner_option"))
+    return payload
 
 
 def _is_google_search_fallback_url(value: Optional[str]) -> bool:
@@ -244,7 +472,7 @@ def _is_google_search_fallback_url(value: Optional[str]) -> bool:
     except Exception:
         return False
     host = (parsed.netloc or "").lower()
-    return host.endswith("google.com") and parsed.path == "/travel/flights"
+    return _is_google_domain(host) and parsed.path == "/travel/flights"
 
 
 def _build_post_handoff_bridge_url(artifact_id: str) -> str:
@@ -405,10 +633,16 @@ def register_post_handoff_artifact(
     Register an internal POST-capable handoff artifact and return a short-lived bridge URL.
     """
     canonical_url = _canonicalize_handoff_url(url)
-    if not canonical_url or _is_google_search_fallback_url(canonical_url):
+    if (
+        not canonical_url
+        or _is_google_search_fallback_url(canonical_url)
+    ):
         return None
     if post_data in (None, "", {}, []):
         return None
+    # booking_request POST artifacts often use Google travel/clk endpoints.
+    # They are not exposed directly to clients; they are consumed through our
+    # one-time bridge and then auto-submitted as POST.
 
     artifact_id = uuid.uuid4().hex
     with _handoff_cache_lock:
@@ -463,6 +697,10 @@ def consume_post_handoff_artifact_with_diagnostics(
             "consume_outcome": "miss",
             "request_id": get_request_id() or "unknown",
         }
+        app_metrics.record_booking_handoff_consume(
+            lookup_result=diagnostics["lookup_result"],
+            outcome=diagnostics["consume_outcome"],
+        )
         logger.info("booking_post_bridge_consume_outcome", extra=diagnostics)
         return None, diagnostics
 
@@ -491,6 +729,10 @@ def consume_post_handoff_artifact_with_diagnostics(
             "consume_outcome": "hit",
             "request_id": get_request_id() or "unknown",
         }
+        app_metrics.record_booking_handoff_consume(
+            lookup_result=diagnostics["lookup_result"],
+            outcome=diagnostics["consume_outcome"],
+        )
         logger.info("booking_post_bridge_consume_outcome", extra=diagnostics)
         return consumed, diagnostics
 
@@ -501,86 +743,12 @@ def consume_post_handoff_artifact_with_diagnostics(
         "consume_outcome": "hit" if isinstance(artifact, dict) else "miss",
         "request_id": get_request_id() or "unknown",
     }
+    app_metrics.record_booking_handoff_consume(
+        lookup_result=diagnostics["lookup_result"],
+        outcome=diagnostics["consume_outcome"],
+    )
     logger.info("booking_post_bridge_consume_outcome", extra=diagnostics)
     return artifact, diagnostics
-
-
-def _search_fallback_quality(
-    *,
-    origin: Optional[str],
-    destination: Optional[str],
-    depart_date: Optional[str],
-    return_date: Optional[str],
-    flight: Optional[Dict[str, Any]],
-) -> str:
-    if not origin or not destination or not depart_date:
-        return "generic"
-    has_itinerary_hints = bool(
-        isinstance(flight, dict)
-        and (
-            str(flight.get("airline") or "").strip()
-            or str(flight.get("flight_no") or "").strip()
-            or str(flight.get("departure_time") or "").strip()
-            or str(flight.get("arrival_time") or "").strip()
-        )
-    )
-    if return_date:
-        if has_itinerary_hints:
-            return "round_trip_route_seeded_with_itinerary_hints"
-        return "round_trip_route_seeded_with_return_leg"
-    if has_itinerary_hints:
-        return "route_seeded_with_itinerary_hints"
-    return "route_seeded_basic"
-
-
-def _search_fallback_context(
-    *,
-    origin: Optional[str],
-    destination: Optional[str],
-    depart_date: Optional[str],
-    return_date: Optional[str],
-    flight: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    has_route_seed = bool(origin and destination and depart_date)
-    has_itinerary_hints = bool(
-        isinstance(flight, dict)
-        and (
-            str(flight.get("airline") or "").strip()
-            or str(flight.get("flight_no") or "").strip()
-            or str(flight.get("departure_time") or "").strip()
-            or str(flight.get("arrival_time") or "").strip()
-        )
-    )
-    quality_tier = _search_fallback_quality(
-        origin=origin,
-        destination=destination,
-        depart_date=depart_date,
-        return_date=return_date,
-        flight=flight,
-    )
-    return {
-        "route_type": "round_trip" if return_date else "one_way",
-        "has_route_seed": has_route_seed,
-        "has_itinerary_hints": has_itinerary_hints,
-        "includes_return_leg_hint": bool(return_date and has_route_seed),
-        "quality_tier": quality_tier,
-    }
-
-
-def _legacy_search_fallback_quality_for_clients(quality_tier: str) -> str:
-    """
-    Backward-compatible quality string for clients/tests expecting legacy values.
-    Keep richer tier details in `search_fallback_context`.
-    """
-    normalized = str(quality_tier or "")
-    if normalized in {
-        "round_trip_route_seeded_with_itinerary_hints",
-        "route_seeded_with_itinerary_hints",
-    }:
-        return "route_seeded_with_itinerary_hints"
-    if normalized in {"round_trip_route_seeded_with_return_leg", "route_seeded_basic"}:
-        return "route_seeded_basic"
-    return "generic"
 
 
 def _extract_booking_request_payload(flight: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -602,12 +770,9 @@ def _extract_booking_request_payload(flight: Dict[str, Any]) -> Optional[Dict[st
             "headers": flight.get("booking_request_headers"),
         }
 
-    raw_url = raw.get("url") or raw.get("endpoint") or raw.get("booking_url") or raw.get("link")
+    raw_url = raw.get("url") or raw.get("endpoint") or raw.get("booking_url")
     canonical_url = _canonicalize_handoff_url(raw_url)
     if not canonical_url:
-        return None
-    # booking_request should never "win" via generic Google search URL.
-    if _is_google_search_fallback_url(canonical_url):
         return None
 
     method = str(raw.get("method") or "").strip().upper()
@@ -615,6 +780,15 @@ def _extract_booking_request_payload(flight: Dict[str, Any]) -> Optional[Dict[st
     if not method:
         method = "POST" if post_data not in (None, "", {}, []) else "GET"
     if method not in {"GET", "POST"}:
+        return None
+    # booking_request should never "win" via generic Google search URL.
+    if _is_google_search_fallback_url(canonical_url):
+        return None
+    # Allow tracker URLs only when they carry a concrete POST artifact that is
+    # consumed via our one-time bridge endpoint.
+    if _is_brittle_google_tracker_url(canonical_url) and not (
+        method == "POST" and post_data not in (None, "", {}, [])
+    ):
         return None
 
     headers = raw.get("headers")
@@ -642,7 +816,7 @@ def _extract_link_from_response_payload(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
         for key in ("booking_url", "booking_link", "deeplink", "redirect_link", "link", "url"):
             candidate = _canonicalize_handoff_url(payload.get(key))
-            if candidate and not _is_google_search_fallback_url(candidate):
+            if candidate and not _is_google_search_fallback_url(candidate) and not _is_brittle_google_tracker_url(candidate):
                 return candidate
         for nested_key in ("data", "result", "booking", "provider", "seller"):
             if nested_key in payload:
@@ -656,6 +830,188 @@ def _extract_link_from_response_payload(payload: Any) -> Optional[str]:
             if nested:
                 return nested
     return None
+
+
+def _extract_meta_refresh_url_from_html(html_text: str, *, base_url: str) -> Optional[str]:
+    if not isinstance(html_text, str) or not html_text:
+        return None
+    for tag_match in _META_REFRESH_TAG_RE.finditer(html_text[:BOOKING_REQUEST_RESPONSE_SNIPPET_BYTES]):
+        tag = str(tag_match.group(0) or "")
+        content_match = re.search(
+            r"content\s*=\s*(['\"])(.*?)\1",
+            tag,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if content_match:
+            content_value = str(content_match.group(2) or "")
+        else:
+            unquoted_match = re.search(r"content\s*=\s*([^>]+)", tag, re.IGNORECASE)
+            content_value = str(unquoted_match.group(1) or "") if unquoted_match else ""
+        if not content_value:
+            continue
+        content_url_match = re.search(r"url\s*=\s*", content_value, re.IGNORECASE)
+        if not content_url_match:
+            continue
+        candidate_tail = str(content_value[content_url_match.end():] or "").strip()
+        if not candidate_tail:
+            continue
+        if candidate_tail[0] in {"'", '"'}:
+            quote = candidate_tail[0]
+            closing = candidate_tail.find(quote, 1)
+            candidate_raw = (
+                candidate_tail[1:closing]
+                if closing > 0
+                else candidate_tail[1:]
+            )
+        else:
+            candidate_raw = candidate_tail.split()[0]
+        candidate_raw = html.unescape(str(candidate_raw or "").strip().strip("'\""))
+        if not candidate_raw:
+            continue
+        absolute = urllib.parse.urljoin(base_url, candidate_raw)
+        canonical = _canonicalize_handoff_url(absolute)
+        if canonical:
+            return canonical
+    return None
+
+
+def _prepare_booking_request_post_body(post_data: Any) -> Dict[str, Any]:
+    if post_data is None:
+        return {}
+    if isinstance(post_data, bytes):
+        return {"content": post_data}
+    if isinstance(post_data, str):
+        return {"content": post_data}
+    if isinstance(post_data, (dict, list, tuple)):
+        return {"data": post_data}
+    return {"content": str(post_data)}
+
+
+def _build_booking_request_headers(headers: Dict[str, Any]) -> Dict[str, str]:
+    safe: Dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        if not isinstance(key, str) or value is None:
+            continue
+        normalized = key.strip()
+        if not normalized:
+            continue
+        if normalized.lower() in {"authorization", "cookie"}:
+            continue
+        safe[normalized] = str(value)
+    safe.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    return safe
+
+
+async def _resolve_booking_request_post_to_provider_url(
+    *,
+    request_url: str,
+    post_data: Any,
+    request_headers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    headers = _build_booking_request_headers(request_headers or {})
+    post_kwargs = _prepare_booking_request_post_body(post_data)
+    client = _get_booking_http_client()
+
+    for attempt in range(1, BOOKING_REQUEST_RETRIES + 1):
+        attempt_started = time.monotonic()
+        try:
+            response = await client.post(
+                request_url,
+                headers=headers,
+                timeout=BOOKING_REQUEST_HTTP_TIMEOUT,
+                follow_redirects=True,
+                **post_kwargs,
+            )
+            status_code = int(response.status_code)
+            content_type = str(response.headers.get("content-type") or "").lower()
+            final_url_raw = str(getattr(response, "url", "") or "").strip()
+            final_url = _canonicalize_handoff_url(final_url_raw)
+
+            html_snippet = ""
+            meta_refresh_url = None
+            if "html" in content_type or content_type == "":
+                with contextlib.suppress(Exception):
+                    html_snippet = str(response.text or "")[:BOOKING_REQUEST_RESPONSE_SNIPPET_BYTES]
+                meta_refresh_url = _extract_meta_refresh_url_from_html(
+                    html_snippet,
+                    base_url=final_url or request_url,
+                )
+
+            json_candidate = None
+            if "json" in content_type:
+                with contextlib.suppress(Exception):
+                    json_candidate = _extract_link_from_response_payload(response.json())
+
+            candidates: List[Tuple[str, str]] = []
+            if meta_refresh_url:
+                candidates.append(("meta_refresh", meta_refresh_url))
+            if json_candidate:
+                canonical_json = _canonicalize_handoff_url(json_candidate)
+                if canonical_json:
+                    candidates.append(("json_payload", canonical_json))
+            if final_url:
+                candidates.append(("final_response_url", final_url))
+
+            for resolver_source, candidate in candidates:
+                domain = _domain_for_url(candidate)
+                if not _is_usable_handoff_url(candidate):
+                    continue
+                if domain and _is_google_domain(domain):
+                    continue
+                return {
+                    "status": "resolved",
+                    "resolved_url": candidate,
+                    "resolver_source": resolver_source,
+                    "status_code": status_code,
+                    "api_base_url": urllib.parse.urljoin(request_url, "/"),
+                    "final_response_url": final_url,
+                    "content_type": content_type or None,
+                    "attempt": attempt,
+                    "duration_ms": int((time.monotonic() - attempt_started) * 1000),
+                    "provider_error_classification": "none",
+                }
+
+            return {
+                "status": "unresolved",
+                "reason": "booking_request_post_no_replayable_provider_url",
+                "status_code": status_code,
+                "api_base_url": urllib.parse.urljoin(request_url, "/"),
+                "final_response_url": final_url,
+                "content_type": content_type or None,
+                "meta_refresh_url": meta_refresh_url,
+                "response_excerpt": html_snippet[:350] if html_snippet else None,
+                "attempt": attempt,
+                "duration_ms": int((time.monotonic() - attempt_started) * 1000),
+                "provider_error_classification": _classify_http_status(status_code),
+            }
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            if attempt < BOOKING_REQUEST_RETRIES:
+                await asyncio.sleep(BOOKING_REQUEST_RETRY_BACKOFF * attempt)
+                continue
+            return {
+                "status": "unresolved",
+                "reason": "booking_request_post_network_error",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "api_base_url": urllib.parse.urljoin(request_url, "/"),
+                "provider_error_classification": "network_failure",
+            }
+        except Exception as exc:
+            return {
+                "status": "unresolved",
+                "reason": "booking_request_post_exception",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "api_base_url": urllib.parse.urljoin(request_url, "/"),
+                "provider_error_classification": "unknown_failure",
+            }
+
+    return {
+        "status": "unresolved",
+        "reason": "booking_request_post_resolution_exhausted",
+        "api_base_url": urllib.parse.urljoin(request_url, "/"),
+        "provider_error_classification": "unknown_failure",
+    }
 
 
 async def _resolve_booking_request_handoff(flight: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -673,15 +1029,26 @@ async def _resolve_booking_request_handoff(flight: Dict[str, Any]) -> tuple[Opti
     post_data = payload.get("post_data")
 
     if method == "GET":
+        if _is_brittle_google_tracker_url(url):
+            return None, None
         return url, "booking_request.url"
 
-    bridge_url = register_post_handoff_artifact(
+    resolver = await _resolve_booking_request_post_to_provider_url(
+        request_url=url,
+        post_data=post_data,
+        request_headers=headers,
+    )
+    if resolver.get("status") == "resolved":
+        resolved_url = _canonicalize_handoff_url(str(resolver.get("resolved_url") or ""))
+        if resolved_url and _is_usable_handoff_url(resolved_url):
+            return resolved_url, "booking_request.post_resolved_provider_url"
+
+    # Keep one-time bridge artifact available for diagnostics only.
+    register_post_handoff_artifact(
         url=url,
         post_data=post_data,
         headers=headers,
     )
-    if bridge_url:
-        return bridge_url, "booking_request.post_followup_bridge"
     return None, None
 
 
@@ -711,17 +1078,20 @@ def _iter_booking_option_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 class Booking(Base):
     """
-    Represents a single flight booking record.
+    Represents a single local booking-follow-up record.
 
     Status lifecycle:
-        HELD  →  CONFIRMED  (user confirmed within hold window)
-        HELD  →  EXPIRED    (hold_minutes elapsed without confirmation)
         HELD  →  CANCELLED  (user explicitly cancelled before expiry)
+        HELD  →  EXPIRED    (hold_minutes elapsed without cancellation)
+
+    Important product semantics:
+    - Real booking/payment completion happens on external airline/OTA/provider sites.
+    - This local record must not imply provider-side booking completion.
     """
     __tablename__ = "bookings"
 
     id           = Column(Integer, primary_key=True, index=True)
-    status       = Column(String,  nullable=False)           # HELD | CONFIRMED | CANCELLED | EXPIRED
+    status       = Column(String,  nullable=False)           # HELD | CANCELLED | EXPIRED
     flight       = Column(JSON,    nullable=False)           # Full flight dict (includes booking_token, shareable_link)
     passenger    = Column(JSON,    nullable=True)            # Passenger info dict (name, DOB, passport…)
     booking_token = Column(Text,   nullable=True)            # SerpAPI booking_token (top-level, for quick access)
@@ -816,10 +1186,25 @@ def _extract_booking_options_from_payload(data: Dict[str, Any]) -> List[Dict[str
     for opt in _iter_booking_option_rows(data):
         if not isinstance(opt, dict):
             continue
-        provider = opt.get("name") or opt.get("provider") or "unknown"
-        price = opt.get("price")
+        together = opt.get("together")
+        together_payload = together if isinstance(together, dict) else {}
+        provider = (
+            together_payload.get("book_with")
+            or together_payload.get("name")
+            or opt.get("book_with")
+            or opt.get("name")
+            or opt.get("provider")
+            or "unknown"
+        )
+        price = together_payload.get("price") if together_payload.get("price") is not None else opt.get("price")
         link = (
-            opt.get("link")
+            together_payload.get("link")
+            or together_payload.get("url")
+            or together_payload.get("booking_url")
+            or together_payload.get("booking_link")
+            or together_payload.get("deeplink")
+            or together_payload.get("redirect_link")
+            or opt.get("link")
             or opt.get("url")
             or opt.get("booking_url")
             or opt.get("booking_link")
@@ -839,11 +1224,32 @@ def _extract_booking_options_from_payload(data: Dict[str, Any]) -> List[Dict[str
         seen_links.add(canonical)
 
         price_float = _coerce_price(price)
+        marketed_as = together_payload.get("marketed_as")
+        if isinstance(marketed_as, (str, int, float)):
+            marketed_as = [str(marketed_as)]
+        elif isinstance(marketed_as, list):
+            marketed_as = [str(item) for item in marketed_as if item is not None][:8]
+        else:
+            marketed_as = None
+        local_prices = together_payload.get("local_prices")
+        baggage_prices = together_payload.get("baggage_prices")
+        booking_request = together_payload.get("booking_request")
+        if not isinstance(booking_request, dict):
+            booking_request = opt.get("booking_request")
         options.append({
             "provider": provider,
             "price": price_float,
             "link": canonical.strip(),
             "price_available": price_float is not None,
+            "book_with": provider,
+            "option_title": together_payload.get("option_title") or opt.get("option_title"),
+            "airline": together_payload.get("airline") or opt.get("airline"),
+            "airline_logos": together_payload.get("airline_logos") or opt.get("airline_logos"),
+            "marketed_as": marketed_as,
+            "local_prices": local_prices if isinstance(local_prices, (list, dict, str, int, float)) else None,
+            "baggage_prices": baggage_prices if isinstance(baggage_prices, (list, dict, str, int, float)) else None,
+            "separate_tickets": bool(opt.get("separate_tickets")),
+            "booking_request": booking_request if isinstance(booking_request, dict) else None,
         })
     return options
 
@@ -894,16 +1300,21 @@ def _extract_booking_request_artifact_from_payload(data: Dict[str, Any]) -> Opti
         booking_request.get("url")
         or booking_request.get("endpoint")
         or booking_request.get("booking_url")
-        or booking_request.get("link")
     )
     canonical_url = _canonicalize_handoff_url(url)
-    if not canonical_url or _is_google_search_fallback_url(canonical_url):
-        return None
 
     post_data = booking_request.get("post_data")
     method = str(booking_request.get("method") or "").strip().upper()
     if not method:
         method = "POST" if post_data not in (None, "", {}, []) else "GET"
+    if method not in {"GET", "POST"}:
+        return None
+    if not canonical_url or _is_google_search_fallback_url(canonical_url):
+        return None
+    if _is_brittle_google_tracker_url(canonical_url) and not (
+        method == "POST" and post_data not in (None, "", {}, [])
+    ):
+        return None
 
     safe_headers: Dict[str, str] = {}
     raw_headers = booking_request.get("headers")
@@ -926,6 +1337,97 @@ def _extract_booking_request_artifact_from_payload(data: Dict[str, Any]) -> Opti
     }
 
 
+def _summarize_booking_option(option: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(option, dict):
+        return None
+    summary: Dict[str, Any] = {
+        "book_with": option.get("book_with") or option.get("provider"),
+        "price": option.get("price"),
+        "option_title": option.get("option_title"),
+        "link_domain": _domain_for_url(option.get("link")),
+        "airline": option.get("airline"),
+        "airline_logos": option.get("airline_logos"),
+        "marketed_as": option.get("marketed_as"),
+        "separate_tickets": bool(option.get("separate_tickets")),
+        "local_prices": option.get("local_prices"),
+        "baggage_prices": option.get("baggage_prices"),
+    }
+    cleaned = {k: v for k, v in summary.items() if v not in (None, "", [], {})}
+    return cleaned or None
+
+
+def _seller_label_from_url(value: Optional[str]) -> Optional[str]:
+    domain = _domain_for_url(value)
+    if not domain:
+        return None
+    if "goindigo" in domain:
+        return "IndiGo"
+    if "airindia" in domain:
+        return "Air India"
+    token = domain.split(".")[0]
+    if token == "www":
+        parts = domain.split(".")
+        token = parts[1] if len(parts) > 1 else token
+    cleaned = token.replace("-", " ").strip()
+    if not cleaned:
+        return None
+    return cleaned.title()
+
+
+def _coalesce_booking_option_summary(
+    summary: Optional[Dict[str, Any]],
+    *,
+    resolved_url: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    domain = _domain_for_url(resolved_url)
+    if not isinstance(summary, dict):
+        summary = {}
+    merged = dict(summary)
+    if domain and not merged.get("link_domain"):
+        merged["link_domain"] = domain
+    if not merged.get("book_with"):
+        seller = _seller_label_from_url(resolved_url)
+        if seller:
+            merged["book_with"] = seller
+    cleaned = {k: v for k, v in merged.items() if v not in (None, "", [], {})}
+    return cleaned or None
+
+
+def _summarize_selected_flights(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    selected = payload.get("selected_flights")
+    if not isinstance(selected, list) or not selected:
+        return None
+    first = selected[0]
+    if not isinstance(first, dict):
+        return None
+    flights = first.get("flights")
+    if not isinstance(flights, list) or not flights:
+        return None
+    legs: List[Dict[str, Any]] = []
+    for leg in flights[:6]:
+        if not isinstance(leg, dict):
+            continue
+        dep = leg.get("departure_airport") if isinstance(leg.get("departure_airport"), dict) else {}
+        arr = leg.get("arrival_airport") if isinstance(leg.get("arrival_airport"), dict) else {}
+        legs.append(
+            {
+                "airline": leg.get("airline"),
+                "flight_number": leg.get("flight_number"),
+                "operating_flight_number": leg.get("operating_flight_number"),
+                "travel_class": leg.get("travel_class"),
+                "departure_airport_id": dep.get("id"),
+                "departure_time": dep.get("time"),
+                "arrival_airport_id": arr.get("id"),
+                "arrival_time": arr.get("time"),
+            }
+        )
+    if not legs:
+        return None
+    return {"legs": legs}
+
+
 async def _fetch_booking_options_payload(
     *,
     booking_token: str,
@@ -933,6 +1435,12 @@ async def _fetch_booking_options_payload(
     arrival_id: Optional[str] = None,
     outbound_date: Optional[str] = None,
     return_date: Optional[str] = None,
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch raw google_flights_booking payload from SerpAPI.
@@ -941,6 +1449,18 @@ async def _fetch_booking_options_payload(
 
     route_type = "round_trip" if return_date else "one_way"
     max_attempts = max(1, min(BOOKING_OPTIONS_RETRIES, BOOKING_OPTIONS_ATTEMPTS_BUDGET))
+    relaxed_shape_enabled = bool(
+        departure_id
+        or arrival_id
+        or outbound_date
+        or include_airlines
+        or deep_search is not None
+        or travel_class
+        or adults
+    )
+    if relaxed_shape_enabled:
+        max_attempts = max(2, max_attempts)
+    use_relaxed_shape = False
 
     for attempt in range(1, max_attempts + 1):
         attempt_started = time.monotonic()
@@ -958,25 +1478,34 @@ async def _fetch_booking_options_payload(
                     "engine": "google_flights",
                     "booking_token": booking_token,
                     "api_key": key,
-                    "hl": "en",
+                    "hl": (hl or "en"),
                     "gl": "in",
-                    "currency": "INR",
+                    "currency": (currency or "INR"),
                 }
                 # We intentionally never mix booking_token with departure_token.
                 params.pop("departure_token", None)
                 # Proven runtime requirement: token-only requests can fail.
                 # Preserve original search context when available.
-                if departure_id:
-                    params["departure_id"] = departure_id
-                if arrival_id:
-                    params["arrival_id"] = arrival_id
-                if outbound_date:
-                    params["outbound_date"] = outbound_date
-                if return_date:
-                    params["return_date"] = return_date
-                    params["type"] = "1"
-                elif outbound_date:
-                    params["type"] = "2"
+                if not use_relaxed_shape:
+                    if departure_id:
+                        params["departure_id"] = departure_id
+                    if arrival_id:
+                        params["arrival_id"] = arrival_id
+                    if outbound_date:
+                        params["outbound_date"] = outbound_date
+                    if return_date:
+                        params["return_date"] = return_date
+                        params["type"] = "1"
+                    elif outbound_date:
+                        params["type"] = "2"
+                    if include_airlines:
+                        params["include_airlines"] = include_airlines
+                    if deep_search is not None:
+                        params["deep_search"] = "true" if bool(deep_search) else "false"
+                    if travel_class:
+                        params["travel_class"] = str(travel_class)
+                    if adults and int(adults) > 0:
+                        params["adults"] = str(int(adults))
 
                 request_timeout = BOOKING_OPTIONS_HTTP_TIMEOUT + (
                     BOOKING_OPTIONS_ROUND_TRIP_TIMEOUT_BONUS if return_date else 0.0
@@ -995,6 +1524,10 @@ async def _fetch_booking_options_payload(
                 "has_arrival_id": bool(params.get("arrival_id")),
                 "has_outbound_date": bool(params.get("outbound_date")),
                 "has_return_date": bool(params.get("return_date")),
+                "has_include_airlines": bool(params.get("include_airlines")),
+                "has_deep_search": bool(params.get("deep_search")),
+                "travel_class": str(params.get("travel_class") or ""),
+                "adults": str(params.get("adults") or ""),
                 "has_departure_token": bool(params.get("departure_token")),
                 "token_fp": _token_fingerprint(booking_token),
                 "key_fp": _key_fingerprint(key),
@@ -1006,6 +1539,7 @@ async def _fetch_booking_options_payload(
                 "attempt_budget": BOOKING_OPTIONS_ATTEMPTS_BUDGET,
                 "client_mode": "shared_get_client",
                 "route_type": route_type,
+                "shape_mode": "token_only_relaxed" if use_relaxed_shape else "route_shaped",
             }
 
             if resp.status_code != 200:
@@ -1013,6 +1547,8 @@ async def _fetch_booking_options_payload(
                 if transient and attempt < max_attempts:
                     await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                     continue
+                if transient and attempt >= max_attempts:
+                    app_metrics.record_retry_budget_exhausted("booking_options_fetch")
                 if resp.status_code in {401, 403}:
                     with contextlib.suppress(Exception):
                         await api_key_manager.mark_exhausted(
@@ -1020,8 +1556,21 @@ async def _fetch_booking_options_payload(
                             idx,
                             reason=f"booking_options_http_{resp.status_code}",
                         )
-                logger.info(
-                    "booking_options unavailable after shaped request",
+                if (not use_relaxed_shape) and relaxed_shape_enabled and resp.status_code in {400, 404, 422}:
+                    use_relaxed_shape = True
+                    logger.warning(
+                        "booking_options shaped request degraded; retrying token-only request",
+                        extra={
+                            **request_shape,
+                            "http_status": resp.status_code,
+                            "fetch_duration_ms": int((time.monotonic() - attempt_started) * 1000),
+                            "result_bucket": "http_error_recoverable",
+                            **response_flags,
+                        },
+                    )
+                    continue
+                logger.warning(
+                    "booking_options unavailable after request",
                     extra={
                         **request_shape,
                         "http_status": resp.status_code,
@@ -1042,8 +1591,8 @@ async def _fetch_booking_options_payload(
             try:
                 data = resp.json()
             except Exception as parse_exc:
-                logger.info(
-                    "booking_options parse error after shaped request",
+                logger.warning(
+                    "booking_options parse error after request",
                     extra={
                         **request_shape,
                         "fetch_duration_ms": int((time.monotonic() - attempt_started) * 1000),
@@ -1095,6 +1644,8 @@ async def _fetch_booking_options_payload(
                 if transient_error and attempt < max_attempts:
                     await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                     continue
+                if transient_error and attempt >= max_attempts:
+                    app_metrics.record_retry_budget_exhausted("booking_options_fetch")
                 if any(tok in error_text for tok in ("unauthorized", "invalid api key", "invalid key", "access denied")):
                     with contextlib.suppress(Exception):
                         await api_key_manager.mark_exhausted(
@@ -1102,8 +1653,21 @@ async def _fetch_booking_options_payload(
                             idx,
                             reason="booking_options_provider_unauthorized",
                         )
-                logger.info(
-                    "booking_options provider error after shaped request",
+                if (not use_relaxed_shape) and relaxed_shape_enabled:
+                    use_relaxed_shape = True
+                    logger.warning(
+                        "booking_options shaped request provider error; retrying token-only request",
+                        extra={
+                            **request_shape,
+                            "provider_error": str(data.get("error") or "")[:180],
+                            "fetch_duration_ms": int((time.monotonic() - attempt_started) * 1000),
+                            "result_bucket": "provider_error_recoverable",
+                            **response_flags,
+                        },
+                    )
+                    continue
+                logger.warning(
+                    "booking_options provider error after request",
                     extra={
                         **request_shape,
                         "provider_error": str(data.get("error") or "")[:180],
@@ -1122,7 +1686,7 @@ async def _fetch_booking_options_payload(
                 )
             with contextlib.suppress(Exception):
                 await api_key_manager.record_usage("serpapi", idx)
-            logger.info(
+            logger.debug(
                 "booking_options fetch succeeded",
                 extra={
                     **request_shape,
@@ -1139,6 +1703,7 @@ async def _fetch_booking_options_payload(
             if attempt < max_attempts:
                 await asyncio.sleep(BOOKING_OPTIONS_RETRY_BACKOFF * attempt)
                 continue
+            app_metrics.record_retry_budget_exhausted("booking_options_fetch")
             exception_bucket = _classify_booking_options_exception(e)
             token_fp = _token_fingerprint(booking_token)
             candidate_probe_context = bool(
@@ -1203,14 +1768,14 @@ async def _fetch_booking_options_payload(
                 if candidate_probe_context:
                     # In bounded candidate probing, isolated unexpected per-candidate failures
                     # can be expected while other candidates still resolve successfully.
-                    log_severity = "info"
-                    log_fn = logger.info
+                    log_severity = "debug"
+                    log_fn = logger.debug
                 else:
                     log_severity = "warning"
                     log_fn = logger.warning
             elif exception_bucket in {"no_active_key", "provider_rate_limited", "provider_auth"}:
-                log_severity = "debug" if candidate_probe_context else "info"
-                log_fn = logger.debug if candidate_probe_context else logger.info
+                log_severity = "debug" if candidate_probe_context else "warning"
+                log_fn = logger.debug if candidate_probe_context else logger.warning
             else:
                 log_severity = "debug"
                 log_fn = logger.debug
@@ -1293,6 +1858,12 @@ async def fetch_booking_options(
     arrival_id: Optional[str] = None,
     outbound_date: Optional[str] = None,
     return_date: Optional[str] = None,
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Call SerpAPI's google_flights_booking engine and return normalized booking options.
@@ -1304,6 +1875,12 @@ async def fetch_booking_options(
             arrival_id=arrival_id,
             outbound_date=outbound_date,
             return_date=return_date,
+            include_airlines=include_airlines,
+            deep_search=deep_search,
+            travel_class=travel_class,
+            adults=adults,
+            currency=currency,
+            hl=hl,
         )
     except BookingOptionsFetchError:
         return None
@@ -1312,10 +1889,10 @@ async def fetch_booking_options(
 
     options = _extract_booking_options_from_payload(data)
     if not options:
-        logger.info("No valid booking options found; falling back")
+        logger.warning("No valid booking options found after provider fetch")
         return None
 
-    logger.info("Fetched %d booking options from SerpAPI", len(options))
+    logger.debug("Fetched %d booking options from SerpAPI", len(options))
     return options
 
 
@@ -1326,6 +1903,12 @@ async def best_booking_option(
     arrival_id: Optional[str] = None,
     outbound_date: Optional[str] = None,
     return_date: Optional[str] = None,
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch all booking options and return the cheapest one.
@@ -1338,16 +1921,22 @@ async def best_booking_option(
         arrival_id=arrival_id,
         outbound_date=outbound_date,
         return_date=return_date,
+        include_airlines=include_airlines,
+        deep_search=deep_search,
+        travel_class=travel_class,
+        adults=adults,
+        currency=currency,
+        hl=hl,
     )
     if not options:
         return None
     priced = [opt for opt in options if opt.get("price") is not None]
     if priced:
         best = min(priced, key=lambda x: x["price"])
-        logger.info(f"Best booking option: {best['provider']} at {best['price']}")
+        logger.debug("Best booking option selected with numeric price")
     else:
         best = options[0]
-        logger.info("Best booking option selected without numeric price; using first valid booking link")
+        logger.debug("Best booking option selected without numeric price; using first valid booking link")
     return best
 
 
@@ -1358,6 +1947,12 @@ async def resolve_booking_token(
     arrival_id: Optional[str] = None,
     outbound_date: Optional[str] = None,
     return_date: Optional[str] = None,
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> Optional[str]:
     """
     Return the direct booking URL from the cheapest option found via SerpAPI.
@@ -1369,6 +1964,12 @@ async def resolve_booking_token(
         arrival_id=arrival_id,
         outbound_date=outbound_date,
         return_date=return_date,
+        include_airlines=include_airlines,
+        deep_search=deep_search,
+        travel_class=travel_class,
+        adults=adults,
+        currency=currency,
+        hl=hl,
     )
     return best["link"] if best else None
 
@@ -1380,6 +1981,12 @@ async def resolve_booking_token_with_details(
     arrival_id: Optional[str] = None,
     outbound_date: Optional[str] = None,
     return_date: Optional[str] = None,
+    include_airlines: Optional[str] = None,
+    deep_search: Optional[bool] = None,
+    travel_class: Optional[str] = None,
+    adults: Optional[int] = None,
+    currency: Optional[str] = None,
+    hl: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Resolve booking token with explicit machine-readable classification.
@@ -1391,6 +1998,12 @@ async def resolve_booking_token_with_details(
         arrival_id=arrival_id,
         outbound_date=outbound_date,
         return_date=return_date,
+        include_airlines=include_airlines,
+        deep_search=deep_search,
+        travel_class=travel_class,
+        adults=adults,
+        currency=currency,
+        hl=hl,
     )
     with _handoff_cache_lock:
         cached = _booking_resolution_cache.get(cache_key)
@@ -1398,8 +2011,11 @@ async def resolve_booking_token_with_details(
         cached_kind = str(cached.get("kind") or "")
         if cached_kind == "direct_booking":
             cached_url = str(cached.get("url") or "").strip()
+            artifact_inspection = cached.get("artifact_inspection")
+            booking_option_summary = cached.get("booking_option_summary")
+            selected_flights_summary = cached.get("selected_flights_summary")
             if _is_usable_handoff_url(cached_url):
-                logger.info(
+                logger.debug(
                     "booking_token_resolution cache hit",
                     extra={
                         "cache_key": cache_key,
@@ -1407,7 +2023,7 @@ async def resolve_booking_token_with_details(
                         "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
                     },
                 )
-                return {
+                payload = {
                     "url": cached_url,
                     "source": "booking_token",
                     "reason": "resolved_booking_token_cache",
@@ -1422,45 +2038,180 @@ async def resolve_booking_token_with_details(
                     "booking_exit_quality": "booking_ready",
                     "cache_hit": True,
                 }
-        if cached_kind == "booking_request_post":
+                if isinstance(artifact_inspection, dict):
+                    payload["artifact_inspection"] = artifact_inspection
+                if isinstance(booking_option_summary, dict):
+                    payload["booking_option_summary"] = booking_option_summary
+                if isinstance(selected_flights_summary, dict):
+                    payload["selected_flights_summary"] = selected_flights_summary
+                return payload
+        if cached_kind in {"booking_request_post", "booking_request_post_resolved"}:
             request_url = str(cached.get("url") or "").strip()
             post_data = cached.get("post_data")
             request_headers = cached.get("headers") or {}
-            bridge_url = register_post_handoff_artifact(
-                url=request_url,
-                post_data=post_data,
-                headers=request_headers,
+            artifact_inspection = cached.get("artifact_inspection")
+            booking_option_summary = cached.get("booking_option_summary")
+            selected_flights_summary = cached.get("selected_flights_summary")
+            cached_resolved_provider_url = _canonicalize_handoff_url(
+                str(cached.get("resolved_provider_url") or "")
             )
-            if bridge_url:
-                logger.info(
-                    "booking_token_resolution cache hit",
-                    extra={
-                        "cache_key": cache_key,
-                        "cache_kind": cached_kind,
-                        "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
-                    },
+            if cached_resolved_provider_url and _is_usable_handoff_url(cached_resolved_provider_url):
+                resolved_summary = _coalesce_booking_option_summary(
+                    booking_option_summary if isinstance(booking_option_summary, dict) else None,
+                    resolved_url=cached_resolved_provider_url,
                 )
-                return {
-                    "url": bridge_url,
+                payload = {
+                    "url": cached_resolved_provider_url,
                     "source": "booking_token",
                     "reason": "resolved_booking_request_post_cache",
                     "status": "ok",
                     "provider": "serpapi",
                     "handoff_mode": "provider_or_shareable",
-                    "landing_guarantee": "provider_managed_post_bridge",
-                    "artifact_field": "booking_request.post_followup_bridge",
-                    "requires_browser_post": True,
+                    "landing_guarantee": "provider_managed",
+                    "artifact_field": "booking_request.post_data_resolved_provider_url",
                     "is_exact_handoff": False,
                     "is_search_fallback": False,
                     "is_provider_managed": True,
                     "is_booking_quality_exit": True,
                     "booking_exit_quality": "booking_ready",
                     "cache_hit": True,
+                    "booking_request_resolution": cached.get("booking_request_resolution"),
                 }
+                if isinstance(artifact_inspection, dict):
+                    payload["artifact_inspection"] = artifact_inspection
+                if isinstance(resolved_summary, dict):
+                    payload["booking_option_summary"] = resolved_summary
+                if isinstance(selected_flights_summary, dict):
+                    payload["selected_flights_summary"] = selected_flights_summary
+                return payload
+
+            resolver = await _resolve_booking_request_post_to_provider_url(
+                request_url=request_url,
+                post_data=post_data,
+                request_headers=request_headers,
+            )
+            resolved_provider_url = _canonicalize_handoff_url(str(resolver.get("resolved_url") or ""))
+            if resolver.get("status") == "resolved" and resolved_provider_url and _is_usable_handoff_url(resolved_provider_url):
+                _cache_booking_resolution(
+                    cache_key,
+                    {
+                        "kind": "booking_request_post_resolved",
+                        "url": request_url,
+                        "post_data": post_data,
+                        "headers": request_headers,
+                        "resolved_provider_url": resolved_provider_url,
+                        "booking_request_resolution": resolver,
+                        "artifact_inspection": artifact_inspection,
+                        "booking_option_summary": booking_option_summary,
+                        "selected_flights_summary": selected_flights_summary,
+                    },
+                )
+                resolved_summary = _coalesce_booking_option_summary(
+                    booking_option_summary if isinstance(booking_option_summary, dict) else None,
+                    resolved_url=resolved_provider_url,
+                )
+                payload = {
+                    "url": resolved_provider_url,
+                    "source": "booking_token",
+                    "reason": "resolved_booking_request_post_cache",
+                    "status": "ok",
+                    "provider": "serpapi",
+                    "handoff_mode": "provider_or_shareable",
+                    "landing_guarantee": "provider_managed",
+                    "artifact_field": "booking_request.post_data_resolved_provider_url",
+                    "is_exact_handoff": False,
+                    "is_search_fallback": False,
+                    "is_provider_managed": True,
+                    "is_booking_quality_exit": True,
+                    "booking_exit_quality": "booking_ready",
+                    "cache_hit": True,
+                    "booking_request_resolution": resolver,
+                }
+                if isinstance(artifact_inspection, dict):
+                    payload["artifact_inspection"] = artifact_inspection
+                if isinstance(resolved_summary, dict):
+                    payload["booking_option_summary"] = resolved_summary
+                if isinstance(selected_flights_summary, dict):
+                    payload["selected_flights_summary"] = selected_flights_summary
+                return payload
+
+            bridge_url = register_post_handoff_artifact(
+                url=request_url,
+                post_data=post_data,
+                headers=request_headers,
+            )
+            if bridge_url:
+                target_domain, target_path = _bridge_target_domain_path(request_url)
+                logger.debug(
+                    "booking_post_bridge_target_resolved",
+                    extra={
+                        "target_domain": target_domain,
+                        "target_path": target_path,
+                        "cache_key": cache_key,
+                        "cache_kind": cached_kind,
+                        "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
+                    },
+                )
+                if _is_brittle_google_tracker_url(request_url):
+                    logger.info(
+                        "booking_post_bridge_booking_ready_downgraded",
+                        extra={
+                            "target_domain": target_domain,
+                            "target_path": target_path,
+                            "downgrade_reason": "google_tracker_post_bridge_unverified",
+                            "browser_landing_verdict": "unknown_unverified",
+                            "cache_hit": True,
+                        },
+                    )
+                    downgraded = _build_unverified_google_tracker_post_bridge_payload(
+                        bridge_url=bridge_url,
+                        reason="resolved_booking_request_post_unverified_google_tracker_cache",
+                        request_url=request_url,
+                        cache_hit=True,
+                        artifact_inspection=artifact_inspection if isinstance(artifact_inspection, dict) else None,
+                    )
+                    downgraded["booking_request_resolution"] = resolver
+                    if isinstance(booking_option_summary, dict):
+                        downgraded["booking_option_summary"] = booking_option_summary
+                    if isinstance(selected_flights_summary, dict):
+                        downgraded["selected_flights_summary"] = selected_flights_summary
+                    return downgraded
+                payload = {
+                    "url": None,
+                    "diagnostic_handoff_url": bridge_url,
+                    "source": "booking_token",
+                    "reason": "booking_request_post_resolution_failed_cache",
+                    "status": "unavailable",
+                    "provider": "serpapi",
+                    "handoff_mode": "unavailable",
+                    "landing_guarantee": "none",
+                    "artifact_field": "booking_request.post_followup_bridge",
+                    "requires_browser_post": True,
+                    "is_exact_handoff": False,
+                    "is_search_fallback": False,
+                    "is_provider_managed": False,
+                    "is_booking_quality_exit": False,
+                    "booking_exit_quality": "unavailable",
+                    "cache_hit": True,
+                    "booking_request_resolution": resolver,
+                }
+                if isinstance(artifact_inspection, dict):
+                    payload["artifact_inspection"] = artifact_inspection
+                    payload["proof_only_google_artifacts"] = bool(
+                        artifact_inspection.get("only_google_click_or_google_domains")
+                    ) and not bool(artifact_inspection.get("has_replayable_partner_option"))
+                if isinstance(booking_option_summary, dict):
+                    payload["booking_option_summary"] = booking_option_summary
+                if isinstance(selected_flights_summary, dict):
+                    payload["selected_flights_summary"] = selected_flights_summary
+                return payload
         if cached_kind == "booking_request_get":
             cached_url = str(cached.get("url") or "").strip()
+            artifact_inspection = cached.get("artifact_inspection")
+            booking_option_summary = cached.get("booking_option_summary")
+            selected_flights_summary = cached.get("selected_flights_summary")
             if _is_usable_handoff_url(cached_url):
-                logger.info(
+                logger.debug(
                     "booking_token_resolution cache hit",
                     extra={
                         "cache_key": cache_key,
@@ -1468,7 +2219,7 @@ async def resolve_booking_token_with_details(
                         "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
                     },
                 )
-                return {
+                payload = {
                     "url": cached_url,
                     "source": "booking_token",
                     "reason": "resolved_booking_request_cache",
@@ -1484,6 +2235,13 @@ async def resolve_booking_token_with_details(
                     "booking_exit_quality": "booking_ready",
                     "cache_hit": True,
                 }
+                if isinstance(artifact_inspection, dict):
+                    payload["artifact_inspection"] = artifact_inspection
+                if isinstance(booking_option_summary, dict):
+                    payload["booking_option_summary"] = booking_option_summary
+                if isinstance(selected_flights_summary, dict):
+                    payload["selected_flights_summary"] = selected_flights_summary
+                return payload
 
     resolve_timeout = BOOKING_TOKEN_RESOLVE_TIMEOUT + (
         BOOKING_OPTIONS_ROUND_TRIP_TIMEOUT_BONUS if return_date else 0.0
@@ -1496,11 +2254,17 @@ async def resolve_booking_token_with_details(
                 arrival_id=arrival_id,
                 outbound_date=outbound_date,
                 return_date=return_date,
+                include_airlines=include_airlines,
+                deep_search=deep_search,
+                travel_class=travel_class,
+                adults=adults,
+                currency=currency,
+                hl=hl,
             ),
             timeout=resolve_timeout,
         )
     except asyncio.TimeoutError:
-        logger.info(
+        logger.debug(
             "booking_token_resolution completed",
             extra={
                 "result_bucket": "timeout",
@@ -1524,7 +2288,7 @@ async def resolve_booking_token_with_details(
             "cache_hit": False,
         }
     except BookingOptionsFetchError as e:
-        logger.info(
+        logger.debug(
             "booking_token_resolution completed",
             extra={
                 "result_bucket": e.reason or "request_exception",
@@ -1548,7 +2312,7 @@ async def resolve_booking_token_with_details(
             "cache_hit": False,
         }
     except Exception:
-        logger.info(
+        logger.debug(
             "booking_token_resolution completed",
             extra={
                 "result_bucket": "exception",
@@ -1573,40 +2337,62 @@ async def resolve_booking_token_with_details(
         }
 
     options = _extract_booking_options_from_payload(payload or {})
-    best = None
-    if options:
-        priced = [opt for opt in options if opt.get("price") is not None]
-        best = min(priced, key=lambda x: x["price"]) if priced else options[0]
+    booking_request = _extract_booking_request_artifact_from_payload(payload or {})
+    selected_flights_summary = _summarize_selected_flights(payload or {})
+    artifact_inspection = _summarize_booking_artifact_graph(
+        payload=payload or {},
+        options=options,
+        booking_request=booking_request,
+    )
+    logger.debug(
+        "booking_artifact_graph_inspected",
+        extra={
+            "booking_options_count": artifact_inspection.get("booking_options_count"),
+            "booking_option_domains": artifact_inspection.get("booking_option_domains"),
+            "replayable_partner_option_domains": artifact_inspection.get("replayable_partner_option_domains"),
+            "booking_request_domain": artifact_inspection.get("booking_request_domain"),
+            "booking_request_method": artifact_inspection.get("booking_request_method"),
+            "booking_request_has_post_data": artifact_inspection.get("booking_request_has_post_data"),
+            "only_google_click_or_google_domains": artifact_inspection.get("only_google_click_or_google_domains"),
+            "has_replayable_partner_option": artifact_inspection.get("has_replayable_partner_option"),
+        },
+    )
 
-    if best and best.get("link"):
-        link = str(best.get("link")).strip()
-        if not _is_usable_handoff_url(link):
-            logger.info(
-                "booking_token_resolution completed",
-                extra={
-                    "result_bucket": "invalid_direct_link",
-                    "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
-                },
-            )
-            return {
-                "url": None,
-                "source": "booking_token",
-                "reason": "booking_token_invalid_url",
-                "status": "unavailable",
-                "provider": "serpapi",
-                "handoff_mode": "unavailable",
-                "landing_guarantee": "none",
-                "is_exact_handoff": False,
-                "is_search_fallback": False,
-                "is_provider_managed": False,
-                "is_booking_quality_exit": False,
-                "booking_exit_quality": "unavailable",
-            }
-        _cache_booking_resolution(cache_key, {"kind": "direct_booking", "url": link})
-        logger.info(
+    invalid_direct_link_encountered = False
+    if options:
+        invalid_direct_link_encountered = True
+
+    selected_partner_option = _select_best_replayable_partner_option(options)
+    summary_option = selected_partner_option
+    if summary_option is None:
+        summary_option = next(
+            (
+                option
+                for option in options
+                if isinstance(option, dict) and isinstance(option.get("booking_request"), dict)
+            ),
+            None,
+        )
+    if summary_option is None and options:
+        summary_option = sorted(options, key=_option_sort_key)[0]
+    booking_option_summary = _summarize_booking_option(summary_option)
+    if selected_partner_option and selected_partner_option.get("link"):
+        link = str(selected_partner_option.get("link")).strip()
+        _cache_booking_resolution(
+            cache_key,
+            {
+                "kind": "direct_booking",
+                "url": link,
+                "artifact_inspection": artifact_inspection,
+                "booking_option_summary": booking_option_summary,
+                "selected_flights_summary": selected_flights_summary,
+            },
+        )
+        logger.debug(
             "booking_token_resolution completed",
             extra={
                 "result_bucket": "direct_booking",
+                "selected_domain": _domain_for_url(link),
                 "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
             },
         )
@@ -1624,9 +2410,22 @@ async def resolve_booking_token_with_details(
             "is_booking_quality_exit": True,
             "booking_exit_quality": "booking_ready",
             "cache_hit": False,
+            "artifact_inspection": artifact_inspection,
+            "booking_option_summary": booking_option_summary,
+            "selected_flights_summary": selected_flights_summary,
         }
 
-    booking_request = _extract_booking_request_artifact_from_payload(payload or {})
+    if options:
+        logger.debug(
+            "booking_token_no_replayable_partner_option",
+            extra={
+                "booking_option_domains": artifact_inspection.get("booking_option_domains"),
+                "booking_option_google_tracker_count": artifact_inspection.get("booking_option_google_tracker_count"),
+                "replayable_partner_option_domains": artifact_inspection.get("replayable_partner_option_domains"),
+                "only_google_click_or_google_domains": artifact_inspection.get("only_google_click_or_google_domains"),
+            },
+        )
+
     if booking_request and booking_request.get("url"):
         request_url = str(booking_request.get("url")).strip()
         post_data = booking_request.get("post_data")
@@ -1641,37 +2440,123 @@ async def resolve_booking_token_with_details(
                     "url": request_url,
                     "post_data": post_data,
                     "headers": request_headers,
+                    "artifact_inspection": artifact_inspection,
+                    "booking_option_summary": booking_option_summary,
+                    "selected_flights_summary": selected_flights_summary,
                 },
             )
-            bridge_url = register_post_handoff_artifact(
-                url=request_url,
+            resolver = await _resolve_booking_request_post_to_provider_url(
+                request_url=request_url,
                 post_data=post_data,
-                headers=request_headers,
+                request_headers=request_headers,
             )
-            if bridge_url:
-                logger.info(
-                    "booking_token_resolution completed",
-                    extra={
-                        "result_bucket": "booking_request_post",
-                        "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
+            resolved_provider_url = _canonicalize_handoff_url(str(resolver.get("resolved_url") or ""))
+            if resolver.get("status") == "resolved" and resolved_provider_url and _is_usable_handoff_url(resolved_provider_url):
+                _cache_booking_resolution(
+                    cache_key,
+                    {
+                        "kind": "booking_request_post_resolved",
+                        "url": request_url,
+                        "post_data": post_data,
+                        "headers": request_headers,
+                        "resolved_provider_url": resolved_provider_url,
+                        "booking_request_resolution": resolver,
+                        "artifact_inspection": artifact_inspection,
+                        "booking_option_summary": booking_option_summary,
+                        "selected_flights_summary": selected_flights_summary,
                     },
                 )
+                resolved_summary = _coalesce_booking_option_summary(
+                    booking_option_summary if isinstance(booking_option_summary, dict) else None,
+                    resolved_url=resolved_provider_url,
+                )
                 return {
-                    "url": bridge_url,
+                    "url": resolved_provider_url,
                     "source": "booking_token",
                     "reason": "resolved_booking_request_post",
                     "status": "ok",
                     "provider": "serpapi",
                     "handoff_mode": "provider_or_shareable",
-                    "landing_guarantee": "provider_managed_post_bridge",
-                    "artifact_field": "booking_request.post_followup_bridge",
-                    "requires_browser_post": True,
+                    "landing_guarantee": "provider_managed",
+                    "artifact_field": "booking_request.post_data_resolved_provider_url",
                     "is_exact_handoff": False,
                     "is_search_fallback": False,
                     "is_provider_managed": True,
                     "is_booking_quality_exit": True,
                     "booking_exit_quality": "booking_ready",
                     "cache_hit": False,
+                    "artifact_inspection": artifact_inspection,
+                    "booking_request_resolution": resolver,
+                    "booking_option_summary": resolved_summary,
+                    "selected_flights_summary": selected_flights_summary,
+                }
+
+            bridge_url = register_post_handoff_artifact(
+                url=request_url,
+                post_data=post_data,
+                headers=request_headers,
+            )
+            if bridge_url:
+                target_domain, target_path = _bridge_target_domain_path(request_url)
+                logger.debug(
+                    "booking_post_bridge_target_resolved",
+                    extra={
+                        "target_domain": target_domain,
+                        "target_path": target_path,
+                        "result_bucket": "booking_request_post",
+                        "resolution_duration_ms": int((time.monotonic() - resolution_started) * 1000),
+                    },
+                )
+                if _is_brittle_google_tracker_url(request_url):
+                    logger.info(
+                        "booking_post_bridge_booking_ready_downgraded",
+                        extra={
+                            "target_domain": target_domain,
+                            "target_path": target_path,
+                            "downgrade_reason": "google_tracker_post_bridge_unverified",
+                            "browser_landing_verdict": "unknown_unverified",
+                            "cache_hit": False,
+                            "only_google_click_or_google_domains": artifact_inspection.get(
+                                "only_google_click_or_google_domains"
+                            ),
+                            "all_non_google_domains": artifact_inspection.get("all_non_google_domains"),
+                        },
+                    )
+                    downgraded = _build_unverified_google_tracker_post_bridge_payload(
+                        bridge_url=bridge_url,
+                        reason="resolved_booking_request_post_unverified_google_tracker",
+                        request_url=request_url,
+                        cache_hit=False,
+                        artifact_inspection=artifact_inspection,
+                    )
+                    downgraded["booking_request_resolution"] = resolver
+                    downgraded["booking_option_summary"] = booking_option_summary
+                    downgraded["selected_flights_summary"] = selected_flights_summary
+                    return downgraded
+                return {
+                    "url": None,
+                    "diagnostic_handoff_url": bridge_url,
+                    "source": "booking_token",
+                    "reason": "booking_request_post_resolution_failed",
+                    "status": "unavailable",
+                    "provider": "serpapi",
+                    "handoff_mode": "unavailable",
+                    "landing_guarantee": "none",
+                    "artifact_field": "booking_request.post_followup_bridge",
+                    "requires_browser_post": True,
+                    "is_exact_handoff": False,
+                    "is_search_fallback": False,
+                    "is_provider_managed": False,
+                    "is_booking_quality_exit": False,
+                    "booking_exit_quality": "unavailable",
+                    "cache_hit": False,
+                    "artifact_inspection": artifact_inspection,
+                    "booking_request_resolution": resolver,
+                    "proof_only_google_artifacts": bool(
+                        artifact_inspection.get("only_google_click_or_google_domains")
+                    ) and not bool(artifact_inspection.get("has_replayable_partner_option")),
+                    "booking_option_summary": booking_option_summary,
+                    "selected_flights_summary": selected_flights_summary,
                 }
         if _is_usable_handoff_url(request_url):
             _cache_booking_resolution(
@@ -1679,9 +2564,12 @@ async def resolve_booking_token_with_details(
                 {
                     "kind": "booking_request_get",
                     "url": request_url,
+                    "artifact_inspection": artifact_inspection,
+                    "booking_option_summary": booking_option_summary,
+                    "selected_flights_summary": selected_flights_summary,
                 },
             )
-            logger.info(
+            logger.debug(
                 "booking_token_resolution completed",
                 extra={
                     "result_bucket": "booking_request_get",
@@ -1703,9 +2591,12 @@ async def resolve_booking_token_with_details(
                 "is_booking_quality_exit": True,
                 "booking_exit_quality": "booking_ready",
                 "cache_hit": False,
+                "artifact_inspection": artifact_inspection,
+                "booking_option_summary": booking_option_summary,
+                "selected_flights_summary": selected_flights_summary,
             }
 
-    logger.info(
+    logger.debug(
         "booking_token_resolution completed",
         extra={
             "result_bucket": "no_usable_artifact",
@@ -1715,7 +2606,7 @@ async def resolve_booking_token_with_details(
     return {
         "url": None,
         "source": "booking_token",
-        "reason": "booking_token_unresolved",
+        "reason": "booking_token_invalid_url" if invalid_direct_link_encountered else "booking_token_unresolved",
         "status": "unavailable",
         "provider": "serpapi",
         "handoff_mode": "unavailable",
@@ -1726,168 +2617,57 @@ async def resolve_booking_token_with_details(
         "is_booking_quality_exit": False,
         "booking_exit_quality": "unavailable",
         "cache_hit": False,
+        "artifact_inspection": artifact_inspection,
+        "proof_only_google_artifacts": bool(
+            artifact_inspection.get("only_google_click_or_google_domains")
+        ) and not bool(artifact_inspection.get("has_replayable_partner_option")),
+        "booking_option_summary": booking_option_summary,
+        "selected_flights_summary": selected_flights_summary,
     }
 
 
-def build_google_flights_fallback(
-    *,
-    origin: str,
-    destination: str,
-    depart_date: str,
-    return_date: Optional[str] = None,
-    flight: Optional[Dict[str, Any]] = None,
-) -> str:
-    """
-    Build a clean, HTTPS Google Flights search URL as a last-resort fallback.
+def _extract_airline_code_hint(flight: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(flight, dict):
+        return None
+    candidates: List[str] = []
+    flight_no = str(flight.get("flight_no") or "").strip().upper()
+    if flight_no:
+        candidates.append(flight_no)
+    marketed = flight.get("marketed_as")
+    if isinstance(marketed, list):
+        candidates.extend([str(item).strip().upper() for item in marketed if item])
+    legs = flight.get("legs")
+    if isinstance(legs, list):
+        for leg in legs[:2]:
+            if isinstance(leg, dict):
+                leg_no = str(leg.get("flight_number") or "").strip().upper()
+                if leg_no:
+                    candidates.append(leg_no)
+    for candidate in candidates:
+        match = re.search(r"\b([A-Z0-9]{2})\s*\d", candidate)
+        if match:
+            return match.group(1)
+    return None
 
-    Uses the /travel/flights?q= format which is stable and works without
-    any special parameters.
-    """
-    query_parts: List[str] = [
-        f"Flights from {origin} airport to {destination} airport on {depart_date}",
-        f"IATA {origin} {destination}",
-    ]
-    if return_date:
-        query_parts.append("round trip")
-        query_parts.append(f"returning {return_date}")
-        # Keep return-leg phrasing explicit so fallback remains useful on weak
-        # round-trip routes while staying compact for parser compatibility.
-        query_parts.append(f"return flight {destination} to {origin} on {return_date}")
 
-    # Add itinerary hints so fallback remains differentiated/useful per flight.
-    # Keep phrasing parser-friendly to avoid generic search landing pages.
-    if isinstance(flight, dict):
-        airline = str(flight.get("airline") or "").strip()
-        flight_no = str(flight.get("flight_no") or "").strip()
-        departure_time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", str(flight.get("departure_time") or ""))
-        arrival_time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", str(flight.get("arrival_time") or ""))
-        layover_airports_raw = flight.get("layover_airports")
-        layover_airports: List[str] = []
-        if isinstance(layover_airports_raw, list):
-            for item in layover_airports_raw:
-                token = str(item or "").strip().upper()
-                if re.fullmatch(r"[A-Z]{3}", token):
-                    layover_airports.append(token)
-        stops_value = flight.get("stops")
-        stops: Optional[int]
-        try:
-            stops = int(stops_value) if stops_value is not None else None
-        except (TypeError, ValueError):
-            stops = None
-
-        if airline and flight_no:
-            query_parts.append(f"{airline} {flight_no}")
-        elif airline:
-            query_parts.append(airline)
-        elif flight_no:
-            query_parts.append(flight_no)
-
-        dep_time = (
-            f"{int(departure_time_match.group(1)):02d}:{departure_time_match.group(2)}"
-            if departure_time_match
-            else None
-        )
-        arr_time = (
-            f"{int(arrival_time_match.group(1)):02d}:{arrival_time_match.group(2)}"
-            if arrival_time_match
-            else None
-        )
-        if dep_time and arr_time:
-            query_parts.append(f"{dep_time} to {arr_time}")
-        elif dep_time:
-            query_parts.append(f"depart {dep_time}")
-        elif arr_time:
-            query_parts.append(f"arrive {arr_time}")
-
-        if layover_airports:
-            # Keep only first two IATA hints so query stays compact and parseable.
-            query_parts.append("via " + " ".join(layover_airports[:2]))
-        elif stops and stops > 0:
-            query_parts.append(f"{stops} stop{'s' if stops != 1 else ''}")
-
-    params = {
-        "q": " ".join(query_parts),
+def _build_serpapi_booking_resolution_hints(flight: Dict[str, Any]) -> Dict[str, Any]:
+    hints: Dict[str, Any] = {
+        "currency": "INR",
         "hl": "en",
-        "gl": "in",
-        "curr": "INR",
+        "adults": 1,
     }
-    return f"https://www.google.com/travel/flights?{urllib.parse.urlencode(params)}"
-
-
-def _select_shareable_or_partner_link(flight: Dict[str, Any]) -> tuple[Optional[str], Optional[str], bool]:
-    """
-    Returns (url, source_field, had_invalid_shareable_flag).
-    """
-    candidate_fields = (
-        "shareable_link",
-        "provider_link",
-        "partner_booking_link",
-        "booking_url",
-        "partner_url",
-        "handoff_url",
-        "link",
-        "url",
-    )
-    had_invalid_shareable = False
-    for field in candidate_fields:
-        raw = flight.get(field)
-        if not raw:
-            continue
-        canonical = _canonicalize_handoff_url(str(raw))
-        if not canonical:
-            if field == "shareable_link":
-                had_invalid_shareable = True
-            continue
-        # Treat generic Google travel search URLs as fallback-equivalent unless
-        # they were explicitly provided as shareable_link.
-        if field != "shareable_link" and _is_google_search_fallback_url(canonical):
-            continue
-        return canonical, field, had_invalid_shareable
-
-    def _extract_nested_link(node: Any, path: str, depth: int) -> tuple[Optional[str], Optional[str]]:
-        if depth > 3:
-            return None, None
-        link_keys = ("booking_url", "booking_link", "deeplink", "redirect_link", "link", "url")
-        container_keys = ("book_with", "providers", "seller", "booking", "options", "booking_options", "tickets", "offers", "offer")
-
-        if isinstance(node, dict):
-            for lk in link_keys:
-                raw_link = node.get(lk)
-                if not raw_link:
-                    continue
-                canonical_link = _canonicalize_handoff_url(str(raw_link))
-                if not canonical_link:
-                    continue
-                if _is_google_search_fallback_url(canonical_link):
-                    continue
-                return canonical_link, f"{path}.{lk}" if path else lk
-            for ck in container_keys:
-                if ck not in node:
-                    continue
-                nested_link, nested_field = _extract_nested_link(
-                    node[ck],
-                    f"{path}.{ck}" if path else ck,
-                    depth + 1,
-                )
-                if nested_link:
-                    return nested_link, nested_field
-            return None, None
-
-        if isinstance(node, list):
-            for idx, item in enumerate(node[:10]):
-                nested_link, nested_field = _extract_nested_link(item, f"{path}[{idx}]", depth + 1)
-                if nested_link:
-                    return nested_link, nested_field
-        return None, None
-
-    for root in ("booking_options", "book_with", "providers", "seller", "tickets", "offers", "offer", "booking"):
-        if root not in flight:
-            continue
-        nested_link, nested_field = _extract_nested_link(flight[root], root, 0)
-        if nested_link:
-            return nested_link, nested_field or root, had_invalid_shareable
-
-    return None, None, had_invalid_shareable
+    include_airlines = _extract_airline_code_hint(flight)
+    if include_airlines:
+        hints["include_airlines"] = include_airlines
+    stops = flight.get("stops")
+    try:
+        stop_count = int(stops) if stops is not None else 0
+    except Exception:
+        stop_count = 0
+    if stop_count > 0:
+        # For connecting itineraries widen seller graph lookup on booking options.
+        hints["deep_search"] = True
+    return hints
 
 
 async def build_booking_handoff_url(
@@ -1899,207 +2679,100 @@ async def build_booking_handoff_url(
     return_date: Optional[str] = None,
     passengers: int = 1,
     return_details: bool = False,
-) -> Union[str, Dict[str, Any]]:
+    ) -> Union[str, Dict[str, Any]]:
     """
-    Resolve the best possible booking deep-link for a flight, in priority order:
-
-    1. SerpAPI booking_token  → calls the SerpAPI booking engine to get the
-                                cheapest airline-native checkout URL.
-    2. shareable_link         → the SerpAPI-provided shareable Google Flights link
-                                which pre-fills the exact itinerary.
-    3. Google Flights fallback→ a clean /travel/flights?q= search URL.
-
-    Args:
-        flight: Full flight dict from planner (must include 'booking_token'
-                and/or 'shareable_link' keys populated by airline_api.py).
-        origin, destination: IATA codes.
-        depart_date: YYYY-MM-DD.
-        return_date: YYYY-MM-DD or None for one-way.
-        passengers: Number of adult passengers.
-
-    Returns:
-        str: The best available booking URL (default behavior).
-        dict: When return_details=True, returns compact source classification metadata.
+    Resolve booking handoff through the booking-token provider-resolution path only.
+    No Google fallback/search-assist link is emitted.
     """
     def _detail_payload(
         *,
-        url: Optional[str],
-        source: str,
+        status: str,
         reason: str,
+        source: str,
+        url: Optional[str] = None,
         provider: Optional[str] = None,
-        handoff_mode: Optional[str] = None,
-        landing_guarantee: Optional[str] = None,
-        artifact_field: Optional[str] = None,
-        search_fallback_quality: Optional[str] = None,
-        search_fallback_context: Optional[Dict[str, Any]] = None,
+        cache_hit: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        status = "ok" if url else "unavailable"
-        mode = handoff_mode or "unavailable"
         payload: Dict[str, Any] = {
-            "url": url,
-            "source": source,
-            "reason": reason,
             "status": status,
-            "is_exact_handoff": mode == "direct_booking",
-            "is_search_fallback": mode == "search_fallback",
-            "is_provider_managed": mode in {"direct_booking", "provider_or_shareable"},
-            "is_booking_quality_exit": mode in {"direct_booking", "provider_or_shareable"},
-            "booking_exit_quality": (
-                "booking_ready"
-                if mode in {"direct_booking", "provider_or_shareable"}
-                else ("search_assist" if mode == "search_fallback" else "unavailable")
-            ),
+            "reason": reason,
+            "source": source,
+            "url": url if status == "booking_ready" else None,
+            "booking_exit_quality": "booking_ready" if status == "booking_ready" else "unavailable",
         }
         if provider:
             payload["provider"] = provider
-        payload["handoff_mode"] = mode
-        payload["landing_guarantee"] = landing_guarantee or "none"
-        if artifact_field:
-            payload["artifact_field"] = artifact_field
-        if mode == "search_fallback" and search_fallback_quality:
-            payload["search_fallback_quality"] = search_fallback_quality
-        if mode == "search_fallback" and isinstance(search_fallback_context, dict):
-            payload["search_fallback_context"] = search_fallback_context
+        if cache_hit is not None:
+            payload["cache_hit"] = bool(cache_hit)
         return payload
 
-    # ── Priority 1: SerpAPI booking_token ────────────────────────────────
     booking_token = flight.get("booking_token")
-    token_result: Optional[Dict[str, Any]] = None
-    if booking_token:
-        try:
-            token_result = await resolve_booking_token_with_details(
-                booking_token,
-                departure_id=origin,
-                arrival_id=destination,
-                outbound_date=depart_date,
-                return_date=return_date,
-            )
-        except TypeError:
-            # Backward-compatible path for tests that monkeypatch this helper
-            # with older signatures.
-            token_result = await resolve_booking_token_with_details(booking_token)
-        resolved = token_result.get("url") if isinstance(token_result, dict) else None
-        if token_result and token_result.get("requires_browser_post") and isinstance(resolved, str) and resolved.startswith("/"):
-            logger.info("Handoff URL resolved via POST-capable booking artifact bridge")
-            if return_details:
-                token_result["artifact_field"] = token_result.get("artifact_field") or "booking_request.post_followup_bridge"
-                return token_result
-            return resolved
-        canonical_resolved = _canonicalize_handoff_url(str(resolved)) if resolved else None
-        if canonical_resolved:
-            logger.info("Handoff URL resolved via SerpAPI booking_token (cheapest option)")
-            if return_details:
-                token_result["url"] = canonical_resolved
-                if token_result.get("handoff_mode") != "provider_or_shareable":
-                    token_result["handoff_mode"] = "direct_booking"
-                    token_result["landing_guarantee"] = "partner_specific"
-                    token_result["is_exact_handoff"] = True
-                    token_result["is_search_fallback"] = False
-                    token_result["is_provider_managed"] = True
-                    token_result["is_booking_quality_exit"] = True
-                    token_result["booking_exit_quality"] = "booking_ready"
-                return token_result
-            return canonical_resolved
-        if resolved and not canonical_resolved:
-            token_result = {
-                "url": None,
-                "source": "booking_token",
-                "reason": "booking_token_invalid_url",
-                "status": "unavailable",
-                "provider": "serpapi",
-            }
-        logger.info("booking_token resolution unavailable; falling through to shareable_link/google fallback")
+    if not booking_token:
+        unavailable = _detail_payload(
+            status="unavailable",
+            reason="booking_token_missing",
+            source="unavailable",
+            provider="serpapi",
+        )
+        return unavailable if return_details else None
 
-    # ── Priority 2: shareable/provider link artifacts ─────────────────────
-    canonical_shareable, shareable_field, had_invalid_shareable = _select_shareable_or_partner_link(flight)
-    if canonical_shareable:
-        logger.info("Handoff URL resolved via %s", shareable_field or "shareable_link")
-        if return_details:
-            if token_result:
-                token_reason = token_result.get("reason") or "booking_token_unresolved"
-                if shareable_field == "shareable_link":
-                    reason = f"{token_reason}_fallback_shareable"
-                else:
-                    reason = f"{token_reason}_fallback_partner_link"
-            else:
-                reason = "shareable_link_available" if shareable_field == "shareable_link" else f"partner_link_{shareable_field}_available"
-            return _detail_payload(
-                url=canonical_shareable,
-                source="shareable_link",
-                reason=reason,
-                provider="serpapi",
-                handoff_mode="provider_or_shareable",
-                landing_guarantee="provider_managed",
-                artifact_field=shareable_field,
-            )
-        return canonical_shareable
-    if had_invalid_shareable:
-        logger.info("shareable_link is present but invalid; falling through to stronger links/google fallback")
-        if not token_result:
-            token_result = {
-                "reason": "invalid_shareable_link",
-                "source": "shareable_link",
-                "status": "unavailable",
-                "provider": "serpapi",
-            }
-
-    # ── Priority 2.5: booking_request follow-up artifacts ────────────────
-    booking_request_url, booking_request_field = await _resolve_booking_request_handoff(flight)
-    if booking_request_url:
-        logger.info("Handoff URL resolved via %s", booking_request_field or "booking_request")
-        if return_details:
-            if token_result:
-                token_reason = token_result.get("reason") or "booking_token_unresolved"
-                reason = f"{token_reason}_fallback_partner_link"
-            else:
-                reason = "partner_link_booking_request_available"
-            return _detail_payload(
-                url=booking_request_url,
-                source="shareable_link",
-                reason=reason,
-                provider="serpapi",
-                handoff_mode="provider_or_shareable",
-                landing_guarantee="provider_managed",
-                artifact_field=booking_request_field or "booking_request",
-            )
-        return booking_request_url
-
-    # ── Priority 3: Google Flights fallback ──────────────────────────────
-    logger.info("Handoff URL falling back to Google Flights search URL")
-    fallback_url = build_google_flights_fallback(
-        origin=origin,
-        destination=destination,
-        depart_date=depart_date,
-        return_date=return_date,
-        flight=flight,
-    )
-    if return_details:
-        search_fallback_context = _search_fallback_context(
-            origin=origin,
-            destination=destination,
-            depart_date=depart_date,
+    serpapi_hints = _build_serpapi_booking_resolution_hints(flight)
+    try:
+        token_result = await resolve_booking_token_with_details(
+            booking_token,
+            departure_id=origin,
+            arrival_id=destination,
+            outbound_date=depart_date,
             return_date=return_date,
-            flight=flight,
+            include_airlines=serpapi_hints.get("include_airlines"),
+            deep_search=serpapi_hints.get("deep_search"),
+            adults=serpapi_hints.get("adults"),
+            currency=serpapi_hints.get("currency"),
+            hl=serpapi_hints.get("hl"),
         )
-        search_fallback_quality = _legacy_search_fallback_quality_for_clients(
-            search_fallback_context.get("quality_tier", "")
+    except TypeError:
+        # Backward-compatible tests may monkeypatch old signatures.
+        token_result = await resolve_booking_token_with_details(booking_token)
+    except Exception:
+        token_result = {
+            "url": None,
+            "reason": "booking_handoff_exception",
+            "source": "booking_token",
+            "provider": "serpapi",
+        }
+
+    if not isinstance(token_result, dict):
+        token_result = {
+            "url": None,
+            "reason": "booking_token_unresolved",
+            "source": "booking_token",
+            "provider": "serpapi",
+        }
+
+    resolved_candidate = _canonicalize_handoff_url(token_result.get("url"))
+    resolved_is_booking_ready = bool(resolved_candidate) and str(
+        token_result.get("booking_exit_quality") or ""
+    ).strip().lower() == "booking_ready"
+
+    if resolved_is_booking_ready:
+        ready = _detail_payload(
+            status="booking_ready",
+            reason=str(token_result.get("reason") or "resolved_booking_token"),
+            source=str(token_result.get("source") or "booking_token"),
+            url=resolved_candidate,
+            provider=str(token_result.get("provider") or "serpapi"),
+            cache_hit=token_result.get("cache_hit"),
         )
-        if token_result:
-            token_reason = token_result.get("reason") or "booking_token_unresolved"
-            reason = f"{token_reason}_google_search_fallback"
-        else:
-            reason = "no_booking_artifacts_google_search_fallback"
-        return _detail_payload(
-            url=fallback_url,
-            source="google_flights_fallback",
-            reason=reason,
-            provider="google_flights",
-            handoff_mode="search_fallback",
-            landing_guarantee="best_effort_search",
-            search_fallback_quality=search_fallback_quality,
-            search_fallback_context=search_fallback_context,
-        )
-    return fallback_url
+        return ready if return_details else str(ready["url"])
+
+    unavailable = _detail_payload(
+        status="unavailable",
+        reason=str(token_result.get("reason") or "booking_token_unresolved"),
+        source=str(token_result.get("source") or "booking_token"),
+        provider=str(token_result.get("provider") or "serpapi"),
+        cache_hit=token_result.get("cache_hit"),
+    )
+    return unavailable if return_details else None
 
 
 # ----------------------------------------------------------------------
@@ -2125,26 +2798,131 @@ async def hold_booking(
         status        – "HELD"
         handoff_url   – resolved deep-link for the user to complete purchase
         expires_at    – ISO-8601 string of when the hold expires
+        checkout_ready – true only when provider checkout URL exists
+        checkout_status – booking_ready | provider_handoff_unavailable
+        hold_outcome  – held_with_checkout | held_local_only
+        booking_handoff – compact handoff metadata for truthful status display
     """
-    # Resolve the URL before writing to DB so it's immediately available
-    handoff_url = await build_booking_handoff_url(
-        flight=flight,
-        origin=origin,
-        destination=destination,
-        depart_date=depart_date,
-        return_date=return_date,
-        passengers=passengers,
+    def _is_booking_ready_meta(meta: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        return str(meta.get("booking_exit_quality") or "").strip().lower() == "booking_ready"
+
+    def _normalized_checkout_status(
+        *,
+        handoff_url_value: Optional[str],
+        handoff_meta_value: Optional[Dict[str, Any]],
+    ) -> str:
+        if _is_usable_handoff_url(handoff_url_value):
+            return "booking_ready"
+        status_text = str((handoff_meta_value or {}).get("status") or "").strip().lower()
+        if status_text == "booking_ready":
+            return "booking_ready"
+        return "provider_handoff_unavailable"
+
+    selected_meta = flight.get("booking_handoff") if isinstance(flight.get("booking_handoff"), dict) else None
+    pre_resolved_url_candidates = [
+        flight.get("handoff_url"),
+        selected_meta.get("url") if isinstance(selected_meta, dict) else None,
+        selected_meta.get("handoff_url") if isinstance(selected_meta, dict) else None,
+        selected_meta.get("resolved_url") if isinstance(selected_meta, dict) else None,
+        selected_meta.get("provider_url") if isinstance(selected_meta, dict) else None,
+    ]
+    pre_resolved_handoff_url = next(
+        (
+            _canonicalize_handoff_url(str(candidate or "").strip())
+            for candidate in pre_resolved_url_candidates
+            if _is_usable_handoff_url(_canonicalize_handoff_url(str(candidate or "").strip()))
+        ),
+        None,
     )
+
+    handoff_source = "resolved_during_hold"
+    handoff_meta: Dict[str, Any] = {
+        "status": "unavailable",
+        "reason": "booking_handoff_not_ready",
+        "source": "booking_token",
+        "url": None,
+        "booking_exit_quality": "unavailable",
+    }
+    if pre_resolved_handoff_url and _is_booking_ready_meta(selected_meta):
+        handoff_url = pre_resolved_handoff_url
+        handoff_source = "selected_handoff_reuse"
+        handoff_meta = {
+            "status": "booking_ready",
+            "reason": "selected_handoff_reuse",
+            "source": str(selected_meta.get("source") or "booking_token") if isinstance(selected_meta, dict) else "booking_token",
+            "url": pre_resolved_handoff_url,
+            "booking_exit_quality": "booking_ready",
+        }
+        if isinstance(selected_meta, dict):
+            provider = selected_meta.get("provider")
+            if provider:
+                handoff_meta["provider"] = provider
+            if isinstance(selected_meta.get("cache_hit"), bool):
+                handoff_meta["cache_hit"] = selected_meta.get("cache_hit")
+    else:
+        # Resolve only when no reusable booking-ready handoff is already attached to the selected flight.
+        handoff_result = await build_booking_handoff_url(
+            flight=flight,
+            origin=origin,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            passengers=passengers,
+            return_details=True,
+        )
+        if isinstance(handoff_result, dict):
+            handoff_meta = {
+                "status": str(handoff_result.get("status") or "unavailable"),
+                "reason": str(handoff_result.get("reason") or "booking_token_unresolved"),
+                "source": str(handoff_result.get("source") or "booking_token"),
+                "url": _canonicalize_handoff_url(handoff_result.get("url")),
+                "booking_exit_quality": str(handoff_result.get("booking_exit_quality") or "unavailable"),
+            }
+            provider = handoff_result.get("provider")
+            if provider:
+                handoff_meta["provider"] = provider
+            if isinstance(handoff_result.get("cache_hit"), bool):
+                handoff_meta["cache_hit"] = handoff_result.get("cache_hit")
+            handoff_url = handoff_meta["url"] if handoff_meta.get("status") == "booking_ready" else None
+        else:
+            handoff_url = _canonicalize_handoff_url(handoff_result)
+            handoff_meta = {
+                "status": "booking_ready" if handoff_url else "unavailable",
+                "reason": "resolved_booking_token" if handoff_url else "booking_token_unresolved",
+                "source": "booking_token",
+                "url": handoff_url,
+                "booking_exit_quality": "booking_ready" if handoff_url else "unavailable",
+            }
+
+    persisted_flight = dict(flight or {})
+    # Ensure held records always carry route/date primitives required by tracking.
+    persisted_flight["origin"] = str(origin or "").strip().upper()
+    persisted_flight["destination"] = str(destination or "").strip().upper()
+    persisted_flight["departure_iata"] = persisted_flight.get("departure_iata") or persisted_flight["origin"]
+    persisted_flight["arrival_iata"] = persisted_flight.get("arrival_iata") or persisted_flight["destination"]
+    persisted_flight["date"] = str(depart_date or "").strip()
+    if return_date:
+        persisted_flight["return_date"] = str(return_date).strip()
+    persisted_flight["passengers"] = int(max(1, passengers or 1))
+    persisted_flight["booking_handoff"] = dict(handoff_meta)
+    if handoff_url:
+        persisted_flight["handoff_url"] = handoff_url
+    else:
+        persisted_flight.pop("handoff_url", None)
+        persisted_flight.pop("search_assist_url", None)
+        persisted_flight.pop("fallback_search_url", None)
 
     def _db_operations():
         db = SessionLocal()
         try:
             booking = Booking(
                 status="HELD",
-                flight=flight,
+                flight=persisted_flight,
                 passenger=passenger,
-                booking_token=flight.get("booking_token"),
-                shareable_link=flight.get("shareable_link"),
+                booking_token=persisted_flight.get("booking_token"),
+                shareable_link=persisted_flight.get("shareable_link"),
                 handoff_url=handoff_url,
                 expires_at=datetime.utcnow() + timedelta(minutes=hold_minutes),
             )
@@ -2156,11 +2934,12 @@ async def hold_booking(
                 "Booking held",
                 extra={
                     "booking_id": booking.id,
-                    "flight_no": flight.get("flight_no"),
-                    "handoff_url_source": (
-                        "serpapi_token" if flight.get("booking_token") else
-                        "shareable_link" if flight.get("shareable_link") else
-                        "google_fallback"
+                    "flight_no": persisted_flight.get("flight_no"),
+                    "handoff_url_source": handoff_source,
+                    "checkout_ready": bool(handoff_url),
+                    "checkout_status": _normalized_checkout_status(
+                        handoff_url_value=handoff_url,
+                        handoff_meta_value=handoff_meta,
                     ),
                 }
             )
@@ -2170,12 +2949,21 @@ async def hold_booking(
             db.close()
 
     b_id, b_status, b_expires = await asyncio.to_thread(_db_operations)
+    checkout_ready = bool(handoff_url)
+    checkout_status = _normalized_checkout_status(
+        handoff_url_value=handoff_url,
+        handoff_meta_value=handoff_meta,
+    )
 
     return {
         "id": b_id,
         "status": b_status,
         "handoff_url": handoff_url,
         "expires_at": b_expires,
+        "checkout_ready": checkout_ready,
+        "checkout_status": checkout_status,
+        "hold_outcome": "held_with_checkout" if checkout_ready else "held_local_only",
+        "booking_handoff": handoff_meta,
     }
 
 
@@ -2186,6 +2974,14 @@ def get_booking(booking_id: int) -> Optional[dict]:
         b = db.get(Booking, booking_id)
         if not b:
             return None
+        flight_payload = b.flight if isinstance(b.flight, dict) else {}
+        booking_handoff = (
+            flight_payload.get("booking_handoff")
+            if isinstance(flight_payload.get("booking_handoff"), dict)
+            else None
+        )
+        checkout_ready = bool(_is_usable_handoff_url(b.handoff_url))
+        checkout_status = "booking_ready" if checkout_ready else "provider_handoff_unavailable"
         return {
             "id":             b.id,
             "status":         b.status,
@@ -2194,6 +2990,10 @@ def get_booking(booking_id: int) -> Optional[dict]:
             "booking_token":  b.booking_token,
             "shareable_link": b.shareable_link,
             "handoff_url":    b.handoff_url,
+            "checkout_ready": checkout_ready,
+            "checkout_status": checkout_status,
+            "hold_outcome": "held_with_checkout" if checkout_ready else "held_local_only",
+            "booking_handoff": booking_handoff,
             "created_at":     b.created_at.isoformat() if b.created_at else None,
             "expires_at":     b.expires_at.isoformat() if b.expires_at else None,
         }
@@ -2201,42 +3001,63 @@ def get_booking(booking_id: int) -> Optional[dict]:
         db.close()
 
 
-def confirm_booking(booking_id: int) -> bool:
+def list_bookings(status: Optional[str] = None, limit: int = 100) -> list[dict]:
     """
-    Confirm a HELD booking. Returns False if the hold has expired or the
-    booking is not in HELD status.
+    List recent bookings, optionally filtered by status.
+    Intended for lightweight UI status surfaces (not large-scale pagination).
     """
     db = SessionLocal()
     try:
-        b = db.get(Booking, booking_id)
-        if not b:
-            return False
-        if b.expires_at and b.expires_at < datetime.utcnow():
-            b.status = "EXPIRED"
-            db.commit()
-            logger.info("Booking auto-expired during confirm attempt", extra={"booking_id": booking_id})
-            return False
-        if b.status != "HELD":
-            return False
-        b.status = "CONFIRMED"
-        db.commit()
-        logger.info("Booking confirmed", extra={"booking_id": booking_id})
-        return True
+        q = db.query(Booking)
+        if status:
+            q = q.filter(Booking.status == str(status).upper())
+        rows = q.order_by(Booking.created_at.desc()).limit(max(1, int(limit))).all()
+        payload_rows: list[dict] = []
+        for b in rows:
+            flight_payload = b.flight if isinstance(b.flight, dict) else {}
+            booking_handoff = (
+                flight_payload.get("booking_handoff")
+                if isinstance(flight_payload.get("booking_handoff"), dict)
+                else None
+            )
+            checkout_ready = bool(_is_usable_handoff_url(b.handoff_url))
+            payload_rows.append(
+                {
+                    "id":             b.id,
+                    "status":         b.status,
+                    "flight":         b.flight,
+                    "passenger":      b.passenger,
+                    "booking_token":  b.booking_token,
+                    "shareable_link": b.shareable_link,
+                    "handoff_url":    b.handoff_url,
+                    "checkout_ready": checkout_ready,
+                    "checkout_status": "booking_ready" if checkout_ready else "provider_handoff_unavailable",
+                    "hold_outcome": "held_with_checkout" if checkout_ready else "held_local_only",
+                    "booking_handoff": booking_handoff,
+                    "created_at":     b.created_at.isoformat() if b.created_at else None,
+                    "expires_at":     b.expires_at.isoformat() if b.expires_at else None,
+                }
+            )
+        return payload_rows
     finally:
         db.close()
 
 
 def cancel_booking(booking_id: int) -> bool:
     """
-    Cancel a HELD booking. Cannot cancel a CONFIRMED or EXPIRED booking.
+    Cancel a local booking-follow-up record.
+
+    Cancel is allowed for active local records. EXPIRED rows remain immutable.
     """
     db = SessionLocal()
     try:
         b = db.get(Booking, booking_id)
         if not b:
             return False
-        if b.status in ("CONFIRMED", "EXPIRED"):
+        if b.status == "EXPIRED":
             return False
+        if b.status == "CANCELLED":
+            return True
         b.status = "CANCELLED"
         db.commit()
         logger.info("Booking cancelled", extra={"booking_id": booking_id})
@@ -2285,15 +3106,60 @@ def get_active_held_bookings() -> list[dict]:
             .filter(Booking.status == "HELD", Booking.expires_at > now)
             .all()
         )
-        return [
-            {
-                "id":            b.id,
-                "flight":        b.flight,
-                "booking_token": b.booking_token,
-                "handoff_url":   b.handoff_url,
-                "expires_at":    b.expires_at.isoformat() if b.expires_at else None,
-            }
-            for b in rows
-        ]
+        payload_rows: list[dict] = []
+        for b in rows:
+            checkout_ready = bool(_is_usable_handoff_url(b.handoff_url))
+            payload_rows.append(
+                {
+                    "id":            b.id,
+                    "flight":        b.flight,
+                    "booking_token": b.booking_token,
+                    "handoff_url":   b.handoff_url,
+                    "checkout_ready": checkout_ready,
+                    "checkout_status": "booking_ready" if checkout_ready else "provider_handoff_unavailable",
+                    "expires_at":    b.expires_at.isoformat() if b.expires_at else None,
+                }
+            )
+        return payload_rows
+    finally:
+        db.close()
+
+
+def expire_held_booking_for_tracking_invalid_data(
+    booking_id: int,
+    *,
+    reason: str,
+    emit_warning: bool = True,
+) -> bool:
+    """
+    Mark an active HELD booking as EXPIRED when tracking prerequisites are invalid.
+    Used to quarantine legacy malformed rows so tracker warnings do not repeat forever.
+    """
+    db = SessionLocal()
+    try:
+        booking = db.get(Booking, booking_id)
+        if not booking:
+            return False
+        if booking.status != "HELD":
+            return False
+        booking.status = "EXPIRED"
+        if isinstance(booking.flight, dict):
+            flight_payload = dict(booking.flight)
+            tracking_meta = (
+                dict(flight_payload.get("tracking_meta"))
+                if isinstance(flight_payload.get("tracking_meta"), dict)
+                else {}
+            )
+            tracking_meta["invalidated_reason"] = str(reason or "invalid_tracking_data")
+            tracking_meta["invalidated_at"] = datetime.utcnow().isoformat() + "Z"
+            flight_payload["tracking_meta"] = tracking_meta
+            booking.flight = flight_payload
+        db.commit()
+        if emit_warning:
+            logger.warning(
+                "Expired held booking due to invalid tracking data",
+                extra={"booking_id": booking_id, "reason": reason},
+            )
+        return True
     finally:
         db.close()

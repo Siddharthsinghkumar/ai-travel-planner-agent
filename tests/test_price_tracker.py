@@ -88,3 +88,90 @@ async def test_check_held_booking_prices_fallback_accepts_search_flights_tuple(m
     assert alerts == []
     assert len(snapshot_calls) == 1
     assert snapshot_calls[0]["price_inr"] == 4200.0
+
+
+@pytest.mark.asyncio
+async def test_check_held_booking_prices_expires_legacy_rows_missing_route_fields(monkeypatch):
+    async def should_not_run_search_with_booking_token(_token):
+        raise AssertionError("search_with_booking_token should not run for invalid legacy rows")
+
+    async def should_not_run_search_flights(**_kwargs):
+        raise AssertionError("search_flights should not run for invalid legacy rows")
+
+    expired_calls = []
+
+    def fake_get_active_held_bookings():
+        return [
+            {
+                "id": 999,
+                "flight": {
+                    # Missing origin/destination/date on purpose (legacy malformed row)
+                    "price_inr": 6000,
+                    "booking_token": "tok_legacy",
+                },
+            }
+        ]
+
+    def fake_expire_held_booking_for_tracking_invalid_data(booking_id: int, *, reason: str):
+        expired_calls.append((booking_id, reason))
+        return True
+
+    async def fake_build_booking_handoff_url(**_kwargs):
+        return None
+
+    monkeypatch.setattr("tools.airline_api.search_with_booking_token", should_not_run_search_with_booking_token)
+    monkeypatch.setattr("tools.airline_api.search_flights", should_not_run_search_flights)
+    monkeypatch.setattr("tools.booking_handoff.get_active_held_bookings", fake_get_active_held_bookings)
+    monkeypatch.setattr("tools.booking_handoff.expire_held_booking_for_tracking_invalid_data", fake_expire_held_booking_for_tracking_invalid_data)
+    monkeypatch.setattr("tools.booking_handoff.build_booking_handoff_url", fake_build_booking_handoff_url)
+
+    alerts = await price_tracker.check_held_booking_prices()
+
+    assert alerts == []
+    assert len(expired_calls) == 1
+    booking_id, reason = expired_calls[0]
+    assert booking_id == 999
+    assert "missing_tracking_fields" in reason
+
+
+def test_cleanup_invalid_held_tracking_rows_expires_startup_legacy_rows(monkeypatch):
+    expired_calls = []
+
+    def fake_get_active_held_bookings():
+        return [
+            {
+                "id": 10,
+                "flight": {
+                    "origin": "DEL",
+                    "destination": "BOM",
+                    "date": "2026-05-01",
+                    "price_inr": 6000,
+                },
+            },
+            {
+                "id": 11,
+                "flight": {
+                    "destination": "BLR",
+                    "price_inr": 7000,
+                },
+            },
+        ]
+
+    def fake_expire_held_booking_for_tracking_invalid_data(booking_id: int, *, reason: str, emit_warning: bool = True):
+        expired_calls.append((booking_id, reason, emit_warning))
+        return True
+
+    monkeypatch.setattr("tools.booking_handoff.get_active_held_bookings", fake_get_active_held_bookings)
+    monkeypatch.setattr(
+        "tools.booking_handoff.expire_held_booking_for_tracking_invalid_data",
+        fake_expire_held_booking_for_tracking_invalid_data,
+    )
+
+    summary = price_tracker.cleanup_invalid_held_tracking_rows()
+
+    assert summary["scanned"] == 2
+    assert summary["expired"] == 1
+    assert summary["expired_booking_ids"] == [11]
+    assert expired_calls[0][0] == 11
+    assert "startup_missing_tracking_fields" in expired_calls[0][1]
+    assert expired_calls[0][2] is False

@@ -2,9 +2,8 @@
 
 This runbook is for quick triage of the `llm-travel-agent` API.
 For broader endpoint usage and copy-paste command sets, also see:
-- [demo-sheet.md](./demo-sheet.md)
 - [operator-sheet.md](./operator-sheet.md)
-- [showcase-commands.sh](./showcase-commands.sh)
+- [runtime-script-catalog.md](./runtime-script-catalog.md)
 
 ## 1) API unhealthy
 
@@ -56,7 +55,9 @@ For broader endpoint usage and copy-paste command sets, also see:
 2. Confirm active mode/provider defaults in environment (`CONFIG.md`).
 3. Check router/stream error tags in metrics:
    - `llm_router_stream_failures_total`
-   - `llm.route.*` dynamic counters in `/metrics`
+   - `llm_route_usage_total`
+   - `provider_health_failures_total`
+   - `provider_health_cooldown_skips_total`
 4. Validate local Ollama reachability and cloud key availability.
 
 ## 5) Tool failures (flight/weather)

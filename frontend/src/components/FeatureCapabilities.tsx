@@ -11,7 +11,7 @@ function getPreviewDescription(item: FeatureCapability) {
     "weather-forecast": "Check destination weather guidance when forecast data is available.",
     streaming: "Follow live planning updates as recommendations are prepared.",
     "booking-handoff": "Open booking links when a provider handoff is available.",
-    "booking-actions": "Use explicit chat phrases for basic confirm/cancel/hold actions.",
+    "booking-actions": "Use explicit chat phrases for local hold/cancel actions; provider checkout completes booking externally.",
     "price-tracking-chat": "Start tracking via natural-language chat prompts; dedicated alert controls are still limited.",
     "full-itinerary": "Expanded day-by-day trip planning is on the way.",
     "price-alerts-ui": "Dedicated alert management is being designed.",

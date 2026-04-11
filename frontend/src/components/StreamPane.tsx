@@ -37,6 +37,7 @@ export default function StreamPane({
       className="stream-pane"
       aria-live="polite"
       aria-busy={isStreaming}
+      data-testid="stream-pane"
     >
       {isStreaming && !hasTokenText ? (
         <div className="stream-pane__loading" aria-label="Loading stream">
@@ -56,6 +57,7 @@ export default function StreamPane({
           ]
             .filter(Boolean)
             .join(" ")}
+          data-testid="stream-pane-body"
         >
           {visibleText}
           {isStreaming && hasTokenText && <span className="stream-caret" aria-hidden="true" />}
@@ -73,6 +75,7 @@ export default function StreamPane({
               onClick={onCancel}
               className="stream-pane__cancel"
               aria-label="Cancel streaming"
+              data-testid="stream-cancel"
             >
               Stop
             </button>

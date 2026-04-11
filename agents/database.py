@@ -1,6 +1,19 @@
 # agents/database.py  — REPLACE top part up to Base declaration
 
-from sqlalchemy import create_engine, Column, Integer, Text, TIMESTAMP, JSON, String
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    Text,
+    TIMESTAMP,
+    JSON,
+    String,
+    DateTime,
+    Boolean,
+    UniqueConstraint,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -71,9 +84,108 @@ class SessionHistory(Base):
     final_response = Column(Text, nullable=True)
     meta = Column(JSON, nullable=True)
 
+
+class ProviderKeyState(Base):
+    """
+    Durable provider key-state records for reconciliation-aware key rotation/exhaustion.
+    Source of truth for SerpAPI provider state across process restarts.
+    """
+    __tablename__ = "provider_key_states"
+    __table_args__ = (
+        UniqueConstraint("provider", "key_name_fingerprint", name="uq_provider_key_name_fp"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String(50), nullable=False, index=True)
+    key_name_fingerprint = Column(String(64), nullable=False, index=True)
+    key_value_fingerprint = Column(String(64), nullable=False, index=True)
+    is_exhausted = Column(Boolean, nullable=False, default=False)
+    exhausted_until = Column(DateTime, nullable=True)
+    retry_after = Column(DateTime, nullable=True)
+    searches_left = Column(Integer, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    expected_reset_basis = Column(String(64), nullable=True)
+    expected_reset_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    last_reason = Column(String(128), nullable=True)
+    failure_classification = Column(String(64), nullable=True)
+    state_meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class ProviderStateOverride(Base):
+    """
+    Durable manual operator overrides for provider/key/account/project state.
+    Supports provider-aware semantics (key scope for SerpAPI, provider/project scopes for Gemini, etc.).
+    """
+    __tablename__ = "provider_state_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String(50), nullable=False, index=True)
+    scope_type = Column(String(32), nullable=False, index=True)  # key | provider_account | project
+    scope_identifier = Column(String(128), nullable=True, index=True)
+    # Explicit key-scope bindings (fingerprints only; never raw secrets).
+    key_name_fingerprint = Column(String(64), nullable=True, index=True)
+    key_value_fingerprint = Column(String(64), nullable=True, index=True)
+    override_type = Column(String(64), nullable=False, index=True)
+    active_until = Column(DateTime, nullable=True)
+    note = Column(Text, nullable=True)
+    is_enabled = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+def _ensure_provider_key_state_columns(engine) -> None:
+    try:
+        inspector = inspect(engine)
+        if not inspector.has_table("provider_key_states"):
+            return
+        existing = {str(col.get("name") or "") for col in inspector.get_columns("provider_key_states")}
+        alters = []
+        if "exhausted_until" not in existing:
+            alters.append("ALTER TABLE provider_key_states ADD COLUMN exhausted_until DATETIME")
+        if "retry_after" not in existing:
+            alters.append("ALTER TABLE provider_key_states ADD COLUMN retry_after DATETIME")
+        if "last_used_at" not in existing:
+            alters.append("ALTER TABLE provider_key_states ADD COLUMN last_used_at DATETIME")
+        if "state_meta" not in existing:
+            alters.append("ALTER TABLE provider_key_states ADD COLUMN state_meta JSON")
+        if not alters:
+            return
+        with engine.begin() as conn:
+            for stmt in alters:
+                conn.execute(text(stmt))
+    except Exception:
+        # Keep startup resilient; callers already log DB init failures upstream.
+        pass
+
+
+def _ensure_provider_override_columns(engine) -> None:
+    try:
+        inspector = inspect(engine)
+        if not inspector.has_table("provider_state_overrides"):
+            return
+        existing = {str(col.get("name") or "") for col in inspector.get_columns("provider_state_overrides")}
+        alters = []
+        if "key_name_fingerprint" not in existing:
+            alters.append("ALTER TABLE provider_state_overrides ADD COLUMN key_name_fingerprint VARCHAR(64)")
+        if "key_value_fingerprint" not in existing:
+            alters.append("ALTER TABLE provider_state_overrides ADD COLUMN key_value_fingerprint VARCHAR(64)")
+        if not alters:
+            return
+        with engine.begin() as conn:
+            for stmt in alters:
+                conn.execute(text(stmt))
+    except Exception:
+        # Keep startup resilient; callers already log DB init failures upstream.
+        pass
+
 def init_db():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    _ensure_provider_key_state_columns(engine)
+    _ensure_provider_override_columns(engine)
 
 
 # Backwards compatibility for modules that import SessionLocal

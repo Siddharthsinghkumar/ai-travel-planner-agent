@@ -2,6 +2,7 @@
 import pytest
 import types
 import time
+import asyncio
 
 import agents.cloud_llm as cloud_llm
 
@@ -53,8 +54,10 @@ class FakeAdapter:
 @pytest.fixture(autouse=True)
 def _clear_provider_cooldowns():
     cloud_llm._PROVIDER_FAIL_COOLDOWNS.clear()
+    cloud_llm._EXHAUSTION_EVENT_DEDUP.clear()
     yield
     cloud_llm._PROVIDER_FAIL_COOLDOWNS.clear()
+    cloud_llm._EXHAUSTION_EVENT_DEDUP.clear()
 
 @pytest.mark.asyncio
 async def test_generate_prefers_first_provider():
@@ -206,6 +209,54 @@ def test_classify_provider_health_failure_reason_classes():
     assert cloud_llm._classify_provider_health_failure(RuntimeError("Circuit breaker open")) == "circuit_open"
 
 
+def test_should_emit_fallback_warning_throttles_repeated_noise():
+    cloud_llm._FALLBACK_WARNING_STATE.clear()
+
+    emit1, count1 = cloud_llm._should_emit_fallback_warning("generate:openai:model", "timeout")
+    emit2, count2 = cloud_llm._should_emit_fallback_warning("generate:openai:model", "timeout")
+    emit3, count3 = cloud_llm._should_emit_fallback_warning("generate:openai:model", "timeout")
+    emit4, count4 = cloud_llm._should_emit_fallback_warning("generate:openai:model", "timeout")
+    emit5, count5 = cloud_llm._should_emit_fallback_warning("generate:openai:model", "timeout")
+
+    assert (emit1, count1) == (True, 1)
+    assert (emit2, count2) == (False, 2)
+    assert (emit3, count3) == (False, 3)
+    assert (emit4, count4) == (False, 4)
+    assert (emit5, count5) == (True, 5)
+
+
+@pytest.mark.asyncio
+async def test_generate_respects_model_attempt_budget(monkeypatch):
+    adapter = FakeAdapter("openai", raise_on_call=True)
+    monkeypatch.setattr(cloud_llm, "provider_chain", [("openai", adapter, (Exception,))])
+    monkeypatch.setattr(cloud_llm, "refresh_provider_chain_from_env", lambda force=False: None)
+    monkeypatch.setenv("CLOUD_LLM_MODEL", "primary-model")
+    monkeypatch.setenv("CLOUD_LLM_FALLBACK_MODELS", "fallback-a,fallback-b,fallback-c")
+    monkeypatch.setenv("CLOUD_LLM_MODEL_ATTEMPT_BUDGET", "2")
+
+    attempted_models = []
+
+    async def fake_call_adapter_completion(
+        *,
+        adapter,
+        retry_exc,
+        messages,
+        model,
+        temperature,
+        timeout,
+        max_tokens,
+    ):
+        attempted_models.append(model)
+        raise RuntimeError("temporary upstream timeout")
+
+    monkeypatch.setattr(cloud_llm, "_call_adapter_completion", fake_call_adapter_completion)
+
+    with pytest.raises(RuntimeError, match="temporary upstream timeout"):
+        await cloud_llm.generate(prompt="hello")
+
+    assert attempted_models == ["primary-model", "fallback-a"]
+
+
 @pytest.mark.asyncio
 async def test_health_check_auth_cooldown_and_recovery(monkeypatch):
     adapter = FakeAdapter("openai", ping_error=RuntimeError("401 unauthorized"))
@@ -257,3 +308,75 @@ async def test_health_check_transient_cooldown_and_prunes_unconfigured_entries(m
     openai_until = cloud_llm._PROVIDER_FAIL_COOLDOWNS.get("openai", 0)
     assert openai_until >= started + 5
     assert openai_until <= started + 15
+
+
+@pytest.mark.asyncio
+async def test_on_key_event_exhausted_logging_is_reactive_and_deduped(monkeypatch):
+    calls = []
+    warning_logs = []
+    debug_logs = []
+
+    async def _fake_clear(provider, idx, **_kwargs):
+        calls.append((provider, idx))
+        return True
+
+    monkeypatch.setattr(cloud_llm, "clear_client_cache", _fake_clear)
+    monkeypatch.setattr(cloud_llm.asyncio, "create_task", lambda coro: asyncio.get_event_loop().create_task(coro))
+    monkeypatch.setattr(cloud_llm.logger, "warning", lambda msg, *args, **kwargs: warning_logs.append(msg % args if args else msg))
+    monkeypatch.setattr(cloud_llm.logger, "debug", lambda msg, *args, **kwargs: debug_logs.append(msg % args if args else msg))
+
+    payload = {
+        "service": "serpapi",
+        "index": 0,
+        "reason_class": "quota",
+        "until": "2026-05-01T00:00:00+00:00",
+        "pending": False,
+    }
+    await cloud_llm.on_key_event("key_exhausted", payload)
+    await cloud_llm.on_key_event("key_exhausted", payload)
+    await asyncio.sleep(0)
+
+    assert calls == [("serpapi", 0), ("serpapi", 0)]
+    assert any("Received key_exhausted event" in message for message in warning_logs)
+    assert any("Deduped key_exhausted reaction log" in message for message in debug_logs)
+
+
+def test_openai_exhaustion_reason_separates_billing_from_rate_limit():
+    assert cloud_llm._openai_exhaustion_reason(RuntimeError("insufficient_quota: please check billing")) == "billing_quota_exhausted"
+    assert cloud_llm._openai_exhaustion_reason(RuntimeError("rate limit reached")) == "rate_limit"
+
+
+def test_gemini_scope_binding_can_distinguish_per_project_keys(monkeypatch):
+    monkeypatch.setenv("GEMINI_PROJECT_ID_1", "project-alpha")
+    monkeypatch.setenv("GEMINI_PROJECT_ID_2", "project-beta")
+    scope1 = cloud_llm._gemini_scope_binding(0)
+    scope2 = cloud_llm._gemini_scope_binding(1)
+    assert scope1 == ("project", "project-alpha")
+    assert scope2 == ("project", "project-beta")
+
+
+@pytest.mark.asyncio
+async def test_apply_gemini_runtime_exhaustion_defaults_to_non_key_scope(monkeypatch):
+    captured = {}
+
+    async def _fake_set_provider_state_override(**kwargs):
+        captured.update(kwargs)
+        return {"id": 1}
+
+    async def _unexpected_mark_exhausted(_service, _idx, **_kwargs):
+        raise AssertionError("default gemini runtime policy should not mark single key exhausted")
+
+    monkeypatch.setenv("GEMINI_QUOTA_SCOPE_MODE", "project_or_provider")
+    monkeypatch.delenv("GEMINI_PROJECT_ID_1", raising=False)
+    monkeypatch.delenv("GEMINI_PROJECT_1", raising=False)
+    monkeypatch.delenv("GEMINI_PROJECT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setattr(cloud_llm.key_manager, "set_provider_state_override", _fake_set_provider_state_override)
+    monkeypatch.setattr(cloud_llm.key_manager, "mark_exhausted", _unexpected_mark_exhausted)
+
+    await cloud_llm._apply_gemini_runtime_exhaustion(0, "quota", "quota reached")
+
+    assert captured.get("provider") == "gemini"
+    assert captured.get("scope_type") == "provider_account"
+    assert captured.get("scope_identifier") == "default"
+    assert captured.get("override_type") == "force_exhausted_until"

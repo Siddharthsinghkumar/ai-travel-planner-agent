@@ -19,8 +19,10 @@ import logging
 import importlib
 import hashlib
 import threading
+from datetime import datetime, UTC, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, Any, List, Tuple, Dict
+from zoneinfo import ZoneInfo
 
 # Core infrastructure
 from core.retry import retry_async, RetryConfig
@@ -29,6 +31,7 @@ from core.request_context import get_request_id
 from core.api_key_manager import key_manager
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, parse_csv_env
 from core.llm_mode import get_cloud_provider_chain_resolution, get_llm_mode_default, LLM_MODE_OLLAMA_ONLY
+import core.metrics as app_metrics
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -50,6 +53,8 @@ _PROVIDER_FAIL_COOLDOWNS = {}  # provider_name -> unix timestamp until which we 
 PROVIDER_AUTH_FAIL_COOLDOWN = get_env_int("PROVIDER_AUTH_FAIL_COOLDOWN", 900)
 PROVIDER_TRANSIENT_FAIL_COOLDOWN = get_env_int("PROVIDER_TRANSIENT_FAIL_COOLDOWN", 60)
 PROVIDER_CIRCUIT_OPEN_FAIL_COOLDOWN = get_env_int("PROVIDER_CIRCUIT_OPEN_FAIL_COOLDOWN", 45)
+_FALLBACK_WARNING_STATE: Dict[str, Dict[str, float]] = {}
+_EXHAUSTION_EVENT_DEDUP: Dict[str, float] = {}
 # --------------------------------------------------
 
 _provider_chain_lock = threading.Lock()
@@ -66,6 +71,199 @@ def is_cloud_admin_enabled() -> bool:
 # Backward-compatible snapshot retained for legacy log/debug surfaces.
 USE_CLOUD_LLM = is_cloud_admin_enabled()
 # --------------------------------------------------
+
+
+def _fallback_warning_window_seconds() -> float:
+    return max(5.0, get_env_float("CLOUD_LLM_FALLBACK_LOG_WINDOW_SECONDS", 30.0))
+
+
+def _model_attempt_budget() -> int:
+    return max(1, min(8, get_env_int("CLOUD_LLM_MODEL_ATTEMPT_BUDGET", 3)))
+
+
+def _bounded_models_to_try(primary_model: str, fallback_models: List[str]) -> List[str]:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for candidate in [primary_model, *(fallback_models or [])]:
+        normalized = str(candidate or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    if not ordered:
+        ordered.append(primary_model)
+    return ordered[:_model_attempt_budget()]
+
+
+def _fallback_reason_bucket(exc: Exception) -> str:
+    text = str(exc or "").lower()
+    if _is_no_available_keys_error(exc):
+        return "no_active_key"
+    if "circuit breaker open" in text or "circuit_open" in text:
+        return "circuit_open"
+    if "rate limit" in text or "too many requests" in text or "429" in text:
+        return "rate_limit"
+    if "quota" in text or "insufficient_quota" in text:
+        return "quota"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "unauthorized" in text or "forbidden" in text or "invalid api key" in text:
+        return "auth"
+    if "network" in text or "connect" in text or "unavailable" in text:
+        return "transient"
+    return type(exc).__name__.lower()
+
+
+def _should_emit_fallback_warning(scope: str, bucket: str) -> tuple[bool, int]:
+    key = f"{scope}:{bucket}"
+    now = time.monotonic()
+    window_seconds = _fallback_warning_window_seconds()
+    state = _FALLBACK_WARNING_STATE.get(key)
+    if state is None or (now - float(state.get("window_start", now))) > window_seconds:
+        _FALLBACK_WARNING_STATE[key] = {"window_start": now, "count": 1}
+        if len(_FALLBACK_WARNING_STATE) > 512:
+            stale_before = now - (window_seconds * 2.0)
+            for stale_key in list(_FALLBACK_WARNING_STATE.keys()):
+                started = float(_FALLBACK_WARNING_STATE.get(stale_key, {}).get("window_start", now))
+                if started < stale_before:
+                    _FALLBACK_WARNING_STATE.pop(stale_key, None)
+        return True, 1
+
+    state["count"] = int(state.get("count", 1)) + 1
+    count = int(state["count"])
+    # Keep the first warning, then sparse milestone warnings only.
+    if count in {5, 20, 50}:
+        return True, count
+    return False, count
+
+
+def _should_emit_exhaustion_reaction_log(event_key: str) -> bool:
+    now = time.monotonic()
+    ttl = max(5.0, get_env_float("KEY_EVENT_DEDUP_WINDOW_SECONDS", 30.0))
+    previous = _EXHAUSTION_EVENT_DEDUP.get(event_key)
+    if previous is not None and (now - previous) < ttl:
+        return False
+    _EXHAUSTION_EVENT_DEDUP[event_key] = now
+    if len(_EXHAUSTION_EVENT_DEDUP) > 1024:
+        stale_before = now - (ttl * 2.0)
+        for key in list(_EXHAUSTION_EVENT_DEDUP.keys()):
+            if _EXHAUSTION_EVENT_DEDUP.get(key, now) < stale_before:
+                _EXHAUSTION_EVENT_DEDUP.pop(key, None)
+    return True
+
+
+def _openai_exhaustion_reason(exc: Exception) -> str:
+    """
+    Distinguish account/billing exhaustion from ordinary rate-limit cooldowns.
+    OpenAI billing exhaustion should be treated as quota/billing domain, not daily-reset style.
+    """
+    text = str(exc or "").lower()
+    if any(token in text for token in ("insufficient_quota", "billing", "credit", "payment required", "quota")):
+        return "billing_quota_exhausted"
+    return "rate_limit"
+
+
+def _gemini_rate_scope_mode() -> str:
+    mode = get_env_str("GEMINI_QUOTA_SCOPE_MODE", "project_or_provider").strip().lower()
+    if mode in {"project_or_provider", "provider_account", "project", "key"}:
+        return mode
+    return "project_or_provider"
+
+
+def _gemini_scope_binding(idx: int) -> tuple[str, str]:
+    # Prefer explicit per-key project mapping when provided.
+    project_by_key = get_env_str(f"GEMINI_PROJECT_ID_{int(idx) + 1}", "").strip()
+    if not project_by_key:
+        project_by_key = get_env_str(f"GEMINI_PROJECT_{int(idx) + 1}", "").strip()
+    if project_by_key:
+        return "project", project_by_key
+
+    # Then global project hints.
+    global_project = get_env_str("GEMINI_PROJECT_ID", "").strip()
+    if not global_project:
+        global_project = get_env_str("GOOGLE_CLOUD_PROJECT", "").strip()
+    if global_project:
+        return "project", global_project
+
+    # Fallback: provider-account scoped hold (safe default when project mapping is unknown).
+    provider_account = get_env_str("GEMINI_PROVIDER_ACCOUNT_ID", "").strip()
+    if not provider_account:
+        provider_account = get_env_str("GEMINI_ACCOUNT_ID", "").strip()
+    return "provider_account", (provider_account or "default")
+
+
+def _next_midnight_pacific_utc() -> datetime:
+    try:
+        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        next_midnight_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_midnight_pt.astimezone(UTC)
+    except Exception:
+        # Fallback if timezone database is unavailable.
+        return datetime.now(UTC) + timedelta(days=1)
+
+
+def _gemini_exhaustion_bucket(exc: Exception) -> str:
+    text = str(exc or "").lower()
+    if any(token in text for token in ("unauthorized", "invalid api key", "invalid key", "permission denied", "403", "401", "auth")):
+        return "auth"
+    if any(token in text for token in ("insufficient_quota", "quota", "resource exhausted", "billing")):
+        return "quota"
+    if any(token in text for token in ("rate limit", "too many requests", "429", "ratelimit")):
+        return "rate_limit"
+    return "unknown"
+
+
+async def _apply_gemini_runtime_exhaustion(idx: int, bucket: str, error_text: str) -> None:
+    """
+    Gemini default policy is project/provider-account scoped unless explicitly set to key mode.
+    This avoids assuming independent per-key quota truth when project/account mapping is unknown.
+    """
+    mode = _gemini_rate_scope_mode()
+    normalized_bucket = str(bucket or "unknown").strip().lower()
+    if mode == "key":
+        reason = "rate_limit" if normalized_bucket in {"quota", "rate_limit"} else "unauthorized"
+        await key_manager.mark_exhausted("gemini", idx, reason=reason)
+        return
+
+    scope_type, scope_identifier = _gemini_scope_binding(idx)
+    if mode == "project" and scope_type != "project":
+        scope_type, scope_identifier = ("project", "default")
+    if mode == "provider_account":
+        scope_type, scope_identifier = ("provider_account", "default")
+
+    now_utc = datetime.now(UTC)
+    if normalized_bucket == "quota":
+        until = _next_midnight_pacific_utc()
+        note = "auto_runtime_quota_project_scoped"
+    else:
+        until = now_utc + timedelta(seconds=max(60, int(PROVIDER_FAIL_COOLDOWN)))
+        note = "auto_runtime_rate_limit_project_scoped"
+
+    try:
+        await key_manager.set_provider_state_override(
+            provider="gemini",
+            scope_type=scope_type,
+            scope_identifier=scope_identifier,
+            override_type="force_exhausted_until",
+            active_until=until.isoformat(),
+            note=note,
+        )
+        logger.info(
+            "Applied Gemini runtime exhaustion override",
+            extra={
+                "provider": "gemini",
+                "scope_type": scope_type,
+                "reason_bucket": normalized_bucket,
+                "until": until.isoformat(),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "gemini_runtime_override_failed_falling_back_to_key",
+            extra={"provider": "gemini", "reason_bucket": normalized_bucket, "idx": idx},
+        )
+        fallback_reason = "rate_limit" if normalized_bucket in {"quota", "rate_limit"} else "unauthorized"
+        await key_manager.mark_exhausted("gemini", idx, reason=fallback_reason)
 
 # Lazy imports for optional provider SDKs
 try:
@@ -226,7 +424,7 @@ async def clear_client_cache(provider: str, idx: int, timeout: float = 30.0, exp
         if expected_fingerprint is not None:
             actual_fp = entry.get("fingerprint")
             if actual_fp != expected_fingerprint:
-                logger.info(
+                logger.debug(
                     "clear_client_cache skipped for %s:%d due to fingerprint mismatch (expected=%s actual=%s)",
                     provider, idx, expected_fingerprint, actual_fp
                 )
@@ -282,7 +480,7 @@ async def clear_client_cache(provider: str, idx: int, timeout: float = 30.0, exp
             async with entry_lock:
                 # verify fingerprint once more
                 if expected_fingerprint is not None and entry.get("fingerprint") != expected_fingerprint:
-                    logger.info("clear_client_cache aborted at removal: fingerprint changed for %s:%d", provider, idx)
+                    logger.debug("clear_client_cache aborted at removal: fingerprint changed for %s:%d", provider, idx)
                     return False
                 popped = _clients.pop(cache_key, None)
         else:
@@ -292,7 +490,7 @@ async def clear_client_cache(provider: str, idx: int, timeout: float = 30.0, exp
     # Close outside both locks to avoid blocking
     if popped:
         await _close_client(popped["client"])
-        logger.info("Cleared cached client for %s:%d", provider, idx)
+        logger.debug("Cleared cached client for %s:%d", provider, idx)
         return True
     return False
 
@@ -334,7 +532,27 @@ async def on_key_event(event: str, payload: dict):
             provider = payload.get("service")
             idx = payload.get("index")
             if provider and idx is not None:
-                logger.info("Key exhausted for %s:%d – clearing client cache", provider, idx)
+                dedup_key = "|".join(
+                    [
+                        str(provider),
+                        str(idx),
+                        str(payload.get("reason_class") or ""),
+                        str(payload.get("until") or ""),
+                        str(bool(payload.get("pending"))),
+                    ]
+                )
+                if _should_emit_exhaustion_reaction_log(dedup_key):
+                    logger.warning(
+                        "Received key_exhausted event for %s:%d; reacting by clearing cached client state",
+                        provider,
+                        idx,
+                    )
+                else:
+                    logger.debug(
+                        "Deduped key_exhausted reaction log for %s:%d; clearing cache silently",
+                        provider,
+                        idx,
+                    )
                 asyncio.create_task(clear_client_cache(provider, idx))
         elif event == "env_changed":
             # payload may include new_fingerprint_maps / old_fingerprint_maps
@@ -354,7 +572,12 @@ async def on_key_event(event: str, payload: dict):
                     # if maps use string keys or other shape, do a best-effort
                     pass
 
-                logger.info("Environment changed for %s:%d – clearing client cache (expected_fp=%s)", provider, idx, expected_fp)
+                logger.debug(
+                    "Environment changed for %s:%d – clearing client cache (expected_fp=%s)",
+                    provider,
+                    idx,
+                    expected_fp,
+                )
                 asyncio.create_task(clear_client_cache(provider, idx, expected_fingerprint=expected_fp))
         else:
             logger.debug("Ignoring unknown key event: %s", event)
@@ -425,7 +648,7 @@ class ProviderAdapter:
                         await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
                         raise
                     except RateLimitError as e:
-                        await key_manager.mark_exhausted("openai", idx, reason="rate_limit")
+                        await key_manager.mark_exhausted("openai", idx, reason=_openai_exhaustion_reason(e))
                         raise
                     except (APIConnectionError, asyncio.TimeoutError) as e:
                         # Transient errors, don't mark exhausted
@@ -515,10 +738,10 @@ class ProviderAdapter:
                             self.usage = None
                     return FakeResponse(content)
                 except Exception as e:
-                    # If the error indicates quota exhaustion, mark key exhausted
-                    if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                        await key_manager.mark_exhausted("gemini", idx, reason="rate_limit")
-                    elif "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "key" in str(e).lower():
+                    bucket = _gemini_exhaustion_bucket(e)
+                    if bucket in {"quota", "rate_limit"}:
+                        await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
+                    elif bucket == "auth":
                         await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
                     raise
 
@@ -548,7 +771,7 @@ class ProviderAdapter:
                             await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
                             raise
                         except RateLimitError as e:
-                            await key_manager.mark_exhausted("openai", idx, reason="rate_limit")
+                            await key_manager.mark_exhausted("openai", idx, reason=_openai_exhaustion_reason(e))
                             raise
                         except (APIConnectionError, asyncio.TimeoutError) as e:
                             raise
@@ -632,9 +855,10 @@ class ProviderAdapter:
                     try:
                         content = await asyncio.to_thread(sync_call)
                     except Exception as e:
-                        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                            await key_manager.mark_exhausted("gemini", idx, reason="rate_limit")
-                        elif "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "key" in str(e).lower():
+                        bucket = _gemini_exhaustion_bucket(e)
+                        if bucket in {"quota", "rate_limit"}:
+                            await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
+                        elif bucket == "auth":
                             await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
                         raise
 
@@ -1104,7 +1328,7 @@ async def _call_adapter_completion(
         if cost is not None:
             log_extra["estimated_cost_usd"] = round(cost, 6)
 
-        logger.info("Cloud LLM success", extra=log_extra)
+        logger.debug("Cloud LLM success", extra=log_extra)
         return response
 
     except Exception as e:
@@ -1159,12 +1383,22 @@ async def generate(
         try:
             await _check_circuit_breaker(prov_name)
         except CloudLLMError as e:
-            logger.warning("Skipping provider %s due to open circuit", prov_name)
+            reason_bucket = _fallback_reason_bucket(e)
+            should_warn, occurrence = _should_emit_fallback_warning(
+                scope=f"generate:{prov_name}:circuit",
+                bucket=reason_bucket,
+            )
+            if should_warn:
+                logger.warning(
+                    "Skipping provider %s due to open circuit (occurrence=%d)",
+                    prov_name,
+                    occurrence,
+                )
             last_exception = e
             continue
 
         # Build list of models to try: primary + fallbacks
-        models_to_try = [primary_model] + fallback_models
+        models_to_try = _bounded_models_to_try(primary_model, fallback_models)
         for attempt_model in models_to_try:
             try:
                 response = await _call_adapter_completion(
@@ -1198,17 +1432,39 @@ async def generate(
             except Exception as e:
                 last_exception = e
                 if _is_no_available_keys_error(e):
-                    logger.info(
+                    logger.warning(
                         "Provider %s unavailable due to key exhaustion/unavailability",
                         prov_name,
                         extra={"provider": prov_name},
                     )
                     break
-                logger.warning("Provider %s model %s failed, trying next fallback", prov_name, attempt_model, exc_info=True)
+                reason_bucket = _fallback_reason_bucket(e)
+                should_warn, occurrence = _should_emit_fallback_warning(
+                    scope=f"generate:{prov_name}:model",
+                    bucket=reason_bucket,
+                )
+                if should_warn:
+                    logger.warning(
+                        "Provider %s model %s failed before fallback (reason_bucket=%s, occurrence=%d)",
+                        prov_name,
+                        attempt_model,
+                        reason_bucket,
+                        occurrence,
+                        exc_info=(occurrence == 1),
+                    )
                 continue
 
         # If all models for this provider failed, log and move to next provider
-        logger.warning("All models for provider %s failed, trying next provider", prov_name)
+        should_warn, occurrence = _should_emit_fallback_warning(
+            scope=f"generate:{prov_name}:provider",
+            bucket="all_models_failed",
+        )
+        if should_warn:
+            logger.warning(
+                "All models for provider %s failed, trying next provider (occurrence=%d)",
+                prov_name,
+                occurrence,
+            )
 
     # If all providers and models failed
     raise last_exception or CloudLLMError("All providers and models failed")
@@ -1259,11 +1515,21 @@ async def generate_stream(
         try:
             await _check_circuit_breaker(prov_name)
         except CloudLLMError as e:
-            logger.warning("Skipping provider %s due to open circuit", prov_name)
+            reason_bucket = _fallback_reason_bucket(e)
+            should_warn, occurrence = _should_emit_fallback_warning(
+                scope=f"stream:{prov_name}:circuit",
+                bucket=reason_bucket,
+            )
+            if should_warn:
+                logger.warning(
+                    "Skipping provider %s due to open circuit (occurrence=%d)",
+                    prov_name,
+                    occurrence,
+                )
             last_exception = e
             continue
 
-        models_to_try = [primary_model] + fallback_models
+        models_to_try = _bounded_models_to_try(primary_model, fallback_models)
         tokens_emitted = False
 
         for attempt_model in models_to_try:
@@ -1330,7 +1596,7 @@ async def generate_stream(
                     if first_token:
                         tokens_emitted = True
                         ttft = time.monotonic() - start_time
-                        logger.info("Cloud LLM first token", extra={
+                        logger.debug("Cloud LLM first token", extra={
                             "request_id": request_id,
                             "provider": prov_name,
                             "model": attempt_model,
@@ -1342,7 +1608,7 @@ async def generate_stream(
 
                 # Generator finished normally – success (breaker already recorded success)
                 total_latency = time.monotonic() - start_time
-                logger.info("Cloud LLM stream completed", extra={
+                logger.debug("Cloud LLM stream completed", extra={
                     "request_id": request_id,
                     "provider": prov_name,
                     "model": attempt_model,
@@ -1352,11 +1618,17 @@ async def generate_stream(
                 return
 
             except CircuitBreakerOpenError:
-                logger.warning("cloud_llm circuit open", extra={
-                    "request_id": request_id,
-                    "provider": prov_name,
-                    "model": attempt_model,
-                })
+                should_warn, occurrence = _should_emit_fallback_warning(
+                    scope=f"stream:{prov_name}:breaker_open",
+                    bucket="circuit_open",
+                )
+                if should_warn:
+                    logger.warning("cloud_llm circuit open", extra={
+                        "request_id": request_id,
+                        "provider": prov_name,
+                        "model": attempt_model,
+                        "occurrence": occurrence,
+                    })
                 raise CloudLLMError("Circuit breaker open")
 
             except Exception as e:
@@ -1373,17 +1645,39 @@ async def generate_stream(
                 # Otherwise (failure before first token) – try next model in this provider
                 last_exception = e
                 if _is_no_available_keys_error(e):
-                    logger.info(
+                    logger.warning(
                         "Stream skipped provider %s due to unavailable keys",
                         prov_name,
                         extra={"provider": prov_name},
                     )
                     break
-                logger.warning("Stream open failed for provider %s model %s, trying next model", prov_name, attempt_model, exc_info=True)
+                reason_bucket = _fallback_reason_bucket(e)
+                should_warn, occurrence = _should_emit_fallback_warning(
+                    scope=f"stream:{prov_name}:model",
+                    bucket=reason_bucket,
+                )
+                if should_warn:
+                    logger.warning(
+                        "Stream open failed for provider %s model %s before first token (reason_bucket=%s, occurrence=%d)",
+                        prov_name,
+                        attempt_model,
+                        reason_bucket,
+                        occurrence,
+                        exc_info=(occurrence == 1),
+                    )
                 continue
 
         # All models for this provider failed before first token – move to next provider
-        logger.warning("All models for provider %s failed before first token, trying next provider", prov_name)
+        should_warn, occurrence = _should_emit_fallback_warning(
+            scope=f"stream:{prov_name}:provider",
+            bucket="all_models_failed",
+        )
+        if should_warn:
+            logger.warning(
+                "All models for provider %s failed before first token, trying next provider (occurrence=%d)",
+                prov_name,
+                occurrence,
+            )
 
     # All providers and models failed without emitting a single token
     raise last_exception or CloudLLMError("All streaming providers and models failed")
@@ -1464,6 +1758,7 @@ async def health_check() -> str:
 
         cooldown_until = float(_PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0) or 0)
         if now < cooldown_until:
+            app_metrics.record_provider_health_cooldown_skip(prov_name)
             logger.debug(
                 "Health check skipping provider due to cooldown",
                 extra={"provider": prov_name, "cooldown_until": cooldown_until},
@@ -1477,6 +1772,7 @@ async def health_check() -> str:
             return "ok"
         except Exception as e:
             reason_class = _classify_provider_health_failure(e)
+            app_metrics.record_provider_health_failure(prov_name, reason_class)
             cooldown_seconds = _cooldown_seconds_for_failure_class(reason_class)
             proposed_until = now + float(cooldown_seconds)
             current_until = float(_PROVIDER_FAIL_COOLDOWNS.get(prov_name, 0) or 0)

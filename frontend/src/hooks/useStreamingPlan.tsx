@@ -136,6 +136,16 @@ export function useStreamingPlan() {
     setIsStreaming(false);
   }, [clearVisibleResultState]);
 
+  const reset = useCallback(() => {
+    if (controllerRef.current) {
+      controllerRef.current.abort();
+    }
+    clearVisibleResultState();
+    setError(null);
+    setIsFallback(false);
+    setIsStreaming(false);
+  }, [clearVisibleResultState]);
+
   const runFallbackRequest = useCallback(async (requestId: number, payload: AskPayload) => {
     if (requestIdRef.current !== requestId) return;
     try {
@@ -560,5 +570,6 @@ export function useStreamingPlan() {
     rawStream,
     start,
     cancel,
+    reset,
   };
 }

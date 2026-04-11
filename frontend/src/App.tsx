@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { API_BASE } from "./lib/api";
+import { API_BASE, getJson, postJson } from "./lib/api";
 import { useStreamingPlan } from "./hooks/useStreamingPlan";
+import { useAsyncJob } from "./hooks/useAsyncJob";
 
 import AuroraCanvas from "./components/AuroraCanvas";
 import QueryForm from "./components/QueryForm";
@@ -18,7 +19,19 @@ import destinationBusiness from "./assets/photos/mumbai-skyline.jpg";
 import destinationStopover from "./assets/photos/delhi-airport.jpg";
 import { IS_PREVIEW_UI } from "./lib/uiMode";
 import { FEATURE_CAPABILITIES } from "./lib/capabilities";
-import type { AskPayload, Flight, TripPlan, MultiCityLeg, LLMMode, LLMOptionsResponse, ServerVersionMeta } from "./lib/types";
+import type {
+  AskPayload,
+  Flight,
+  TripPlan,
+  MultiCityLeg,
+  LLMMode,
+  LLMOptionsResponse,
+  ServerVersionMeta,
+  BookingActionResponse,
+  BookingRecord,
+  PriceAlert,
+  PriceTrackingStatus,
+} from "./lib/types";
 import { formatFlightSummaryLine, formatPriceINR, formatTemperatureC } from "./lib/format";
 
 type ThemePreference = "system" | "dark" | "light";
@@ -177,6 +190,14 @@ export default function App() {
   const [devDrawerOpen, setDevDrawerOpen] = useState(false);
   const [devLlmMode, setDevLlmMode] = useState<LLMMode>("ollama_first");
   const [devCloudProvider, setDevCloudProvider] = useState<string>("gemini");
+  const [asyncMode, setAsyncMode] = useState(false);
+  const [bookingItems, setBookingItems] = useState<BookingRecord[]>([]);
+  const [bookingActionMessage, setBookingActionMessage] = useState<string | null>(null);
+  const [bookingActionError, setBookingActionError] = useState<string | null>(null);
+  const [priceAlerts, setPriceAlerts] = useState<PriceAlert[]>([]);
+  const [priceAlertError, setPriceAlertError] = useState<string | null>(null);
+  const [priceTrackingStatus, setPriceTrackingStatus] = useState<PriceTrackingStatus | null>(null);
+  const [isBookingActionBusy, setIsBookingActionBusy] = useState(false);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readThemePreference());
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() => {
     if (typeof window === "undefined") return "dark";
@@ -198,7 +219,7 @@ export default function App() {
 
   const {
     tokens,
-    finalJson,
+    finalJson: streamFinalJson,
     partialFlights,
     partialBestFlight,
     partialWeather,
@@ -209,13 +230,23 @@ export default function App() {
     responseMeta,
     rawStream,
     start,
-    cancel
+    cancel,
+    reset
   } = useStreamingPlan();
+  const asyncJob = useAsyncJob();
   const isDevMode = (() => {
     if (typeof window === "undefined") return false;
     const params = new URLSearchParams(window.location.search);
     return params.get("dev") === "true" || params.get("devmode") === "true";
   })();
+  const asyncJobActive = ["queued", "running"].includes(String(asyncJob.status));
+  const asyncJobResult = asyncJob.job?.result ?? null;
+  const finalJson = asyncJobResult || streamFinalJson;
+  const asyncJobError =
+    asyncJob.status === "error"
+      ? (asyncJob.job?.error || asyncJob.error || "Async job failed.")
+      : null;
+  const activeError = asyncJobError || error;
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -385,6 +416,15 @@ export default function App() {
   function handleSubmit(payload: AskPayload) {
     setLastPayload(payload);
     autoScrolledRef.current = false;
+    setBookingActionMessage(null);
+    setBookingActionError(null);
+    if (asyncMode) {
+      reset();
+      asyncJob.clearJob();
+      asyncJob.startJob(payload);
+      return;
+    }
+    asyncJob.clearJob();
     start(payload);
   }
 
@@ -446,7 +486,175 @@ export default function App() {
       : typeof weatherData?.location_label === "string"
         ? weatherData.location_label
         : undefined;
-  const isBusy = isStreaming || isFallback;
+  const intentRecord = (debugInfo?.intent ?? {}) as Record<string, unknown>;
+  const actionOrigin =
+    toIata(intentRecord.origin_iata) ||
+    toIata(routeLabels.origin_iata) ||
+    toIata(lastPayload?.origin);
+  const actionDestination =
+    toIata(intentRecord.destination_iata) ||
+    toIata(routeLabels.destination_iata) ||
+    toIata(lastPayload?.destination);
+  const actionDepartDate =
+    typeof finalRecord?.search_date === "string"
+      ? finalRecord.search_date
+      : typeof intentRecord.date === "string"
+        ? intentRecord.date
+        : lastPayload?.date || "";
+  const actionReturnDate =
+    typeof intentRecord.return_date === "string" ? intentRecord.return_date : undefined;
+  const isBusy = isStreaming || isFallback || asyncJobActive;
+  const canAction = Boolean(actionOrigin && actionDestination && actionDepartDate);
+  const actionDisabled = isBookingActionBusy || isBusy;
+
+  const upsertBooking = (booking: BookingRecord) => {
+    setBookingItems((prev) => {
+      const next = prev.filter((item) => item.id !== booking.id);
+      return [booking, ...next].slice(0, 20);
+    });
+  };
+
+  const describeBooking = (booking: BookingRecord) => {
+    const flightRecord =
+      booking.flight && typeof booking.flight === "object" ? (booking.flight as Record<string, unknown>) : {};
+    const airline = toText(flightRecord.airline);
+    const flightNo = toText(flightRecord.flight_no);
+    const origin = toIata(flightRecord.origin);
+    const destination = toIata(flightRecord.destination);
+    const departTime = toText(flightRecord.departure_time);
+    const arrivalTime = toText(flightRecord.arrival_time);
+    const dateText = toText(flightRecord.date);
+    const priceValue = flightRecord.price_inr;
+    const priceText = typeof priceValue === "number" ? formatPriceINR(priceValue) : "";
+    const title = [airline, flightNo].filter(Boolean).join(" ").trim() || `Booking #${booking.id}`;
+    const routeText = origin && destination ? `${origin} → ${destination}` : "Route unavailable";
+    const summaryPieces = [routeText, dateText].filter(Boolean).join(" · ");
+    const timeWindow = departTime && arrivalTime ? `${departTime} → ${arrivalTime}` : "";
+    return {
+      title,
+      summary: [summaryPieces, timeWindow].filter(Boolean).join(" · "),
+      priceText,
+    };
+  };
+
+  const buildBookingActionPayload = (flight: Flight) => {
+    if (!actionOrigin || !actionDestination || !actionDepartDate) {
+      return null;
+    }
+    const enrichedFlight = {
+      ...flight,
+      origin: actionOrigin,
+      destination: actionDestination,
+      date: actionDepartDate,
+    };
+    return {
+      flight: enrichedFlight,
+      origin: actionOrigin,
+      destination: actionDestination,
+      depart_date: actionDepartDate,
+      return_date: actionReturnDate,
+    };
+  };
+
+  const refreshBookings = async () => {
+    try {
+      const data = await getJson<{ items: BookingRecord[] }>(`/bookings?limit=50`);
+      setBookingItems(data.items || []);
+    } catch (err: unknown) {
+      setBookingActionError(err instanceof Error ? err.message : "Failed to refresh bookings");
+    }
+  };
+
+  const handleHoldFlight = async (flight: Flight) => {
+    const payload = buildBookingActionPayload(flight);
+    if (!payload) {
+      setBookingActionError("Missing route/date for booking action.");
+      return;
+    }
+    setIsBookingActionBusy(true);
+    setBookingActionError(null);
+    setBookingActionMessage(null);
+    try {
+      const data = await postJson<BookingActionResponse>("/booking/hold", payload);
+      if (data?.booking) upsertBooking(data.booking);
+      setBookingActionMessage(data?.message || "Flight held successfully.");
+    } catch (err: unknown) {
+      setBookingActionError(err instanceof Error ? err.message : "Hold request failed");
+    } finally {
+      setIsBookingActionBusy(false);
+    }
+  };
+
+  const handleTrackFlight = async (flight: Flight) => {
+    const payload = buildBookingActionPayload(flight);
+    if (!payload) {
+      setBookingActionError("Missing route/date for tracking.");
+      return;
+    }
+    setIsBookingActionBusy(true);
+    setBookingActionError(null);
+    setBookingActionMessage(null);
+    try {
+      const data = await postJson<BookingActionResponse>("/booking/track-price", payload);
+      if (data?.booking) upsertBooking(data.booking);
+      setBookingActionMessage(data?.message || "Price tracking activated.");
+    } catch (err: unknown) {
+      setBookingActionError(err instanceof Error ? err.message : "Track-price request failed");
+    } finally {
+      setIsBookingActionBusy(false);
+    }
+  };
+
+  const handleCancelBooking = async (bookingId: number) => {
+    setIsBookingActionBusy(true);
+    setBookingActionError(null);
+    setBookingActionMessage(null);
+    try {
+      const data = await postJson<BookingActionResponse>("/booking/cancel", { booking_id: bookingId });
+      setBookingActionMessage(data?.message || "Booking cancelled.");
+      setBookingItems((prev) =>
+        prev.map((item) => (item.id === bookingId ? { ...item, status: data.success ? "CANCELLED" : item.status } : item))
+      );
+    } catch (err: unknown) {
+      setBookingActionError(err instanceof Error ? err.message : "Cancel request failed");
+    } finally {
+      setIsBookingActionBusy(false);
+    }
+  };
+
+  const refreshAlerts = async () => {
+    try {
+      const data = await getJson<{ items: PriceAlert[] }>("/price-tracking/alerts");
+      setPriceAlerts(data.items || []);
+      setPriceAlertError(null);
+    } catch (err: unknown) {
+      setPriceAlertError(err instanceof Error ? err.message : "Failed to load alerts");
+    }
+  };
+
+  const acknowledgeAlert = async (alertId: number) => {
+    try {
+      await postJson<{ acknowledged: boolean }>(`/price-tracking/alerts/${alertId}/ack`, {});
+      setPriceAlerts((prev) => prev.filter((item) => item.alert_id !== alertId));
+    } catch (err: unknown) {
+      setPriceAlertError(err instanceof Error ? err.message : "Failed to acknowledge alert");
+    }
+  };
+
+  useEffect(() => {
+    getJson<PriceTrackingStatus>("/price-tracking/status")
+      .then((data) => setPriceTrackingStatus(data))
+      .catch(() => setPriceTrackingStatus(null));
+  }, []);
+  useEffect(() => {
+    refreshBookings();
+  }, []);
+
+  useEffect(() => {
+    if (priceTrackingStatus?.enabled) {
+      refreshAlerts();
+    }
+  }, [priceTrackingStatus?.enabled]);
   const streamPaneTokens = isMultiCity && multiCityNarrative.trim().length > 0 ? "" : tokens;
   const hasTokenContent = streamPaneTokens.length > 0;
   const hasReasoningContent =
@@ -474,6 +682,13 @@ export default function App() {
   const showServiceStatus = serverStatus !== "online";
   const heroBadgeText = IS_PREVIEW_UI ? "AI-guided trip planning" : "Travel intelligence engine";
   const streamHeading = !isBusy && (hasTokenContent || finalMessage.trim().length > 0) ? "Trip brief" : "AI thinking";
+  const asyncStatusLabel = asyncJobActive
+    ? `Async job ${String(asyncJob.status || "running")}: process-local queue`
+    : undefined;
+  const asyncJobNotice =
+    asyncJob.job && !asyncJobActive
+      ? `Async job ${String(asyncJob.status || "done")} ${asyncJob.status === "done" ? "completed" : "stopped"}.`
+      : null;
   const highlightWeatherText = weatherData
     ? [typeof weatherData.condition === "string" ? weatherData.condition : "", formatTemperatureC(weatherData.temperature_c)]
         .filter(Boolean)
@@ -507,8 +722,8 @@ export default function App() {
     .join(" ");
   const hasLiveUpdate = tokens.length > 0 || hasFlights || Boolean(weatherData) || reasoningSteps.length > 0;
   const partialOutcomeError =
-    typeof error === "string" &&
-    error.toLowerCase().includes("available flight/weather results are shown");
+    typeof activeError === "string" &&
+    activeError.toLowerCase().includes("available flight/weather results are shown");
   const resultStatus = finalJson?.result_status || responseMeta?.result_status;
   const isDegradedResult = resultStatus === "degraded";
   const noFlightsFailure =
@@ -522,6 +737,17 @@ export default function App() {
   const bestFlightHasHandoff = Boolean(
     typeof bestFlight?.handoff_url === "string" && bestFlight.handoff_url.trim().length > 0
   );
+  const bestFlightHandoffQuality = String(
+    bestFlight?.booking_handoff?.booking_exit_quality || ""
+  ).toLowerCase();
+  const bestFlightHandoffLabel =
+    bestFlightHandoffQuality === "booking_ready"
+      ? "Booking-ready provider handoff"
+      : bestFlightHandoffQuality === "deferred"
+        ? "Booking deferred"
+        : bestFlightHasHandoff
+          ? "Provider handoff available"
+          : "Booking unavailable from current artifacts";
   const bestFlightStopSummary = bestFlight
     ? Number(bestFlight.stops) === 0
       ? "Non-stop route"
@@ -548,7 +774,17 @@ export default function App() {
           : isBusy
             ? "Analyzing"
             : "Awaiting query";
-  const showProofSurface = Boolean(lastPayload || isBusy || hasFlights || finalJson || error);
+  const showProofSurface = Boolean(lastPayload || isBusy || hasFlights || finalJson || activeError);
+  const showBookingPanel =
+    bookingItems.length > 0 || Boolean(bookingActionMessage) || Boolean(bookingActionError) || isBookingActionBusy;
+  const showAlertsPanel =
+    priceAlerts.length > 0 || Boolean(priceAlertError) || Boolean(priceTrackingStatus);
+  const trackingMeta = (priceTrackingStatus?.status ?? {}) as Record<string, unknown>;
+  const trackingLastCompleted =
+    typeof trackingMeta.last_completed_at === "string" ? trackingMeta.last_completed_at : "";
+  const trackingLastError = typeof trackingMeta.last_error === "string" ? trackingMeta.last_error : "";
+  const trackingLastAlerts =
+    typeof trackingMeta.last_alert_count === "number" ? trackingMeta.last_alert_count : null;
   const routeRevealSteps = [
     {
       id: "intent",
@@ -618,10 +854,10 @@ export default function App() {
         : "Light";
 
   useEffect(() => {
-    if (!isBusy && !error && finalJson) {
+    if (!isBusy && !activeError && finalJson) {
       setResultVersion((v) => v + 1);
     }
-  }, [finalJson, isBusy, error]);
+  }, [finalJson, isBusy, activeError]);
 
   useEffect(() => {
     if (!isBusy || !hasLiveUpdate || autoScrolledRef.current) return;
@@ -707,6 +943,8 @@ export default function App() {
                     disabled={isBusy}
                     resultVersion={resultVersion}
                     onRecentQueriesChange={setRecentQueries}
+                    asyncMode={asyncMode}
+                    onAsyncModeChange={setAsyncMode}
                     devRoutingOverrides={
                       isDevMode
                         ? {
@@ -717,14 +955,14 @@ export default function App() {
                     }
                   />
 
-                  {error && (
-                    <div className="notice notice--error notice--inline">
+                  {activeError && (
+                    <div className="notice notice--error notice--inline" data-testid="notice-error">
                       <span className="min-w-0 break-words">
                         {partialOutcomeError
-                          ? error
+                          ? activeError
                           : noFlightsFailure
-                            ? error
-                            : `We couldn't finish your plan. ${error}`}
+                            ? activeError
+                            : `We couldn't finish your plan. ${activeError}`}
                       </span>
                       {lastPayload && (
                         <button
@@ -736,15 +974,15 @@ export default function App() {
                       )}
                     </div>
                   )}
-                  {!error && isDegradedResult && (
-                    <div className="notice notice--inline">
+                  {!activeError && isDegradedResult && (
+                    <div className="notice notice--inline" data-testid="notice-inline">
                       <span className="min-w-0 break-words">
                         Partial result: {degradedSummary}
                       </span>
                     </div>
                   )}
-                  {hasConstraintWarnings && !error && (
-                    <div className="notice notice--inline">
+                  {hasConstraintWarnings && !activeError && (
+                    <div className="notice notice--inline" data-testid="notice-inline">
                       <span className="min-w-0 break-words">
                         Constraint adjustments: {[...resultWarnings, ...returnTripWarnings].join(" ")}
                       </span>
@@ -805,10 +1043,25 @@ export default function App() {
                     fallbackBestFlight={bestFlight}
                     fallbackWeather={weatherData}
                     isStreaming={isBusy}
-                    canCancel={isStreaming}
-                    onCancel={cancel}
+                    canCancel={isStreaming || asyncJobActive}
+                    statusText={asyncStatusLabel}
+                    onCancel={asyncJobActive ? asyncJob.cancelJob : cancel}
                   />
                 </article>
+                {asyncJobNotice && (
+                  <div className={`notice notice--inline ${asyncJob.status === "error" ? "notice--error" : ""}`}>
+                    <span className="min-w-0 break-words">
+                      {asyncJobNotice}{" "}
+                      {asyncJob.status === "done"
+                        ? "Results are now ready below."
+                        : asyncJob.status === "cancelled"
+                          ? "You can submit a new query at any time."
+                          : asyncJob.status === "error"
+                            ? "Please retry the request."
+                            : ""}
+                    </span>
+                  </div>
+                )}
 
                 {hasFlights && (
                   <a className="results-nudge" href="#results">
@@ -1001,7 +1254,7 @@ export default function App() {
             </div>
             {showProofSurface ? (
               <>
-                <div className="proof-overview-grid reveal">
+                <div className="proof-overview-grid reveal" data-testid="proof-overview">
                   <article className="r-card proof-card proof-card--best">
                     <div className="proof-card__head">
                       <p className="proof-card__kicker">Top recommendation</p>
@@ -1018,7 +1271,7 @@ export default function App() {
                           {bestFlight.departure_time} → {bestFlight.arrival_time} · {bestFlight.duration_min} min · {bestFlightStopSummary}
                         </p>
                         <div className="proof-chip-row">
-                          <span className="proof-chip">{bestFlightHasHandoff ? "Provider handoff ready" : "Handoff depends on provider availability"}</span>
+                          <span className="proof-chip">{bestFlightHandoffLabel}</span>
                           <span className="proof-chip">Weather: {weatherProofSummary}</span>
                         </div>
                       </>
@@ -1033,7 +1286,7 @@ export default function App() {
 
                   <article className="r-card proof-card proof-card--evidence">
                     <p className="proof-card__kicker">Evidence stack</p>
-                    <ul className="proof-evidence-list">
+                    <ul className="proof-evidence-list" data-testid="proof-evidence">
                       <li className="proof-evidence-item">
                         <span className="proof-evidence-item__label">Ranked shortlist</span>
                         <span className="proof-evidence-item__value">
@@ -1050,16 +1303,16 @@ export default function App() {
                       </li>
                       <li className="proof-evidence-item">
                         <span className="proof-evidence-item__label">Booking confidence</span>
-                        <span className="proof-evidence-item__value">
-                          {bestFlightHasHandoff ? "Secure handoff link available on recommended option" : "Link appears only when provider handoff is available"}
-                        </span>
+                          <span className="proof-evidence-item__value">
+                          {bestFlightHandoffLabel}
+                          </span>
                       </li>
                     </ul>
                   </article>
                 </div>
-                <div className="result-wrap reveal">
+                <div className="result-wrap reveal" data-testid="result-wrap">
                   {isMultiCity && multiCityLegs.length > 0 && (
-                    <article className="r-card results-card">
+                    <article className="r-card results-card" data-testid="multicity-itinerary">
                       <div className="r-label r-label--secondary">
                         <span className="r-dot" aria-hidden="true" />
                         Multi-city itinerary
@@ -1067,15 +1320,22 @@ export default function App() {
                       <MultiCitySummary legs={multiCityLegs} />
                     </article>
                   )}
-                  <article className={flightsCardClass}>
+                  <article className={flightsCardClass} data-testid="ranked-shortlist">
                     <div className="r-label r-label--secondary">
                       <span className="r-dot" aria-hidden="true" />
                       Ranked shortlist
                     </div>
-                    <FlightsList flights={flights} bestFlight={bestFlight} isLoading={isBusy && !hasFlights} />
+                    <FlightsList
+                      flights={flights}
+                      bestFlight={bestFlight}
+                      isLoading={isBusy && !hasFlights}
+                      onHold={canAction ? handleHoldFlight : undefined}
+                      onTrack={canAction ? handleTrackFlight : undefined}
+                      actionDisabled={actionDisabled}
+                    />
                   </article>
                   {returnTripFlight && (
-                    <article className="r-card results-card">
+                    <article className="r-card results-card" data-testid="return-leg">
                       <div className="r-label r-label--secondary">
                         <span className="r-dot" aria-hidden="true" />
                         Return leg snapshot
@@ -1096,6 +1356,183 @@ export default function App() {
                         </p>
                       )}
                     </article>
+                  )}
+                  {(showBookingPanel || showAlertsPanel) && (
+                    <div className="booking-grid">
+                      <article className="r-card results-card booking-card" data-testid="booking-panel">
+                        <div className="booking-card__head">
+                          <div className="r-label r-label--secondary">
+                            <span className="r-dot" aria-hidden="true" />
+                            Booking actions
+                          </div>
+                          <button
+                            type="button"
+                            className="booking-card__refresh"
+                            onClick={refreshBookings}
+                            disabled={isBookingActionBusy}
+                            data-testid="booking-refresh"
+                          >
+                            Refresh
+                          </button>
+                        </div>
+                        <p className="booking-card__hint">
+                          Hold or track a flight from the shortlist to create a local follow-up record. Complete checkout on provider sites via handoff links.
+                        </p>
+                        {bookingActionMessage && (
+                          <div className="notice notice--inline" data-testid="notice-inline">
+                            <span className="min-w-0 break-words">{bookingActionMessage}</span>
+                          </div>
+                        )}
+                        {bookingActionError && (
+                          <div className="notice notice--error notice--inline" data-testid="notice-error">
+                            <span className="min-w-0 break-words">{bookingActionError}</span>
+                          </div>
+                        )}
+                        {bookingItems.length > 0 ? (
+                          <div className="booking-list">
+                            {bookingItems.map((booking) => {
+                              const details = describeBooking(booking);
+                              const status = String(booking.status || "UNKNOWN").toUpperCase();
+                              const statusLabel = status === "CONFIRMED" ? "LEGACY_CONFIRMED" : status;
+                              const canCancel = status === "HELD" || status === "CONFIRMED";
+                              const checkoutStatus = String(booking.checkout_status || "").toLowerCase();
+                              const checkoutUnavailable = !booking.handoff_url && checkoutStatus && checkoutStatus !== "booking_ready";
+                              return (
+                                <div key={booking.id} className="booking-item">
+                                  <div className="booking-item__main">
+                                    <div className="booking-item__title-row">
+                                      <p className="booking-item__title">{details.title}</p>
+                                      <span className={`booking-status booking-status--${statusLabel.toLowerCase()}`}>
+                                        {statusLabel}
+                                      </span>
+                                    </div>
+                                    <p className="booking-item__summary">
+                                      {details.summary || "Flight details stored for this booking."}
+                                    </p>
+                                    {details.priceText && (
+                                      <p className="booking-item__price">{details.priceText}</p>
+                                    )}
+                                    {checkoutUnavailable && (
+                                      <p className="booking-item__summary" data-testid="checkout-unavailable-note">
+                                        Provider checkout link is currently unavailable for this held record.
+                                      </p>
+                                    )}
+                                  </div>
+                                  <div className="booking-item__actions">
+                                    {booking.handoff_url && (
+                                      <a
+                                        href={booking.handoff_url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="booking-action booking-action--primary"
+                                      >
+                                        Open booking
+                                      </a>
+                                    )}
+                                    {canCancel && (
+                                      <button
+                                        type="button"
+                                        className="booking-action booking-action--ghost"
+                                        onClick={() => handleCancelBooking(booking.id)}
+                                        disabled={actionDisabled}
+                                        data-testid="booking-cancel"
+                                      >
+                                        Cancel
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="empty-state empty-state--compact">
+                            <p className="empty-state__title">No held bookings yet.</p>
+                            <p className="empty-state__hint">Use Hold or Track on a flight card to start one.</p>
+                          </div>
+                        )}
+                      </article>
+                      <article className="r-card results-card booking-card" data-testid="tracking-panel">
+                        <div className="booking-card__head">
+                          <div className="r-label r-label--secondary">
+                            <span className="r-dot" aria-hidden="true" />
+                            Price tracking
+                          </div>
+                          <button
+                            type="button"
+                            className="booking-card__refresh"
+                            onClick={refreshAlerts}
+                            disabled={!priceTrackingStatus?.enabled}
+                            data-testid="alerts-refresh"
+                          >
+                            Refresh
+                          </button>
+                        </div>
+                        <p className="booking-card__hint">
+                          {priceTrackingStatus?.enabled
+                            ? "Tracking runs on the server. Alerts appear here when prices drop."
+                            : "Price tracking is disabled in this environment."}
+                        </p>
+                        {trackingLastCompleted && (
+                          <p className="booking-card__meta">
+                            Last check: {trackingLastCompleted}
+                            {trackingLastAlerts !== null ? ` · Alerts fired: ${trackingLastAlerts}` : ""}
+                          </p>
+                        )}
+                        {trackingLastError && (
+                          <div className="notice notice--error notice--inline" data-testid="notice-error">
+                            <span className="min-w-0 break-words">Tracker error: {trackingLastError}</span>
+                          </div>
+                        )}
+                        {priceAlertError && (
+                          <div className="notice notice--error notice--inline" data-testid="notice-error">
+                            <span className="min-w-0 break-words">{priceAlertError}</span>
+                          </div>
+                        )}
+                        {priceAlerts.length > 0 ? (
+                          <div className="alert-list">
+                            {priceAlerts.map((alert) => (
+                              <div key={alert.alert_id} className="alert-item">
+                                <div className="alert-item__main">
+                                  <p className="alert-item__title">
+                                    {alert.origin} → {alert.destination} · {alert.travel_date}
+                                  </p>
+                                  <p className="alert-item__summary">
+                                    Drop {alert.drop_pct}% · {formatPriceINR(alert.held_price_inr)} →{" "}
+                                    {formatPriceINR(alert.new_price_inr)}
+                                  </p>
+                                </div>
+                                <div className="alert-item__actions">
+                                  {alert.new_handoff_url && (
+                                    <a
+                                      href={alert.new_handoff_url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="booking-action booking-action--primary"
+                                    >
+                                      View deal
+                                    </a>
+                                  )}
+                                  <button
+                                    type="button"
+                                    className="booking-action booking-action--ghost"
+                                    onClick={() => acknowledgeAlert(alert.alert_id)}
+                                    data-testid="alert-ack"
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="empty-state empty-state--compact">
+                            <p className="empty-state__title">No active price alerts.</p>
+                            <p className="empty-state__hint">Track a flight to start monitoring price drops.</p>
+                          </div>
+                        )}
+                      </article>
+                    </div>
                   )}
                 </div>
               </>

@@ -5,7 +5,10 @@
 - Frontend local runtime (Vite): edit `frontend/.env` (start from `frontend/.env.example`).
 - Docker validation/runtime variant in this repo: `.env.laptopdocker` (only for that deployment path).
 - One-off validator generated environment: `.env.tmp` (created by `full_validation.py`; do not treat as canonical).
-- For operator-facing endpoint/startup/topology command examples, see `docs/operator-sheet.md` and `docs/demo-sheet.md`.
+- For operator-facing endpoint/startup/topology command examples, see `docs/operator-sheet.md`.
+- Canonical production deployment and env/secrets contracts:
+  - `docs/deployment-topology.md`
+  - `docs/environment-secrets-contract.md`
 
 ## 1. Purpose
 This project has multiple configuration surfaces:
@@ -17,6 +20,9 @@ This project has multiple configuration surfaces:
 - Docker/runtime overrides: container `ENV` and env-file injection can override root `.env`.
 
 This file defines the canonical configuration contract for current runtime behavior and marks legacy/dead flags explicitly.
+For production topology and secret-handling ownership, use:
+- `docs/deployment-topology.md`
+- `docs/environment-secrets-contract.md`
 
 ## 2. Canonical Runtime Variables
 
@@ -91,6 +97,16 @@ This file defines the canonical configuration contract for current runtime behav
 - Used in: `api/app.py`, `core/health.py`.
 - Required: recommended when admin endpoints are exposed.
 
+`ALLOWED_ORIGINS`
+- Purpose: browser CORS allowlist for trusted frontend origins.
+- Format: comma-separated `scheme://host[:port]` origins.
+- Runtime hardening:
+  - wildcard `*` is not accepted;
+  - invalid origin entries are ignored;
+  - if env is set but no valid origins parse, cross-origin browser access is denied.
+- Used in: `api/app.py` CORS middleware config.
+- Required: yes for production (explicit trusted origins).
+
 `LOG_LEVEL`
 - Purpose: runtime logging level.
 - Allowed: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
@@ -98,7 +114,7 @@ This file defines the canonical configuration contract for current runtime behav
 - Used in: `core/logging_config.py`.
 - Required: optional.
 
-### Key manager / refresh / locking
+### Key manager / refresh (canonical)
 
 `KEY_ENV_MONITOR_TICK`
 - Purpose: key-refresh loop interval (seconds) started by app lifespan.
@@ -106,36 +122,41 @@ This file defines the canonical configuration contract for current runtime behav
 - Used in: `api/app.py`.
 - Required: optional.
 
+### Key manager / runtime lock tuning (non-canonical)
+
+These toggles are intentionally omitted from `.env.example` and canonical deployment docs.
+Use only for diagnostics/manual tuning.
+
 `KEY_MANAGER_LOCK_BACKEND`
 - Purpose: refresh lock backend selection.
 - Allowed: `file`, `redis`.
 - Default: `file`.
 - Used in: `api/app.py`.
-- Required: optional.
-
-`KEY_MANAGER_REDIS_URL`
-- Purpose: Redis connection for distributed lock when backend is `redis`.
-- Default: `redis://localhost:6379/0`.
-- Used in: `api/app.py`.
-- Required: optional (redis backend only).
-
-`KEY_MANAGER_LOCK_NAME`
-- Purpose: Redis lock key name.
-- Default: `llm:key_refresh_lock`.
-- Used in: `api/app.py`.
-- Required: optional.
-
-`KEY_MANAGER_LOCK_TTL_SECONDS`
-- Purpose: Redis lock TTL.
-- Default: `60`.
-- Used in: `api/app.py`.
-- Required: optional.
+- Classification: non-canonical runtime tuning.
 
 `KEY_MANAGER_LOCK_PATH`
 - Purpose: file lock path when lock backend is `file`.
 - Default: `/tmp/llm_key_refresh.lock`.
 - Used in: `api/app.py`.
-- Required: optional.
+- Classification: non-canonical runtime tuning.
+
+`KEY_MANAGER_LOCK_TTL_SECONDS`
+- Purpose: Redis lock TTL.
+- Default: `60`.
+- Used in: `api/app.py`.
+- Classification: non-canonical runtime tuning.
+
+`KEY_MANAGER_REDIS_URL`
+- Purpose: Redis connection for distributed lock when backend is `redis`.
+- Default: `redis://localhost:6379/0`.
+- Used in: `api/app.py`.
+- Classification: non-canonical runtime tuning (outside canonical topology).
+
+`KEY_MANAGER_LOCK_NAME`
+- Purpose: Redis lock key name.
+- Default: `llm:key_refresh_lock`.
+- Used in: `api/app.py`.
+- Classification: non-canonical runtime tuning (outside canonical topology).
 
 ### Numbered key families (canonical modern key surface)
 
@@ -154,6 +175,8 @@ This file defines the canonical configuration contract for current runtime behav
 - Purpose: SerpAPI key pool for flight tool.
 - Used in: `core/api_key_manager.py`.
 - Required: required for live flight search.
+- Booking scope note: booking handoff is SerpApi-first only; paid provider API variables
+  such as Duffel/Amadeus are intentionally not part of the supported config surface.
 
 `WEATHER_KEY_n`
 - Purpose: OpenWeather key pool for weather tool.
@@ -200,8 +223,8 @@ Note:
 - Backend variables like `LLM_MODE`, `USE_CLOUD_LLM`, or key vars should never be placed in frontend env files.
 
 ## 5. Docker and Runtime Overrides
-- Primary container startup path is `Dockerfile` `CMD` (gunicorn), not `app/entrypoint.sh`.
-- `app/entrypoint.sh` is retained for compatibility but is not authoritative in the default Docker path.
+- Canonical production process model is **single-node, reverse-proxy + one uvicorn process** (see `docs/deployment-topology.md`).
+- `Dockerfile` runtime path is now aligned to single-process `uvicorn` (`--workers 1`).
 - Runtime env precedence follows normal process environment rules: container-injected vars override values loaded from `.env`.
 - Validation flow (`full_validation.py`) may generate `.env.tmp` to run scenario-specific checks; this is test harness behavior, not production config ownership.
 - Validation flow sets `TESTING_USE_PERSISTENT_DB=1` in `.env.tmp` so cross-process booking bridge checks use a shared persistent store.
@@ -228,6 +251,19 @@ Runtime timeout variables currently used in active backend/frontend paths:
 `CLOUD_LLM_TIMEOUT`
 - Purpose: router first-chunk/per-chunk timeout budget for cloud backend path.
 - Used in: `agents/llm_router.py` and cloud adapter defaults.
+
+## 5b. Non-Canonical Runtime Safety Toggles
+
+These variables are intentionally omitted from `.env.example` and canonical deployment docs.
+They are used only for diagnostics or unsafe/lab override scenarios.
+
+`ASYNC_JOB_REQUIRE_SINGLE_WORKER`
+- Current behavior: defaults to `true`; enforces async-job single-worker topology guard in `api/app.py`.
+- Classification: non-canonical runtime safety toggle.
+
+`ALLOW_UNSAFE_ASYNC_JOBS`
+- Current behavior: defaults to `false`; when set, bypasses async-job topology safety guard.
+- Classification: non-canonical unsafe override (diagnostic/lab only).
 
 ## 6. Deprecated / Legacy Variables
 
@@ -256,10 +292,9 @@ Runtime timeout variables currently used in active backend/frontend paths:
 - Status: temporarily supported for legacy compatibility.
 
 `LLM_PREWARM`
-- Current behavior: checked only in `app/entrypoint.sh`.
-- Caveat: main Docker startup path uses `Dockerfile` `CMD` directly (gunicorn), so `LLM_PREWARM` is stale in that path.
+- Current behavior: no active startup read site in canonical runtime path.
 - Replacement: `PLANNER_PREWARM` (used in `api/app.py` lifespan).
-- Status: stale/deprecated in primary Docker runtime path.
+- Status: stale/deprecated and ignored by current startup path.
 
 ## 7. Removed / Dead Variables
 These variables are not part of the active canonical surface:
@@ -274,7 +309,7 @@ These variables are not part of the active canonical surface:
 
 `HOST` (Dockerfile ENV)
 - Removed from Dockerfile.
-- Gunicorn bind remains hardcoded to `0.0.0.0:${PORT}`.
+- Runtime bind remains `0.0.0.0:${PORT}` via Uvicorn command arguments.
 
 ## 8. Minimal Setup Examples
 
@@ -358,9 +393,9 @@ From `LLM_PRIORITY` to `LLM_MODE`
 - Replace legacy hybrid-priority combinations with explicit canonical mode.
 - Example: `LLM_MODE=ollama_first` instead of `LLM_MODE=hybrid` + `LLM_PRIORITY=local-first`.
 
-From entrypoint prewarm assumption to active startup path
+From legacy `LLM_PREWARM` assumption to active startup path
 - Primary startup path uses `api/app.py` lifespan and `PLANNER_PREWARM`.
-- `LLM_PREWARM` in `app/entrypoint.sh` does not affect the default Docker `CMD` path.
+- `LLM_PREWARM` has no effect in the supported runtime path.
 
 ## 11. Validation/Test-Only Variables
 Do not treat these as production runtime config:

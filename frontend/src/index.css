@@ -1147,6 +1147,19 @@ button {
   gap: 10px;
 }
 
+.async-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.form-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
 .recent-strip {
   position: relative;
   display: flex;
@@ -2575,6 +2588,14 @@ html[data-theme="light"] .proof-placeholder {
   flex-wrap: wrap;
 }
 
+.flight-card__actions-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
 .flight-card__link,
 .flight-card__copy {
   border: 1px solid var(--border);
@@ -2595,6 +2616,17 @@ html[data-theme="light"] .proof-placeholder {
   color: #fff;
   font-weight: 600;
   box-shadow: 0 8px 20px -14px rgba(139, 100, 255, 0.9);
+}
+
+.flight-card__link--secondary {
+  background: rgba(79, 163, 255, 0.12);
+  border-color: rgba(79, 163, 255, 0.4);
+  color: var(--text-1);
+}
+
+.flight-card__link--secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .flight-card__copy {
@@ -2618,6 +2650,159 @@ html[data-theme="light"] .proof-placeholder {
   border-color: rgba(139, 100, 255, 0.35);
   color: var(--text-1);
   background: rgba(139, 100, 255, 0.1);
+}
+
+.booking-grid {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.booking-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.booking-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.booking-card__hint {
+  font-size: var(--fs-label);
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.booking-card__meta {
+  font-size: var(--fs-label);
+  color: var(--text-3);
+}
+
+.booking-card__refresh {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text-2);
+  font-size: var(--fs-label);
+  padding: 4px 10px;
+}
+
+.booking-list,
+.alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.booking-item,
+.alert-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.booking-item__main,
+.alert-item__main {
+  min-width: 0;
+}
+
+.booking-item__title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.booking-item__title,
+.alert-item__title {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.booking-item__summary,
+.alert-item__summary {
+  font-size: var(--fs-label);
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.booking-item__price {
+  font-size: var(--fs-meta);
+  color: var(--text-1);
+  margin-top: 2px;
+}
+
+.booking-item__actions,
+.alert-item__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+}
+
+.booking-status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-radius: 999px;
+  padding: 2px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  color: rgba(226, 232, 240, 0.9);
+  background: rgba(148, 163, 184, 0.1);
+}
+
+.booking-status--held {
+  border-color: rgba(94, 234, 212, 0.5);
+  color: #d1fae5;
+  background: rgba(94, 234, 212, 0.12);
+}
+
+.booking-status--cancelled,
+.booking-status--expired {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #fee2e2;
+  background: rgba(248, 113, 113, 0.1);
+}
+
+.booking-action {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-2);
+  font-size: var(--fs-label);
+  padding: 4px 10px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.booking-action--primary {
+  background: linear-gradient(135deg, #4fa3ff, #3f7fe8);
+  border-color: rgba(79, 163, 255, 0.8);
+  color: #fff;
+}
+
+.booking-action--ghost {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: rgba(148, 163, 184, 0.35);
+  color: var(--text-2);
+}
+
+.booking-action:disabled,
+.booking-card__refresh:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .flight-card__link--primary:hover {
@@ -2765,6 +2950,10 @@ html[data-theme="light"] .proof-placeholder {
 }
 
 .empty-state--flights-compact {
+  padding: 10px 12px;
+}
+
+.empty-state--compact {
   padding: 10px 12px;
 }
 
