@@ -96,6 +96,20 @@ default_weather_tool = get_forecast_for_date   # Use forecast-for-date as the de
 # Metrics instrumentation
 import core.metrics as metrics
 
+# RAG retriever — lazy singleton
+_rag_retriever = None
+def _get_rag_retriever():
+    global _rag_retriever
+    if _rag_retriever is None:
+        try:
+            from rag.retriever import RAGRetriever
+            corpus_dir = get_env_str("RAG_CORPUS_DIR", "rag/corpus")
+            _rag_retriever = RAGRetriever(corpus_dir=corpus_dir)
+        except Exception as e:
+            logger.warning(f"RAG retriever init failed: {e}")
+            _rag_retriever = None
+    return _rag_retriever
+
 load_dotenv()
 
 # ----------------------------------------------------------------------
@@ -2765,9 +2779,26 @@ Please recommend the best flight, explain why it matches their preferences, ment
         flights_block=flights_str,
     )
 
+    # RAG context injection (feature-flagged)
+    rag_context_block = ""
+    if get_env_str("RAG_ENABLED", "true").lower() != "false":
+        try:
+            retriever = _get_rag_retriever()
+            if retriever is not None:
+                rag_results = retriever.retrieve(user_query, top_k=4)
+                if rag_results:
+                    rag_lines = ["Relevant context from knowledge base:"]
+                    for r in rag_results:
+                        rag_lines.append(f"{r['source']}: {r['text']}")
+                        rag_lines.append("---")
+                    rag_context_block = "\n".join(rag_lines) + "\n\n"
+        except Exception as e:
+            logger.debug(f"RAG retrieval failed: {e}")
+
     # Combine facts block and prompt with an instruction to echo the facts
     full_prompt = (
-        facts_block
+        rag_context_block
+        + facts_block
         + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n"
         + prompt
     )

@@ -237,6 +237,12 @@ special_group.add_argument(
     help="Run RAGAS baseline evaluation and write results to eval_results/ragas_baseline.json.",
 )
 special_group.add_argument(
+    "--with-rag",
+    action="store_true",
+    default=False,
+    help="Run RAGAS evaluation with RAG context retrieval (requires --ragas-eval).",
+)
+special_group.add_argument(
     "--hitl-test",
     action="store_true",
     default=False,
@@ -7023,10 +7029,10 @@ def test_hitl_approval_gate(base_url=None):
 # ----------------------------------------------------------------------
 # RAGAS Evaluation
 # ----------------------------------------------------------------------
-def run_ragas_eval(base_url=None):
+def run_ragas_eval(base_url=None, with_rag=False):
     """
     Run RAGAS evaluation on existing test cases.
-    Writes results to eval_results/ragas_baseline.json.
+    Writes results to eval_results/ragas_baseline.json or eval_results/ragas_with_rag.json.
     """
     try:
         from datasets import Dataset
@@ -7035,7 +7041,8 @@ def run_ragas_eval(base_url=None):
         return False
 
     url = base_url or DEFAULT_API_BASE_URL
-    log("\n=== RAGAS Baseline Evaluation ===")
+    label = "with-RAG" if with_rag else "pre-RAG baseline"
+    log(f"\n=== RAGAS Evaluation ({label}) ===")
 
     test_cases = [
         {
@@ -7060,6 +7067,17 @@ def run_ragas_eval(base_url=None):
 
     future_date = (datetime.now().date() + timedelta(days=21)).strftime("%Y-%m-%d")
 
+    # RAG context retrieval (if --with-rag)
+    retriever = None
+    if with_rag:
+        try:
+            from rag.retriever import RAGRetriever
+            retriever = RAGRetriever(corpus_dir="rag/corpus")
+            log("RAG retriever initialized.")
+        except Exception as e:
+            log(f"RAG retriever init failed: {e}; falling back to baseline contexts.")
+            with_rag = False
+
     server_available = False
     try:
         resp = requests.get(f"{url}/health", timeout=5)
@@ -7082,16 +7100,24 @@ def run_ragas_eval(base_url=None):
                 if resp.ok:
                     data = resp.json()
                     tc["answer"] = data.get("llm_response", "") or data.get("message", "") or data.get("error", "")
-                    tc["contexts"] = [json.dumps(data.get("best_flight", {}))]
+                    if with_rag and retriever is not None:
+                        rag_results = retriever.retrieve(tc["question"], top_k=4)
+                        tc["contexts"] = [r["text"] for r in rag_results] if rag_results else ["No relevant context found."]
+                    else:
+                        tc["contexts"] = [json.dumps(data.get("best_flight", {}))]
                 else:
                     tc["answer"] = f"Error: {resp.status_code}"
             except Exception as e:
                 tc["answer"] = f"Exception: {str(e)}"
     else:
-        log("Server not available; using placeholder data for pre-RAG baseline.")
+        log("Server not available; using placeholder data.")
         for i, tc in enumerate(test_cases):
             tc["answer"] = f"Placeholder answer for test case {i+1}. Server was not available during evaluation."
-            tc["contexts"] = [f"Placeholder context for test case {i+1}."]
+            if with_rag and retriever is not None:
+                rag_results = retriever.retrieve(tc["question"], top_k=4)
+                tc["contexts"] = [r["text"] for r in rag_results] if rag_results else ["No relevant context found."]
+            else:
+                tc["contexts"] = [f"Placeholder context for test case {i+1}."]
 
     ragas_dataset = Dataset.from_dict({
         "question": [tc["question"] for tc in test_cases],
@@ -7148,7 +7174,7 @@ def run_ragas_eval(base_url=None):
 
     output = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "label": "pre-RAG baseline",
+        "label": "with-RAG" if with_rag else "pre-RAG baseline",
         "num_test_cases": len(test_cases),
         "overall_scores": scores,
         "per_question": per_question,
@@ -7156,16 +7182,36 @@ def run_ragas_eval(base_url=None):
 
     eval_dir = ROOT / "eval_results"
     eval_dir.mkdir(exist_ok=True)
-    output_path = eval_dir / "ragas_baseline.json"
+    if with_rag:
+        output_path = eval_dir / "ragas_with_rag.json"
+    else:
+        output_path = eval_dir / "ragas_baseline.json"
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2))
     log(f"RAGAS results written to {output_path}")
     log(f"Overall scores: faithfulness={scores.get('faithfulness', 0):.3f}, answer_relevancy={scores.get('answer_relevancy', 0):.3f}, context_relevance={scores.get('context_relevance', 0):.3f}")
+
+    # Print delta vs baseline when --with-rag
+    if with_rag:
+        baseline_path = eval_dir / "ragas_baseline.json"
+        if baseline_path.exists():
+            try:
+                baseline = json.loads(baseline_path.read_text())
+                baseline_scores = baseline.get("overall_scores", {})
+                log("\nRAGAS Delta (with RAG vs baseline):")
+                for metric in ["faithfulness", "answer_relevancy", "context_relevance"]:
+                    base_val = baseline_scores.get(metric, 0.0)
+                    new_val = scores.get(metric, 0.0)
+                    delta = new_val - base_val
+                    log(f"  {metric}: {base_val:.3f} -> {new_val:.3f} (Δ {delta:+.3f})")
+            except Exception as e:
+                log(f"Could not compute delta: {e}")
+
     return True
 
 
 if __name__ == "__main__":
     if args.ragas_eval:
-        ok = run_ragas_eval()
+        ok = run_ragas_eval(with_rag=args.with_rag)
         sys.exit(0 if ok else 1)
 
     if args.hitl_test:
