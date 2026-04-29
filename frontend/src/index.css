@@ -619,6 +619,31 @@ button {
   align-items: start;
 }
 
+.hero--results-mode .hero-grid {
+  grid-template-columns: minmax(0, 1fr) 320px;
+}
+
+.hero--results-mode {
+  min-height: auto;
+  padding-top: 34px;
+  padding-bottom: 34px;
+}
+
+.hero-intro--compact {
+  gap: 8px;
+}
+
+.hero-title--compact {
+  font-size: clamp(30px, 3.7vw, 46px);
+  letter-spacing: -0.8px;
+  margin-bottom: 10px;
+}
+
+.hero-sub--compact {
+  font-size: clamp(14px, 1.5vw, 17px);
+  max-width: 860px;
+}
+
 .hero-scroll-cue {
   align-self: flex-start;
   margin: 12px 0 0;
@@ -742,6 +767,11 @@ button {
   animation: fadeUp 0.7s ease 0.3s both;
   position: relative;
   overflow: hidden;
+}
+
+.search-card--compact {
+  padding: 14px 16px 14px;
+  border-radius: 18px;
 }
 
 .search-card::before,
@@ -1430,6 +1460,27 @@ button {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.experience-section--proof-results-first {
+  display: flex;
+  flex-direction: column;
+}
+
+.experience-section--proof-results-first .result-wrap {
+  order: 1;
+}
+
+.experience-section--proof-results-first .proof-overview-grid {
+  order: 2;
+  margin-top: 16px;
+}
+
+.results-callout {
+  margin: 8px 0 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-2);
 }
 
 .proof-overview-grid {
@@ -2487,6 +2538,12 @@ html[data-theme="light"] .proof-placeholder {
   letter-spacing: 0.03em;
 }
 
+.airline-ico[src] {
+  object-fit: contain;
+  padding: 4px;
+  background: var(--card-bg, #ffffff);
+}
+
 .fl-info {
   flex: 1;
   min-width: 0;
@@ -2645,6 +2702,10 @@ html[data-theme="light"] .proof-placeholder {
   opacity: 0.9;
 }
 
+.flight-card__booking-error {
+  color: #fecaca;
+}
+
 .flight-card__link:hover,
 .flight-card__copy:hover {
   border-color: rgba(139, 100, 255, 0.35);
@@ -2691,6 +2752,13 @@ html[data-theme="light"] .proof-placeholder {
   color: var(--text-2);
   font-size: var(--fs-label);
   padding: 4px 10px;
+}
+
+.booking-auth-token-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .booking-list,
@@ -4038,4 +4106,79 @@ html[data-theme="light"] .theme-switch__button--active {
     bottom: 10px;
     width: calc(100vw - 20px);
   }
+}
+
+/* HITL Approval Gate */
+.approval-gate {
+  padding: 16px;
+  margin: 12px 0;
+  border-radius: 12px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+.approval-gate__message {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin: 0 0 6px;
+  color: var(--text-primary, #1f2937);
+}
+
+.approval-gate__detail {
+  font-size: 0.85rem;
+  margin: 0 0 12px;
+  color: var(--text-secondary, #6b7280);
+}
+
+.approval-gate__actions {
+  display: flex;
+  gap: 10px;
+}
+
+.approval-gate__btn {
+  padding: 8px 20px;
+  border-radius: 8px;
+  border: none;
+  font-weight: 600;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.approval-gate__btn--approve {
+  background: #10b981;
+  color: #fff;
+}
+
+.approval-gate__btn--approve:hover {
+  background: #059669;
+}
+
+.approval-gate__btn--reject {
+  background: #ef4444;
+  color: #fff;
+}
+
+.approval-gate__btn--reject:hover {
+  background: #dc2626;
+}
+
+.approval-result {
+  padding: 12px 16px;
+  margin: 12px 0;
+  border-radius: 10px;
+}
+
+.approval-result__status {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.approval-result__status.approved {
+  color: #10b981;
+}
+
+.approval-result__status.rejected {
+  color: #ef4444;
 }

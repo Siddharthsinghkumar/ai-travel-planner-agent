@@ -113,3 +113,17 @@ For full booking and operator behavior details, use [docs/operator-sheet.md](doc
 
 Canonical deployment smoke script:
 - [scripts/deploy_smoke.sh](scripts/deploy_smoke.sh)
+
+## RAGAS Baseline Scores
+
+Pre-RAG baseline evaluation results (generated via `venv/bin/python full_validation.py --ragas-eval`).
+Results are stored in `eval_results/ragas_baseline.json`.
+
+| Metric | Score |
+|--------|-------|
+| Faithfulness | 0.000 |
+| Answer Relevancy | 0.000 |
+| Context Relevance | 0.000 |
+
+> **Note:** Scores are 0.0 because no LLM was configured for RAGAS evaluation at baseline time.
+> These will be populated with real numeric scores once an LLM backend is connected for RAGAS metric computation.

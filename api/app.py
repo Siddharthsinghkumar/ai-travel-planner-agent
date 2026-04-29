@@ -10,6 +10,8 @@
 # responses. Streaming is enabled by passing ?stream=true in the query string.
 # Background jobs are triggered by ?async_job=true; they return a 202 with a job_id
 # that can be polled via GET /jobs/{job_id} or streamed via GET /jobs/{job_id}/events.
+# Async jobs/tracking state are memory-only in this runtime: lost on restart/crash
+# and not durable persistence.
 
 import uuid
 import json
@@ -24,7 +26,8 @@ import urllib.parse
 import fcntl                     # for process‑level locking
 import contextlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header, Depends
@@ -38,16 +41,17 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 # Use module import instead of direct function import for better testability
 import agents.planner_agent as planner_agent
 
-# Import specific tool exceptions for granular error handling
-from tools.airline_api import AirlineAPIError
-from tools.weather_api import WeatherAPIError
+# Import exceptions through service layer to avoid direct tool imports at API layer
+from api.services_exceptions import AirlineAPIError, WeatherAPIError
 from core.http_client import close_client
 from core.request_context import set_request_id, get_request_id
 from core.logging_config import setup_logging
 from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
 import core.metrics as app_metrics
+from core.auth import AuthenticatedPrincipal, get_current_principal, get_optional_principal
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, is_env_set
+from core.ollama_context import RUNTIME_NUM_CTX_DEFAULT, resolve_runtime_num_ctx
 from core.llm_mode import (
     llm_routing_context,
     normalize_cloud_provider,
@@ -65,6 +69,7 @@ from core.llm_mode import (
     VALID_LLM_MODES,
 )
 from core import job_queue                     # background job worker
+from core.rate_limiter import SlidingWindowRateLimiter
 from core.api_key_manager import key_manager    # key rotation manager
 from agents.database import init_db
 from agents.cloud_llm import (
@@ -77,6 +82,11 @@ from agents.cloud_llm import (
     refresh_provider_chain_from_env,
 )  # callback for key changes
 from agents import ollama_client
+from api.contracts import LLMOptionsResponseContract, VersionResponseContract
+from api.runtime_legacy_llm import shutdown_legacy_llm_client, startup_legacy_llm_client
+from api.routes_booking_tracking import build_booking_tracking_router
+from api.runtime_key_manager import shutdown_key_manager_runtime, startup_key_manager_runtime
+from api.runtime_price_tracker import run_price_tracker_loop
 
 logger = logging.getLogger(__name__)
 LOG_REQUEST_BODY_DEBUG = get_env_bool("LOG_REQUEST_BODY_DEBUG", default=False)
@@ -92,6 +102,45 @@ ASK_RECENT_COMPLETION_MAX_ENTRIES_DEFAULT = max(
     16,
     get_env_int("ASK_RECENT_COMPLETION_MAX_ENTRIES", 256),
 )
+ASK_RATE_LIMIT_WINDOW_SECONDS_DEFAULT = max(1, get_env_int("ASK_RATE_LIMIT_WINDOW_SECONDS", 60))
+ASK_RATE_LIMIT_PER_WINDOW_DEFAULT = max(1, get_env_int("ASK_RATE_LIMIT_PER_WINDOW", 30))
+ASK_ASYNC_RATE_LIMIT_PER_WINDOW_DEFAULT = max(
+    1,
+    get_env_int("ASK_ASYNC_RATE_LIMIT_PER_WINDOW", 10),
+)
+ADMIN_RATE_LIMIT_WINDOW_SECONDS_DEFAULT = max(
+    1,
+    get_env_int("ADMIN_RATE_LIMIT_WINDOW_SECONDS", 60),
+)
+ADMIN_RATE_LIMIT_PER_WINDOW_DEFAULT = max(
+    1,
+    get_env_int("ADMIN_RATE_LIMIT_PER_WINDOW", 30),
+)
+DIAGNOSTIC_RATE_LIMIT_PER_WINDOW_DEFAULT = max(
+    1,
+    get_env_int("DIAGNOSTIC_RATE_LIMIT_PER_WINDOW", 15),
+)
+JSON_REQUEST_BODY_MAX_BYTES_DEFAULT = max(
+    16 * 1024,
+    get_env_int("JSON_REQUEST_BODY_MAX_BYTES", 256 * 1024),
+)
+APP_SECURITY_HEADERS_ENABLE_HSTS = get_env_bool("APP_SECURITY_HEADERS_ENABLE_HSTS", default=False)
+APP_SECURITY_HEADERS_HSTS_VALUE = (
+    get_env_str("APP_SECURITY_HEADERS_HSTS_VALUE", "max-age=31536000; includeSubDomains") or ""
+).strip() or "max-age=31536000; includeSubDomains"
+APP_SECURITY_HEADERS_X_FRAME_OPTIONS = (
+    get_env_str("APP_SECURITY_HEADERS_X_FRAME_OPTIONS", "DENY") or ""
+).strip() or "DENY"
+APP_SECURITY_HEADERS_REFERRER_POLICY = (
+    get_env_str("APP_SECURITY_HEADERS_REFERRER_POLICY", "no-referrer") or ""
+).strip() or "no-referrer"
+APP_SECURITY_HEADERS_CSP = (
+    get_env_str(
+        "APP_SECURITY_HEADERS_CSP",
+        "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+    )
+    or ""
+).strip() or "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
 
 
 def _resolve_ask_max_inflight() -> int:
@@ -133,6 +182,228 @@ def _resolve_ask_recent_completion_max_entries() -> int:
         ASK_RECENT_COMPLETION_MAX_ENTRIES_DEFAULT,
     )
     return max(16, configured)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_ask_rate_limit_window_seconds() -> int:
+    return max(1, get_env_int("ASK_RATE_LIMIT_WINDOW_SECONDS", ASK_RATE_LIMIT_WINDOW_SECONDS_DEFAULT))
+
+
+def _resolve_ask_rate_limit_per_window() -> int:
+    return max(1, get_env_int("ASK_RATE_LIMIT_PER_WINDOW", ASK_RATE_LIMIT_PER_WINDOW_DEFAULT))
+
+
+def _resolve_ask_async_rate_limit_per_window() -> int:
+    return max(
+        1,
+        get_env_int("ASK_ASYNC_RATE_LIMIT_PER_WINDOW", ASK_ASYNC_RATE_LIMIT_PER_WINDOW_DEFAULT),
+    )
+
+
+def _resolve_admin_rate_limit_window_seconds() -> int:
+    return max(
+        1,
+        get_env_int("ADMIN_RATE_LIMIT_WINDOW_SECONDS", ADMIN_RATE_LIMIT_WINDOW_SECONDS_DEFAULT),
+    )
+
+
+def _resolve_admin_rate_limit_per_window() -> int:
+    return max(
+        1,
+        get_env_int("ADMIN_RATE_LIMIT_PER_WINDOW", ADMIN_RATE_LIMIT_PER_WINDOW_DEFAULT),
+    )
+
+
+def _resolve_diagnostic_rate_limit_per_window() -> int:
+    return max(
+        1,
+        get_env_int(
+            "DIAGNOSTIC_RATE_LIMIT_PER_WINDOW",
+            DIAGNOSTIC_RATE_LIMIT_PER_WINDOW_DEFAULT,
+        ),
+    )
+
+
+def _ensure_ask_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
+    limiter = getattr(app.state, "ask_rate_limiter", None)
+    if isinstance(limiter, SlidingWindowRateLimiter):
+        return limiter
+    limiter = SlidingWindowRateLimiter(
+        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000))
+    )
+    app.state.ask_rate_limiter = limiter
+    return limiter
+
+
+def _ensure_admin_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
+    limiter = getattr(app.state, "admin_rate_limiter", None)
+    if isinstance(limiter, SlidingWindowRateLimiter):
+        return limiter
+    limiter = SlidingWindowRateLimiter(
+        max_keys=max(200, get_env_int("ADMIN_RATE_LIMIT_MAX_KEYS", 5000))
+    )
+    app.state.admin_rate_limiter = limiter
+    return limiter
+
+
+def _public_error_schema(
+    *,
+    code: str,
+    message: str,
+    request_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "code": str(code or "internal_error"),
+        "message": str(message or "Request failed."),
+        "request_id": str(request_id or get_request_id() or "unknown"),
+    }
+    if job_id:
+        payload["job_id"] = str(job_id)
+    return payload
+
+
+def _ask_public_error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    failure_reason: Optional[str] = None,
+    failure_domain: Optional[str] = None,
+) -> JSONResponse:
+    payload: Dict[str, Any] = {
+        "detail": message,
+        "error": code,
+        "public_error": _public_error_schema(code=code, message=message),
+        "result_status": "error",
+    }
+    if failure_reason:
+        payload["failure_reason"] = failure_reason
+    if failure_domain:
+        payload["failure_domain"] = failure_domain
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _resolve_json_request_body_max_bytes() -> int:
+    return max(
+        256,
+        get_env_int("JSON_REQUEST_BODY_MAX_BYTES", JSON_REQUEST_BODY_MAX_BYTES_DEFAULT),
+    )
+
+
+def _is_json_request(request: Request) -> bool:
+    method = str(request.method or "").upper()
+    if method not in {"POST", "PUT", "PATCH"}:
+        return False
+    content_type = str(request.headers.get("content-type") or "").lower()
+    return "application/json" in content_type
+
+
+def _oversized_request_response(*, max_bytes: int) -> JSONResponse:
+    message = f"JSON request body exceeds the {max_bytes} byte limit."
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": "payload_too_large",
+            "detail": message,
+            "public_error": _public_error_schema(
+                code="payload_too_large",
+                message=message,
+            ),
+            "max_bytes": max_bytes,
+        },
+    )
+
+
+async def _reject_oversized_json_request(request: Request) -> Optional[JSONResponse]:
+    if not _is_json_request(request):
+        return None
+    max_bytes = _resolve_json_request_body_max_bytes()
+    content_length = str(request.headers.get("content-length") or "").strip()
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                return _oversized_request_response(max_bytes=max_bytes)
+        except Exception:
+            logger.debug("invalid_content_length_header_ignored", extra={"value": content_length})
+    body_bytes = await request.body()
+    if len(body_bytes) > max_bytes:
+        return _oversized_request_response(max_bytes=max_bytes)
+    request._body = body_bytes
+    return None
+
+
+def _is_docs_or_openapi_path(path: str) -> bool:
+    return path in {"/docs", "/redoc", "/openapi.json"} or path.startswith("/docs/")
+
+
+def _apply_app_security_headers(request: Request, response: Response) -> None:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", APP_SECURITY_HEADERS_X_FRAME_OPTIONS)
+    response.headers.setdefault("Referrer-Policy", APP_SECURITY_HEADERS_REFERRER_POLICY)
+    if not _is_docs_or_openapi_path(str(request.url.path or "")):
+        response.headers.setdefault("Content-Security-Policy", APP_SECURITY_HEADERS_CSP)
+    if APP_SECURITY_HEADERS_ENABLE_HSTS and str(request.url.scheme or "").lower() == "https":
+        response.headers.setdefault("Strict-Transport-Security", APP_SECURITY_HEADERS_HSTS_VALUE)
+
+
+def _ask_rate_limit_subject(
+    *,
+    request: Request,
+    principal: Optional[AuthenticatedPrincipal],
+) -> str:
+    if principal is not None:
+        return f"principal:{principal.principal_id}"
+    client_host = (getattr(request.client, "host", None) or "unknown").strip()
+    return f"ip:{client_host}"
+
+
+async def _build_ask_rate_limit_response(
+    *,
+    request: Request,
+    principal: Optional[AuthenticatedPrincipal],
+    async_job: bool,
+) -> Optional[JSONResponse]:
+    limiter = _ensure_ask_rate_limiter(app)
+    window_seconds = _resolve_ask_rate_limit_window_seconds()
+    limit = (
+        _resolve_ask_async_rate_limit_per_window()
+        if async_job
+        else _resolve_ask_rate_limit_per_window()
+    )
+    subject = _ask_rate_limit_subject(request=request, principal=principal)
+    key = f"ask:{'async' if async_job else 'sync'}:{subject}"
+    decision = await limiter.check(key, limit=limit, window_seconds=window_seconds)
+    if decision.allowed:
+        return None
+
+    app_metrics.record_ask_admission(outcome="rejected_rate_limited", stream=False)
+    error_code = "async_job_rate_limited" if async_job else "ask_rate_limited"
+    content: Dict[str, Any] = {
+        "detail": "Rate limit exceeded for this caller.",
+        "error": error_code,
+        "retry_after_seconds": decision.retry_after_seconds,
+        "limit": decision.limit,
+        "window_seconds": decision.window_seconds,
+        "contract": "single_node_process_local_rate_limit",
+        "result_status": "error",
+    }
+    if async_job:
+        content["job_contract"] = _job_contract_payload()
+        content["job_runtime_warning"] = _job_runtime_warning_payload()
+    response = JSONResponse(
+        status_code=429,
+        content=content,
+    )
+    response.headers["Retry-After"] = str(decision.retry_after_seconds)
+    response.headers["X-Ask-Admission"] = "rate_limited"
+    response.headers["X-Ask-Contract"] = "single-node-process-local"
+    if async_job:
+        _apply_job_runtime_headers(response)
+    return response
 
 
 def _build_ask_request_fingerprint(
@@ -370,7 +641,16 @@ async def _log_startup_config_summary(*, deprecated_env_detected: list[str], log
     cloud_runtime_relevant = _is_cloud_startup_relevant_for_mode(llm_mode)
     planner_prewarm_enabled = get_env_bool("PLANNER_PREWARM", default=False)
     ollama_base_url = get_env_str("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model = get_env_str("OLLAMA_MODEL", "openhermes")
+    ollama_model = get_env_str("OLLAMA_MODEL", "qwen2.5:3b")
+    runtime_num_ctx = resolve_runtime_num_ctx(
+        process_env=os.environ,
+        dotenv_paths=[Path(__file__).resolve().parent.parent / ".env"],
+        minimum_value=1,
+        fallback_default=RUNTIME_NUM_CTX_DEFAULT,
+    )
+    ollama_num_ctx_effective = runtime_num_ctx.get("effective_num_ctx")
+    ollama_num_ctx_source = str(runtime_num_ctx.get("source") or "unset")
+    ollama_num_ctx_process = str(runtime_num_ctx.get("process_raw") or "") or "<unset>"
     planner_timeout = max(5.0, get_env_float("PLANNER_LLM_TIMEOUT", 45.0))
     router_timeout = max(1.0, get_env_float("ROUTER_TIMEOUT", 90.0))
     local_timeout = max(1.0, get_env_float("LOCAL_LLM_TIMEOUT", max(get_env_float("OLLAMA_TIMEOUT", 30.0), planner_timeout)))
@@ -398,6 +678,7 @@ async def _log_startup_config_summary(*, deprecated_env_detected: list[str], log
             "Startup config summary | llm_mode=%s | llm_mode_source=%s | llm_priority_compat_used=%s "
             "| cloud_enabled=%s | cloud_default_provider=%s | cloud_provider_chain=%s | cloud_provider_chain_source=%s "
             "| cloud_runtime_relevant=%s | cloud_initialized_providers=%s | cloud_usable_providers=%s | ollama_base_url=%s | ollama_model=%s "
+            "| ollama_num_ctx_process=%s | ollama_num_ctx_effective=%s | ollama_num_ctx_source=%s "
             "| planner_timeout_sec=%.2f | local_llm_timeout_sec=%.2f | cloud_llm_timeout_sec=%.2f | router_timeout_sec=%.2f | request_timeout_sec=%s "
             "| mode_ignored_for_routing=%s | key_manager_lock_backend=%s | planner_prewarm=%s | deprecated_env_detected=%s"
         ),
@@ -413,6 +694,9 @@ async def _log_startup_config_summary(*, deprecated_env_detected: list[str], log
         usable_text,
         ollama_base_url,
         ollama_model,
+        ollama_num_ctx_process,
+        str(ollama_num_ctx_effective) if ollama_num_ctx_effective is not None else "<unset>",
+        ollama_num_ctx_source,
         planner_timeout,
         local_timeout,
         cloud_timeout,
@@ -453,7 +737,9 @@ def _acquire_process_lock(path: str) -> Optional[int]:
     """
     fd = None
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.write(fd, str(os.getpid()).encode())
         return fd
@@ -532,6 +818,7 @@ def _compute_async_job_support() -> dict:
         "allow_unsafe_override": bool(allow_unsafe),
         "fail_fast_on_unsupported_topology": bool(fail_fast),
         "contract": "single_worker_required_process_local_queue",
+        "job_runtime_warning": _job_runtime_warning_payload(),
     }
     if allow_unsafe:
         return {
@@ -566,12 +853,44 @@ def _get_async_job_support_state(app: FastAPI) -> dict:
     return _compute_async_job_support()
 
 
+def _get_startup_complete_state(app: FastAPI) -> bool:
+    return bool(getattr(app.state, "startup_complete", False))
+
+
+def _get_llm_prewarm_state(app: FastAPI) -> Dict[str, Any]:
+    prewarm = getattr(app.state, "llm_prewarm", {}) or {}
+    if isinstance(prewarm, dict):
+        return prewarm
+    return {}
+
+
+def _get_key_manager_refresh_owner_state(app: FastAPI) -> bool:
+    return bool(getattr(app.state, "key_manager_refresh_owner", False))
+
+
 def _job_contract_payload() -> Dict[str, Any]:
+    # Contract is intentionally process-local/single-worker for this runtime.
+    # Multi-worker shared-state/distributed async semantics are explicitly deferred.
+    warning_payload = job_queue.job_runtime_warning_payload()
     return {
-        "durability": "process_local",
+        "durability": "memory_only_ephemeral",
         "queue": "in_memory_single_worker",
         "contract": "single_worker_required_process_local_queue",
+        "jobs_tracking_memory_only": bool(warning_payload.get("jobs_tracking_memory_only", True)),
+        "lost_on_restart": bool(warning_payload.get("lost_on_restart", True)),
+        "durable_persistence": bool(warning_payload.get("durable_persistence", False)),
+        "warning": str(warning_payload.get("warning") or ""),
     }
+
+
+def _job_runtime_warning_payload() -> Dict[str, Any]:
+    return job_queue.job_runtime_warning_payload()
+
+
+def _apply_job_runtime_headers(response: Response) -> None:
+    response.headers["X-Async-Job-Durability"] = "memory-only-ephemeral"
+    response.headers["X-Async-Job-Lost-On-Restart"] = "true"
+    response.headers["X-Async-Job-Not-Durable"] = "true"
 
 
 def _should_run_prewarm(prewarm_enabled: bool, refresh_owner: bool) -> bool:
@@ -649,37 +968,7 @@ async def _acquire_pluggable_lock():
 
 
 async def _run_price_tracker_loop(app: FastAPI) -> None:
-    from tools import price_tracker
-
-    interval = max(60, get_env_int("PRICE_TRACKER_INTERVAL_SECONDS", 1800))
-    try:
-        cleanup_summary = await asyncio.to_thread(price_tracker.cleanup_invalid_held_tracking_rows)
-        app.state.price_tracker_status["startup_cleanup"] = cleanup_summary
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        app.state.price_tracker_status["startup_cleanup"] = {
-            "status": "failed",
-            "error": str(exc),
-        }
-        logger.warning(
-            "price_tracker_startup_cleanup_failed",
-            extra={"exception_type": type(exc).__name__},
-        )
-    while getattr(app.state, "price_tracker_enabled", False):
-        try:
-            app.state.price_tracker_status["last_started_at"] = datetime.utcnow().isoformat() + "Z"
-            alerts = await price_tracker.check_held_booking_prices()
-            app.state.price_tracker_status["last_alert_count"] = len(alerts)
-            app.state.price_tracker_status["last_error"] = None
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            app.state.price_tracker_status["last_error"] = str(exc)
-            logger.exception("price_tracker_loop_error")
-        finally:
-            app.state.price_tracker_status["last_completed_at"] = datetime.utcnow().isoformat() + "Z"
-        await asyncio.sleep(interval)
+    await run_price_tracker_loop(app, logger=logger)
 
 
 async def prewarm_llm():
@@ -697,7 +986,7 @@ async def prewarm_llm():
     timeout_step = max(0, get_env_int("OLLAMA_PREWARM_TIMEOUT_STEP", 20))
     max_retries = get_env_int("OLLAMA_PREWARM_RETRIES", 3)
     backoff = 1
-    model_name = get_env_str("OLLAMA_MODEL", "openhermes")
+    model_name = get_env_str("OLLAMA_MODEL", "qwen2.5:3b")
     last_error: Optional[str] = None
     last_error_bucket: Optional[str] = None
 
@@ -791,12 +1080,74 @@ async def prewarm_llm():
                 }
 
 
-def require_admin_token(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
-    """Dependency to protect admin endpoints with a token from environment."""
+def _validate_admin_token(x_admin_token: Optional[str]) -> str:
     expected = (get_env_str("ADMIN_TOKEN") or "").strip()
     provided = (x_admin_token or "").strip()
     if not expected or not provided or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
+    return provided
+
+
+def _admin_rate_limit_subject(*, request: Request, token: str) -> str:
+    client_host = (getattr(request.client, "host", None) or "unknown").strip()
+    token_fp = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+    return f"{client_host}:{token_fp}"
+
+
+async def _enforce_admin_rate_limit(*, request: Request, token: str, scope: str) -> None:
+    limiter = _ensure_admin_rate_limiter(app)
+    window_seconds = _resolve_admin_rate_limit_window_seconds()
+    limit = (
+        _resolve_diagnostic_rate_limit_per_window()
+        if scope == "diagnostic"
+        else _resolve_admin_rate_limit_per_window()
+    )
+    subject = _admin_rate_limit_subject(request=request, token=token)
+    decision = await limiter.check(
+        f"admin:{scope}:{subject}",
+        limit=limit,
+        window_seconds=window_seconds,
+    )
+    if decision.allowed:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": "admin_rate_limited",
+            "message": "Rate limit exceeded for admin/diagnostic endpoint access.",
+            "public_error": _public_error_schema(
+                code="admin_rate_limited",
+                message="Rate limit exceeded for admin/diagnostic endpoint access.",
+            ),
+            "retry_after_seconds": decision.retry_after_seconds,
+            "limit": decision.limit,
+            "window_seconds": decision.window_seconds,
+        },
+        headers={"Retry-After": str(decision.retry_after_seconds)},
+    )
+
+
+async def require_admin_token(
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    """Dependency to protect admin endpoints with a token from environment."""
+    _validate_admin_token(x_admin_token)
+
+
+async def require_admin_access(
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    token = _validate_admin_token(x_admin_token)
+    await _enforce_admin_rate_limit(request=request, token=token, scope="debug")
+
+
+async def require_admin_diagnostic_access(
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    token = _validate_admin_token(x_admin_token)
+    await _enforce_admin_rate_limit(request=request, token=token, scope="diagnostic")
 
 
 @asynccontextmanager
@@ -808,10 +1159,10 @@ async def lifespan(app: FastAPI):
         "enabled": prewarm_enabled,
         "best_effort": True,
         "status": "scheduled" if prewarm_enabled else "disabled",
-        "model": get_env_str("OLLAMA_MODEL", "openhermes"),
+        "model": get_env_str("OLLAMA_MODEL", "qwen2.5:3b"),
         "attempts": 0,
         "last_error": None,
-        "last_updated": datetime.utcnow().isoformat() + "Z",
+        "last_updated": _utc_now_iso(),
     }
     app.state.llm_prewarm_task = None
     app.state.async_job_support = _compute_async_job_support()
@@ -823,6 +1174,9 @@ async def lifespan(app: FastAPI):
         "inflight": {},
         "recent_completed": {},
     }
+    app.state.ask_rate_limiter = SlidingWindowRateLimiter(
+        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000))
+    )
     app.state.price_tracker_enabled = get_env_bool("PRICE_TRACKER_ENABLED", default=True)
     app.state.price_tracker_status = {
         "enabled": bool(app.state.price_tracker_enabled),
@@ -837,145 +1191,57 @@ async def lifespan(app: FastAPI):
     setup_logging()
     deprecated_env_detected = _emit_deprecated_config_warnings()
 
+    def _validate_secret_runtime_config() -> None:
+        if not get_env_bool("ENFORCE_SECRET_ENV_VALIDATION", default=False):
+            return
+        database_url = str(get_env_str("DATABASE_URL", "") or "").strip()
+        if not database_url:
+            raise RuntimeError("DATABASE_URL must be configured when ENFORCE_SECRET_ENV_VALIDATION=1")
+        lowered = database_url.lower()
+        insecure_markers = ("strongpassword", "changeme", "example", "admin:admin", "password@")
+        if any(marker in lowered for marker in insecure_markers):
+            raise RuntimeError(
+                "DATABASE_URL contains a placeholder-like credential; supply a real secret at runtime."
+            )
+
+    _validate_secret_runtime_config()
+
     # Legacy async LLM client path is compatibility-only and opt-in.
     # Modern runtime uses llm_router + provider adapters + key-manager pools.
-    if _legacy_async_llm_client_enabled():
-        try:
-            await init_llm_client()
-            app.state.legacy_llm_client_initialized = True
-        except Exception as e:
-            logger.warning("legacy_llm_client_init_skipped: %s", str(e))
-    else:
-        logger.debug("legacy_llm_client_disabled_by_config")
+    await startup_legacy_llm_client(
+        app,
+        enabled=_legacy_async_llm_client_enabled(),
+        logger=logger,
+        init_client_fn=init_llm_client,
+    )
 
     # Ensure ORM tables (including provider_key_states) exist before key-manager provider-state IO.
     try:
         init_db()
     except Exception:
         logger.exception("database_init_failed")
+        raise
 
-    # Load API keys from environment into the key manager.
-    # Keep startup responsive: if hydration is slow, continue and finish in background.
     key_load_timeout = max(
         0.1,
         float(get_env_float("KEY_MANAGER_STARTUP_LOAD_TIMEOUT_SECONDS", 1.5)),
     )
-    try:
-        await asyncio.wait_for(key_manager.load_env_keys(), timeout=key_load_timeout)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "key_manager_load_deferred_to_background",
-            extra={"timeout_seconds": key_load_timeout},
-        )
-
-        async def _background_key_manager_load() -> None:
-            try:
-                await key_manager.load_env_keys()
-                logger.info("key_manager_background_load_complete")
-            except Exception:
-                logger.exception("key_manager_background_load_failed")
-
-        app.state.key_manager_hydration_task = asyncio.create_task(_background_key_manager_load())
-    except Exception:
-        logger.exception("key_manager_load_failed")
-
-    if is_cloud_admin_enabled():
-        try:
-            if _is_cloud_startup_relevant_now():
-                # Avoid forcing duplicate provider-refresh startup logs in follower workers.
-                # Module import has already performed an initial refresh in-process.
-                refresh_provider_chain_from_env(force=False)
-            else:
-                logger.debug("cloud_provider_refresh_skipped_non_routing_ollama_only_mode")
-        except Exception:
-            logger.exception("cloud_provider_refresh_failed")
-    else:
-        logger.debug("cloud_provider_refresh_skipped_cloud_disabled")
-
-    # ---- Register key event listener early (idempotent) ----
-    try:
-        already_registered = False
-        # best-effort detection to avoid duplicate registration in same process
-        listeners = getattr(key_manager, "_key_event_listeners", None)
-        if listeners is not None:
-            try:
-                if on_key_event in listeners:
-                    already_registered = True
-            except Exception:
-                # fall back to identity scan
-                for item in list(listeners):
-                    if getattr(item, "__name__", None) == getattr(on_key_event, "__name__", None):
-                        already_registered = True
-                        break
-
-        if not already_registered:
-            key_manager.register_key_event_listener(on_key_event)
-            app.state.cloud_llm_listener_registered = True
-            logger.debug("Registered cloud LLM key event listener")
-        else:
-            logger.debug("Cloud LLM key event listener already registered in this process")
-    except Exception:
-        logger.exception("Failed to register cloud LLM key event listener")
-
-    # ---- Pluggable lock to ensure only one process/replica runs the refresh loop ----
-    lock_backend, lock_handle = await _acquire_pluggable_lock()
-    should_run_refresh = lock_handle is not None
-
-    # Fallback: env var override (useful for containers where you set one replica manually)
-    if not should_run_refresh and get_env_bool("RUN_KEY_REFRESH", default=False):
-        if lock_backend == "redis":
-            logger.error(
-                "RUN_KEY_REFRESH=true ignored for redis backend when lock is not acquired; "
-                "refusing unsafe refresh-loop ownership."
-            )
-        else:
-            logger.warning(
-                "RUN_KEY_REFRESH=true but lock not acquired; starting refresh loop anyway. "
-                "Ensure only one replica has this variable set."
-            )
-            should_run_refresh = True
-
-    if should_run_refresh:
-        logger.info("Starting key manager background refresh loop (lock_backend=%s).", lock_backend)
-        # Save lock handle for shutdown cleanup
-        app.state.key_manager_lock_backend = lock_backend
-        app.state.key_manager_lock_handle = lock_handle
-
-        # Start the key manager's background refresh loop (interval configurable)
-        refresh_interval = get_env_int("KEY_ENV_MONITOR_TICK", 60)
-        # start_refresh_loop is synchronous; it creates an internal task.
-        key_manager.start_refresh_loop(
-            interval_seconds=refresh_interval,
-            skip_lock_check=True      # we already acquired the lock ourselves
-        )
-        serpapi_reconcile_interval = max(
-            300,
-            get_env_int("SERPAPI_ACCOUNT_RECONCILE_INTERVAL_SECONDS", 1800),
-        )
-        # Do not block app startup on provider-account reconciliation.
-        # The periodic reconcile loop starts immediately and performs the same check
-        # in the background.
-        key_manager.start_serpapi_reconcile_loop(interval_seconds=serpapi_reconcile_interval)
-        logger.info(
-            "SerpAPI reconcile loop started in background (startup not blocked)",
-            extra={"interval_seconds": serpapi_reconcile_interval},
-        )
-        app.state.serpapi_reconcile_task = key_manager._serpapi_reconcile_task
-        # Store the internal task so we can cancel it on shutdown
-        app.state.key_manager_task = key_manager._refresh_task
-        app.state.key_manager_refresh_owner = True
-        if lock_backend == "redis" and lock_handle is not None:
-            client, lock = lock_handle
-            app.state.key_manager_lease_task = asyncio.create_task(
-                _run_redis_lock_lease_keeper(app, lock, KEY_MANAGER_LOCK_TTL)
-            )
-    else:
-        logger.debug("Another process/replica holds the key manager lock; not starting refresh loop.")
-        app.state.key_manager_lock_backend = None
-        app.state.key_manager_lock_handle = None
-        app.state.key_manager_task = None
-        app.state.serpapi_reconcile_task = None
-        app.state.key_manager_refresh_owner = False
+    lock_backend = await startup_key_manager_runtime(
+        app,
+        logger=logger,
+        key_load_timeout=key_load_timeout,
+        cloud_admin_enabled=bool(is_cloud_admin_enabled()),
+        cloud_startup_relevant=bool(_is_cloud_startup_relevant_now()),
+        refresh_provider_chain_from_env_fn=refresh_provider_chain_from_env,
+        key_event_listener=on_key_event,
+        acquire_pluggable_lock_fn=_acquire_pluggable_lock,
+        run_redis_lock_lease_keeper_fn=_run_redis_lock_lease_keeper,
+        key_manager_lock_ttl=KEY_MANAGER_LOCK_TTL,
+        run_key_refresh_override=get_env_bool("RUN_KEY_REFRESH", default=False),
+        key_env_monitor_tick=get_env_int("KEY_ENV_MONITOR_TICK", 60),
+        serpapi_reconcile_interval=0,  # removed — was burning quota
+    )
+    should_run_refresh = bool(app.state.key_manager_refresh_owner)
 
     if _should_emit_startup_summary(bool(app.state.key_manager_refresh_owner)):
         try:
@@ -1048,22 +1314,22 @@ async def lifespan(app: FastAPI):
     if _should_run_prewarm(prewarm_enabled, should_run_refresh):
         async def background_prewarm():
             app.state.llm_prewarm["status"] = "running"
-            app.state.llm_prewarm["last_updated"] = datetime.utcnow().isoformat() + "Z"
+            app.state.llm_prewarm["last_updated"] = _utc_now_iso()
             try:
                 result = await prewarm_llm()
                 app.state.llm_prewarm["attempts"] = int(result.get("attempts", 0))
                 app.state.llm_prewarm["status"] = str(result.get("status", "failed"))
                 app.state.llm_prewarm["last_error"] = result.get("error")
-                app.state.llm_prewarm["last_updated"] = datetime.utcnow().isoformat() + "Z"
+                app.state.llm_prewarm["last_updated"] = _utc_now_iso()
             except Exception:
                 logger.exception("Background prewarm failed")
                 app.state.llm_prewarm["status"] = "failed"
                 app.state.llm_prewarm["last_error"] = "background_prewarm_exception"
-                app.state.llm_prewarm["last_updated"] = datetime.utcnow().isoformat() + "Z"
+                app.state.llm_prewarm["last_updated"] = _utc_now_iso()
         app.state.llm_prewarm_task = asyncio.create_task(background_prewarm())
     elif prewarm_enabled:
         app.state.llm_prewarm["status"] = "skipped_non_owner_worker"
-        app.state.llm_prewarm["last_updated"] = datetime.utcnow().isoformat() + "Z"
+        app.state.llm_prewarm["last_updated"] = _utc_now_iso()
         logger.debug(
             "Skipping prewarm on non-owner worker",
             extra={"pid": os.getpid(), "refresh_owner": bool(should_run_refresh)},
@@ -1104,84 +1370,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("price_tracker_task_cancel_failed")
 
-    # Stop the key manager's background refresh loop only if we started it
-    if getattr(app.state, "key_manager_task", None):
-        try:
-            # stop_refresh_loop is synchronous; it cancels the internal task.
-            key_manager.stop_refresh_loop()
-        except Exception:
-            logger.exception("key_manager_stop_refresh_loop_failed")
+    await shutdown_key_manager_runtime(app, logger=logger)
 
-        # Cancel background task if still running (though stop_refresh_loop should have done it)
-        task = app.state.key_manager_task
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("key_manager_task_cancel_failed")
-
-    if getattr(app.state, "serpapi_reconcile_task", None):
-        try:
-            key_manager.stop_serpapi_reconcile_loop()
-        except Exception:
-            logger.exception("serpapi_reconcile_loop_stop_failed")
-        reconcile_task = app.state.serpapi_reconcile_task
-        if reconcile_task and not reconcile_task.done():
-            reconcile_task.cancel()
-            try:
-                await reconcile_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("serpapi_reconcile_task_cancel_failed")
-
-    lease_task = getattr(app.state, "key_manager_lease_task", None)
-    if lease_task and not lease_task.done():
-        lease_task.cancel()
-        try:
-            await lease_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("key_manager_lease_task_cancel_failed")
-
-    hydration_task = getattr(app.state, "key_manager_hydration_task", None)
-    if hydration_task and not hydration_task.done():
-        hydration_task.cancel()
-        try:
-            await hydration_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("key_manager_hydration_task_cancel_failed")
-
-    # Release the lock we acquired (backend-specific)
-    backend = getattr(app.state, "key_manager_lock_backend", None)
-    handle = getattr(app.state, "key_manager_lock_handle", None)
-    if backend == "file" and handle is not None:
-        try:
-            os.close(handle)
-            logger.info("Released file lock for key manager refresh.")
-        except Exception:
-            logger.exception("failed_to_release_file_lock")
-    elif backend == "redis" and handle is not None:
-        client, lock = handle
-        try:
-            # release the redis lock and close connection
-            await lock.release()
-        except Exception:
-            logger.exception("failed_to_release_redis_lock")
-        try:
-            await client.close()
-        except Exception:
-            pass
-
-    # Clean up legacy async client only when it was enabled.
-    if getattr(app.state, "legacy_llm_client_initialized", False):
-        await close_llm_client()
+    await shutdown_legacy_llm_client(
+        app,
+        close_client_fn=close_llm_client,
+    )
     await close_client()
 
     # Ensure cloud_llm provider adapters are closed (safe even if none initialised)
@@ -1195,6 +1389,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LLM Travel Agent",
     lifespan=lifespan
+)
+app.include_router(
+    build_booking_tracking_router(
+        app,
+        logger=logger,
+        job_contract_payload_fn=_job_contract_payload,
+    )
 )
 
 # Add CORS middleware with strict origin parsing.
@@ -1273,6 +1474,10 @@ app.add_middleware(
 # Middleware to log raw request bodies for debugging 422 errors
 @app.middleware("http")
 async def log_request_body(request: Request, call_next):
+    oversized = await _reject_oversized_json_request(request)
+    if oversized is not None:
+        _apply_app_security_headers(request, oversized)
+        return oversized
     if not LOG_REQUEST_BODY_DEBUG:
         return await call_next(request)
     try:
@@ -1293,7 +1498,7 @@ async def log_request_body(request: Request, call_next):
                         redacted[key] = value
                 body_text = json.dumps(redacted, ensure_ascii=False)
         except Exception:
-            pass
+            logger.exception("request_body_debug_redaction_failed")
         logger.debug(
             "request_body_observed",
             extra={
@@ -1307,7 +1512,7 @@ async def log_request_body(request: Request, call_next):
         request._body = body_bytes
     except Exception:
         # Logging must never break the request
-        pass
+        logger.exception("request_body_debug_observe_failed")
     response = await call_next(request)
     return response
 
@@ -1319,6 +1524,7 @@ async def add_request_id(request: Request, call_next):
     set_request_id(request_id)
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    _apply_app_security_headers(request, response)
     return response
 
 
@@ -1365,13 +1571,13 @@ async def observe_http_metrics(request: Request, call_next):
 
 
 class AskRequest(BaseModel):
-    origin: Optional[str] = None
-    destination: Optional[str] = None
-    date: Optional[str] = None
-    user_query: Optional[str] = None
-    trip_type: Optional[str] = None          # now optional, planner may default to "Business"
-    llm_mode: Optional[str] = None
-    cloud_provider: Optional[str] = None
+    origin: Optional[str] = Field(default=None, max_length=8)
+    destination: Optional[str] = Field(default=None, max_length=8)
+    date: Optional[str] = Field(default=None, max_length=32)
+    user_query: Optional[str] = Field(default=None, max_length=4000)
+    trip_type: Optional[str] = Field(default=None, max_length=32)          # now optional, planner may default to "Business"
+    llm_mode: Optional[str] = Field(default=None, max_length=32)
+    cloud_provider: Optional[str] = Field(default=None, max_length=32)
 
     @field_validator("date")
     @classmethod
@@ -1453,77 +1659,6 @@ class AskRequest(BaseModel):
         return self
 
 
-class BookingHoldRequest(BaseModel):
-    flight: Dict[str, Any] = Field(default_factory=dict)
-    origin: str
-    destination: str
-    depart_date: str
-    return_date: Optional[str] = None
-    passengers: int = 1
-    hold_minutes: Optional[int] = None
-    passenger: Optional[Dict[str, Any]] = None
-
-    @model_validator(mode="after")
-    def normalize(self):
-        self.origin = str(self.origin or "").strip().upper()
-        self.destination = str(self.destination or "").strip().upper()
-        self.depart_date = str(self.depart_date or "").strip()
-        if self.return_date:
-            self.return_date = str(self.return_date).strip()
-        self.passengers = max(1, int(self.passengers or 1))
-        if not self.origin or not self.destination or not self.depart_date:
-            raise ValueError("origin, destination, and depart_date are required")
-        return self
-
-
-class BookingCancelRequest(BaseModel):
-    booking_id: int
-
-    @field_validator("booking_id")
-    @classmethod
-    def validate_booking_id(cls, v):
-        if v is None or int(v) <= 0:
-            raise ValueError("booking_id must be a positive integer")
-        return int(v)
-
-
-class BookingTrackRequest(BookingHoldRequest):
-    pass
-
-
-def _coerce_price_inr(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            parsed = float(value)
-        except Exception:
-            return None
-        return parsed if parsed > 0 else None
-    text = str(value).strip()
-    if not text:
-        return None
-    cleaned = text.replace("₹", "").replace(",", "").strip()
-    try:
-        parsed = float(cleaned)
-    except Exception:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _tracking_detail(*, error: str, reason: str, message: str, **extra: Any) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "error": error,
-        "reason": reason,
-        "message": message,
-        "contract": "price_tracking_requires_supported_selected_flight",
-    }
-    for key, value in extra.items():
-        if value is not None:
-            payload[key] = value
-    return payload
-
-
 class ProviderStateOverrideRequest(BaseModel):
     provider: str
     scope_type: str
@@ -1561,8 +1696,10 @@ class ProviderStateOverrideRequest(BaseModel):
 @app.post("/ask")
 async def ask(
     req: AskRequest,
+    request: Request,
     stream: bool = False,
-    async_job: bool = Query(False, description="Enqueue request as background job")
+    async_job: bool = Query(False, description="Enqueue request as background job"),
+    principal: Optional[AuthenticatedPrincipal] = Depends(get_optional_principal),
 ):
     """
     Plan a trip based on the user's request.
@@ -1607,6 +1744,31 @@ async def ask(
     ask_slot_acquired = False
     stream_cleanup_owner = False
     non_stream_completion_snapshot: Optional[Dict[str, Any]] = None
+    warmup_probe = str(request.headers.get("X-Validation-Warmup-Probe") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    warmup_replay_bypassed = False
+
+    if principal is not None and not isinstance(principal, AuthenticatedPrincipal):
+        principal = None
+
+    if async_job and principal is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required for async jobs.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    rate_limit_response = await _build_ask_rate_limit_response(
+        request=request,
+        principal=principal,
+        async_job=bool(async_job),
+    )
+    if rate_limit_response is not None:
+        return rate_limit_response
 
     try:
         def _failure_domain_for_reason(reason: Optional[str]) -> str:
@@ -1686,16 +1848,20 @@ async def ask(
                     )
                     app_metrics.record_ask_inflight_stale_pruned(stale_removed)
                 if not stream and recent_ttl_seconds > 0:
-                    recent = recent_completed.get(ask_request_fingerprint)
-                    if recent is not None:
-                        replay_meta = {
-                            "status_code": int(recent.get("status_code") or 200),
-                            "payload": recent.get("payload"),
-                            "age_seconds": round(
-                                max(0.0, now_monotonic - float(recent.get("completed_at") or now_monotonic)),
-                                3,
-                            ),
-                        }
+                    if warmup_probe:
+                        if recent_completed.get(ask_request_fingerprint) is not None:
+                            warmup_replay_bypassed = True
+                    else:
+                        recent = recent_completed.get(ask_request_fingerprint)
+                        if recent is not None:
+                            replay_meta = {
+                                "status_code": int(recent.get("status_code") or 200),
+                                "payload": recent.get("payload"),
+                                "age_seconds": round(
+                                    max(0.0, now_monotonic - float(recent.get("completed_at") or now_monotonic)),
+                                    3,
+                                ),
+                            }
                 existing = inflight.get(ask_request_fingerprint)
                 if replay_meta is not None:
                     pass
@@ -1741,6 +1907,9 @@ async def ask(
                 response.headers["X-Ask-Admission"] = "replayed_recent"
                 response.headers["X-Ask-Contract"] = "single-node-process-local"
                 response.headers["X-Ask-Replay-Age-Seconds"] = str(replay_meta["age_seconds"])
+                if warmup_probe:
+                    response.headers["X-Validation-Warmup-Execution"] = "replayed_recent"
+                    response.headers["X-Validation-Warmup-Replay-Bypassed"] = "false"
                 return response
 
             if duplicate_meta is not None:
@@ -1772,6 +1941,11 @@ async def ask(
                 response.headers["X-Ask-Admission"] = "duplicate_in_progress"
                 response.headers["X-Ask-Fingerprint"] = ask_request_fingerprint[:16]
                 response.headers["X-Ask-Contract"] = "single-node-process-local"
+                if warmup_probe:
+                    response.headers["X-Validation-Warmup-Execution"] = "duplicate_in_progress"
+                    response.headers["X-Validation-Warmup-Replay-Bypassed"] = (
+                        "true" if warmup_replay_bypassed else "false"
+                    )
                 return response
 
             if overload_meta is not None:
@@ -1802,6 +1976,11 @@ async def ask(
                 response.headers["Retry-After"] = str(overload_meta["retry_after_seconds"])
                 response.headers["X-Ask-Admission"] = "overloaded"
                 response.headers["X-Ask-Contract"] = "single-node-process-local"
+                if warmup_probe:
+                    response.headers["X-Validation-Warmup-Execution"] = "overloaded"
+                    response.headers["X-Validation-Warmup-Replay-Bypassed"] = (
+                        "true" if warmup_replay_bypassed else "false"
+                    )
                 return response
 
             app_metrics.record_ask_admission(outcome="accepted", stream=stream)
@@ -1827,9 +2006,12 @@ async def ask(
                         "reason": async_job_support.get("reason"),
                         "declared_workers": async_job_support.get("declared_workers"),
                         "hint": "Use non-async /ask or run single-worker topology for async_job.",
+                        "job_contract": _job_contract_payload(),
+                        "job_runtime_warning": _job_runtime_warning_payload(),
                     },
                 )
             from core.job_queue import enqueue_job
+            from core.job_queue import JobQueueBackpressureError
             # Exclude None fields for a cleaner payload
             payload = req.model_dump(exclude_none=True)
             # Override with processed values
@@ -1837,12 +2019,37 @@ async def ask(
             payload["destination"] = destination
             payload["date"] = effective_date
             payload["user_query"] = planner_user_query
-            job_id = await enqueue_job(payload)
-            return Response(
+            try:
+                job_id = await enqueue_job(payload, owner_principal_id=principal.principal_id)
+            except JobQueueBackpressureError as exc:
+                response = JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": "Async job admission is saturated. Please retry.",
+                        "error": "async_job_backpressure",
+                        "reason": exc.reason,
+                        "retry_after_seconds": exc.retry_after_seconds,
+                        "contract": "single_worker_required_process_local_queue",
+                        "job_contract": _job_contract_payload(),
+                        "job_runtime_warning": _job_runtime_warning_payload(),
+                        "result_status": "error",
+                    },
+                )
+                response.headers["Retry-After"] = str(exc.retry_after_seconds)
+                response.headers["X-Ask-Admission"] = "async_backpressure"
+                response.headers["X-Ask-Contract"] = "single-node-process-local"
+                _apply_job_runtime_headers(response)
+                return response
+            response = JSONResponse(
                 status_code=202,
-                content=json.dumps({"job_id": job_id}),
-                media_type="application/json"
+                content={
+                    "job_id": job_id,
+                    "job_contract": _job_contract_payload(),
+                    "job_runtime_warning": _job_runtime_warning_payload(),
+                },
             )
+            _apply_job_runtime_headers(response)
+            return response
 
         if stream:
             # Streaming branch: call planner with stream=True
@@ -2032,11 +2239,24 @@ async def ask(
             "status_code": response_status_code,
             "payload": encoded_payload,
         }
-        return JSONResponse(status_code=response_status_code, content=encoded_payload)
+        response = JSONResponse(status_code=response_status_code, content=encoded_payload)
+        if warmup_probe:
+            response.headers["X-Ask-Admission"] = response.headers.get("X-Ask-Admission") or "warmup_fresh"
+            response.headers["X-Validation-Warmup-Execution"] = "fresh_execution"
+            response.headers["X-Validation-Warmup-Replay-Bypassed"] = (
+                "true" if warmup_replay_bypassed else "false"
+            )
+        return response
 
     except asyncio.TimeoutError:
         logger.error(f"Request timed out after {GLOBAL_TIMEOUT} seconds")
-        raise HTTPException(status_code=504, detail="Request timed out")
+        return _ask_public_error_response(
+            status_code=504,
+            code="request_timeout",
+            message="Request timed out.",
+            failure_reason="upstream_timeout",
+            failure_domain=_failure_domain_for_reason("upstream_timeout"),
+        )
     except HTTPException:
         # Re-raise HTTPExceptions that we intentionally throw
         raise
@@ -2045,40 +2265,48 @@ async def ask(
         logger.exception("Airline API failure")
         text = str(e).lower()
         reason = "upstream_timeout" if ("timed out" in text or "timeout" in text) else "provider_failure"
-        return JSONResponse(
+        return _ask_public_error_response(
             status_code=502,
-            content={
-                "detail": str(e),
-                "failure_reason": reason,
-                "failure_domain": _failure_domain_for_reason(reason),
-                "result_status": "error",
-            },
+            code="upstream_provider_error",
+            message="Upstream provider request failed.",
+            failure_reason=reason,
+            failure_domain=_failure_domain_for_reason(reason),
         )
     except WeatherAPIError as e:
         # Upstream tool failed: 502 Bad Gateway is appropriate
         logger.exception("Weather API failure")
         text = str(e).lower()
         reason = "upstream_timeout" if ("timed out" in text or "timeout" in text) else "provider_failure"
-        return JSONResponse(
+        return _ask_public_error_response(
             status_code=502,
-            content={
-                "detail": str(e),
-                "failure_reason": reason,
-                "failure_domain": _failure_domain_for_reason(reason),
-                "result_status": "error",
-            },
+            code="upstream_provider_error",
+            message="Upstream provider request failed.",
+            failure_reason=reason,
+            failure_domain=_failure_domain_for_reason(reason),
         )
-    except ValueError as e:
+    except ValueError:
         # Defensive: bad data formatting inside planner
         logger.exception("Bad request data")
-        raise HTTPException(status_code=400, detail=str(e))
+        return _ask_public_error_response(
+            status_code=400,
+            code="invalid_request_payload",
+            message="Request payload is invalid.",
+            failure_reason="invalid_request_payload",
+            failure_domain=_failure_domain_for_reason("invalid_route"),
+        )
     except Exception:
         logger.exception("Unexpected error in /ask")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        return _ask_public_error_response(
+            status_code=500,
+            code="internal_server_error",
+            message="Internal server error.",
+            failure_reason="planner_error",
+            failure_domain=_failure_domain_for_reason("planner_error"),
+        )
     finally:
         if ask_slot_acquired and not stream_cleanup_owner:
             await _release_ask_inflight_key(ask_request_fingerprint)
-        if ask_slot_acquired and non_stream_completion_snapshot is not None:
+        if ask_slot_acquired and non_stream_completion_snapshot is not None and not warmup_probe:
             await _record_recent_ask_completion(
                 ask_request_fingerprint,
                 non_stream_completion_snapshot,
@@ -2086,12 +2314,43 @@ async def ask(
 
 
 @app.get("/booking/handoff/post/{artifact_id}", response_class=HTMLResponse)
-async def booking_post_handoff_bridge(artifact_id: str, request: Request):
+async def booking_post_handoff_bridge_get(artifact_id: str, request: Request):
+    """
+    Non-mutating landing endpoint for one-time booking handoff.
+    The artifact is consumed only via POST to preserve HTTP semantics.
+    """
+    accept_header = str(request.headers.get("accept") or "").lower()
+    browser_prefers_html = "text/html" in accept_header or "*/*" in accept_header
+    if not browser_prefers_html:
+        raise HTTPException(
+            status_code=405,
+            detail={
+                "error": "booking_handoff_post_required",
+                "message": "Use POST to consume booking handoff artifacts.",
+            },
+        )
+    escaped_artifact_id = html.escape(artifact_id, quote=True).replace("'", "&#x27;")
+    html_body = (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Continue to booking</title></head>"
+        "<body>"
+        "<p>Continue to securely submit your booking handoff.</p>"
+        f"<form id='handoff-consume' method='post' action='/booking/handoff/post/{escaped_artifact_id}'>"
+        "<button type='submit'>Continue to booking</button>"
+        "</form>"
+        "<script>document.getElementById('handoff-consume').submit();</script>"
+        "</body></html>"
+    )
+    return HTMLResponse(content=html_body, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/booking/handoff/post/{artifact_id}", response_class=HTMLResponse)
+async def booking_post_handoff_bridge_post(artifact_id: str, request: Request):
     """
     One-time bridge for provider-managed POST booking artifacts.
     Accepts only server-issued artifact ids (no open redirect/proxy behavior).
     """
-    from tools.booking_handoff import consume_post_handoff_artifact_with_diagnostics
+    from api.services_exceptions import get_consume_post_handoff_artifact
+    consume_post_handoff_artifact_with_diagnostics = get_consume_post_handoff_artifact()
 
     artifact, consume_meta = consume_post_handoff_artifact_with_diagnostics(artifact_id)
     accept_header = str(request.headers.get("accept") or "").lower()
@@ -2150,8 +2409,10 @@ async def booking_post_handoff_bridge(artifact_id: str, request: Request):
     hidden_inputs: list[str] = []
 
     def _append_input(name: str, value: str) -> None:
+        escaped_name = html.escape(name, quote=True).replace("'", "&#x27;")
+        escaped_value = html.escape(value, quote=True).replace("'", "&#x27;")
         hidden_inputs.append(
-            f'<input type="hidden" name="{html.escape(name, quote=True)}" value="{html.escape(value, quote=True)}" />'
+            f'<input type="hidden" name="{escaped_name}" value="{escaped_value}" />'
         )
 
     if isinstance(post_data, dict):
@@ -2166,14 +2427,23 @@ async def booking_post_handoff_bridge(artifact_id: str, request: Request):
     elif post_data is not None:
         _append_input("__payload", str(post_data))
 
+    escaped_action_url = html.escape(action_url, quote=True).replace("'", "&#x27;")
     html_body = (
-        "<!doctype html><html><head><meta charset='utf-8'><title>Redirecting to booking</title></head>"
-        "<body>"
-        "<p>Redirecting to booking provider...</p>"
-        f"<form id='handoff' method='post' action='{html.escape(action_url, quote=True)}'>"
+        "<!doctype html><html><head><meta charset='utf-8'><title>Redirecting to booking</title>"
+        "<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;"
+        "min-height:100vh;margin:0;background:#f9fafb;color:#111827}"
+        ".card{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center;"
+        "max-width:400px}.spinner{width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#3b82f6;"
+        "border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 1rem}"
+        "@keyframes spin{to{transform:rotate(360deg)}}</style></head>"
+        "<body><div class='card'><div class='spinner'></div>"
+        "<h2 style='margin:0 0 .5rem;font-size:1.1rem'>Opening booking provider</h2>"
+        "<p style='margin:0;color:#6b7280;font-size:.9rem'>Securely redirecting to complete your booking...</p>"
+        "</div>"
+        f"<form id='handoff' method='post' action='{escaped_action_url}' style='display:none'>"
         + "".join(hidden_inputs) +
         "</form>"
-        "<script>document.getElementById('handoff').submit();</script>"
+        "<script>setTimeout(function(){document.getElementById('handoff').submit()},300)</script>"
         "<noscript><button type='submit' form='handoff'>Continue to booking</button></noscript>"
         "</body></html>"
     )
@@ -2187,269 +2457,80 @@ async def booking_post_handoff_bridge(artifact_id: str, request: Request):
     )
 
 
-@app.post("/booking/hold")
-async def booking_hold(req: BookingHoldRequest):
-    """Create a HELD booking for the selected flight."""
-    from tools.booking_handoff import hold_booking
-
-    hold_minutes = req.hold_minutes or get_env_int("BOOKING_HOLD_MINUTES", 15)
-    try:
-        held = await hold_booking(
-            flight=req.flight,
-            origin=req.origin,
-            destination=req.destination,
-            depart_date=req.depart_date,
-            return_date=req.return_date,
-            passengers=req.passengers,
-            passenger=req.passenger,
-            hold_minutes=hold_minutes,
-        )
-    except Exception as exc:
-        logger.warning(
-            "booking_hold_creation_failed",
-            extra={"exception_type": type(exc).__name__},
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "booking_hold_failed",
-                "reason": "hold_creation_failed",
-                "message": "Could not create a local hold record for this selection.",
-            },
-        )
-    checkout_ready = bool((held or {}).get("checkout_ready"))
-    checkout_status = str((held or {}).get("checkout_status") or ("booking_ready" if checkout_ready else "provider_handoff_unavailable"))
-    hold_outcome = str((held or {}).get("hold_outcome") or ("held_with_checkout" if checkout_ready else "held_local_only"))
-    return {
-        "action": "hold_booking",
-        "success": True,
-        "hold_created": True,
-        "checkout_ready": checkout_ready,
-        "checkout_status": checkout_status,
-        "hold_outcome": hold_outcome,
-        "message": (
-            "Flight held successfully. Provider checkout link is ready."
-            if checkout_ready
-            else "Flight held locally, but provider checkout is currently unavailable."
-        ),
-        "booking": held,
-        "best_flight": req.flight,
-    }
+class PlanApprovalRequest(BaseModel):
+    approved: bool
 
 
-@app.post("/booking/track-price")
-async def booking_track_price(req: BookingTrackRequest):
-    """Create a HELD local record and enable price tracking for the selected flight."""
-    if not getattr(app.state, "price_tracker_enabled", False):
-        raise HTTPException(
-            status_code=503,
-            detail=_tracking_detail(
-                error="price_tracking_disabled",
-                reason="disabled_by_configuration",
-                message="Price tracking is disabled by configuration.",
-            ),
-        )
-    from tools.booking_handoff import hold_booking
-    from tools.booking_handoff import get_booking
-    from tools.booking_handoff import cancel_booking
-    from tools.price_tracker import record_price_snapshot
-
-    hold_minutes = req.hold_minutes or get_env_int("PRICE_TRACK_HOLD_MINUTES", 43200)
-    baseline_price = _coerce_price_inr(req.flight.get("price_inr"))
-    if baseline_price is None:
-        raise HTTPException(
-            status_code=422,
-            detail=_tracking_detail(
-                error="price_tracking_unsupported_selection",
-                reason="selected_flight_price_unavailable",
-                message="Price tracking requires a selected flight with a numeric fare.",
-            ),
-        )
-
-    held = await hold_booking(
-        flight=req.flight,
-        origin=req.origin,
-        destination=req.destination,
-        depart_date=req.depart_date,
-        return_date=req.return_date,
-        passengers=req.passengers,
-        passenger=req.passenger,
-        hold_minutes=hold_minutes,
-    )
-    booking_id_raw = held.get("id")
-    booking_id: Optional[int] = None
-    try:
-        if booking_id_raw is not None:
-            booking_id = int(booking_id_raw)
-    except Exception:
-        booking_id = None
-
-    persisted_booking = None
-    if booking_id is not None:
-        with contextlib.suppress(Exception):
-            persisted_booking = await asyncio.to_thread(get_booking, booking_id)
-
-    persisted_flight = (
-        persisted_booking.get("flight")
-        if isinstance(persisted_booking, dict) and isinstance(persisted_booking.get("flight"), dict)
-        else {}
-    )
-    tracking_missing_fields: list[str] = []
-    if not (persisted_flight.get("origin") or persisted_flight.get("departure_iata")):
-        tracking_missing_fields.append("origin")
-    if not (persisted_flight.get("destination") or persisted_flight.get("arrival_iata")):
-        tracking_missing_fields.append("destination")
-    if not persisted_flight.get("date"):
-        tracking_missing_fields.append("travel_date")
-    if _coerce_price_inr(persisted_flight.get("price_inr")) is None:
-        tracking_missing_fields.append("held_price")
-    if booking_id is None:
-        tracking_missing_fields.append("booking_id")
-    if not persisted_booking:
-        tracking_missing_fields.append("held_booking_record")
-
-    if tracking_missing_fields:
-        cancelled = False
-        if booking_id is not None:
-            try:
-                cancelled = bool(await asyncio.to_thread(cancel_booking, booking_id))
-            except Exception:
-                logger.exception("tracking_setup_cleanup_cancel_failed")
-        raise HTTPException(
-            status_code=503,
-            detail=_tracking_detail(
-                error="price_tracking_setup_failed",
-                reason="held_tracking_prerequisites_missing",
-                message="Price tracking setup failed because HELD booking prerequisites were incomplete.",
-                booking_id=booking_id,
-                missing_fields=tracking_missing_fields,
-                cleanup_cancelled=cancelled,
-            ),
-        )
-
-    try:
-        snapshot_id = record_price_snapshot(
-            origin=req.origin,
-            destination=req.destination,
-            travel_date=req.depart_date,
-            price_inr=baseline_price,
-        )
-        if not isinstance(snapshot_id, int) or snapshot_id <= 0:
-            raise RuntimeError("snapshot_persist_failed")
-    except Exception as exc:
-        booking_id = held.get("id")
-        cancelled = False
-        if booking_id is not None:
-            try:
-                cancelled = bool(await asyncio.to_thread(cancel_booking, int(booking_id)))
-            except Exception:
-                logger.exception("tracking_setup_cleanup_cancel_failed")
-        logger.warning(
-            "record_price_snapshot failed for tracking setup",
-            extra={
-                "booking_id": booking_id,
-                "exception_type": type(exc).__name__,
-                "cleanup_cancelled": cancelled,
-            },
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=_tracking_detail(
-                error="price_tracking_setup_failed",
-                reason="snapshot_persist_failed",
-                message="Price tracking setup failed before monitoring could start.",
-                booking_id=booking_id,
-                cleanup_cancelled=cancelled,
-            ),
-        )
-    return {
-        "action": "track_price",
-        "success": True,
-        "message": "Price tracking activated for this itinerary.",
-        "booking": held,
-        "best_flight": req.flight,
-        "monitoring_active": True,
-        "tracking_state": {
-            "booking_id": booking_id,
-            "baseline_snapshot_id": snapshot_id,
-            "route_tracking_ready": True,
-            "checkout_dependency": "not_required",
-        },
-    }
-
-
-@app.post("/booking/cancel")
-async def booking_cancel(req: BookingCancelRequest):
-    """Cancel a local booking follow-up record."""
-    from tools.booking_handoff import cancel_booking
-    ok = await asyncio.to_thread(cancel_booking, req.booking_id)
-    return {
-        "action": "cancel_booking",
-        "booking_id": req.booking_id,
-        "success": ok,
-        "message": "Booking cancelled." if ok else "Booking could not be cancelled.",
-    }
-
-
-@app.get("/bookings/{booking_id}")
-async def booking_get(booking_id: int):
-    from tools.booking_handoff import get_booking
-    booking = await asyncio.to_thread(get_booking, booking_id)
-    if booking is None:
-        raise HTTPException(status_code=404, detail="booking not found")
-    return booking
-
-
-@app.get("/bookings")
-async def booking_list(status: Optional[str] = None, limit: int = Query(100, ge=1, le=500)):
-    from tools.booking_handoff import list_bookings
-    bookings = await asyncio.to_thread(list_bookings, status, limit)
-    return {"count": len(bookings), "items": bookings}
-
-
-@app.get("/price-tracking/status")
-async def price_tracking_status():
-    status = getattr(app.state, "price_tracker_status", {}) or {}
-    return {
-        "enabled": bool(getattr(app.state, "price_tracker_enabled", False)),
-        "status": status,
-        "contract": _job_contract_payload(),
-    }
-
-
-@app.get("/price-tracking/alerts")
-async def price_tracking_alerts(booking_id: Optional[int] = None):
-    from tools.price_tracker import get_unacknowledged_alerts
-    alerts = await asyncio.to_thread(get_unacknowledged_alerts, booking_id)
-    return {"count": len(alerts), "items": alerts}
-
-
-@app.post("/price-tracking/alerts/{alert_id}/ack")
-async def price_tracking_ack(alert_id: int):
-    from tools.price_tracker import acknowledge_alert
-    ok = await asyncio.to_thread(acknowledge_alert, alert_id)
+@app.post("/plan/{plan_id}/approve")
+async def approve_plan(
+    plan_id: str,
+    req: PlanApprovalRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    """HITL approval gate — approve or reject a pending booking plan."""
+    from agents.planner_agent import _approval_store
+    ok = await _approval_store.set_decision(plan_id, req.approved)
     if not ok:
-        raise HTTPException(status_code=404, detail="alert not found")
-    return {"alert_id": alert_id, "acknowledged": True}
+        raise HTTPException(status_code=404, detail="No pending approval found for this plan_id.")
+    return {"plan_id": plan_id, "approved": req.approved, "principal_id": principal.principal_id}
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str):
-    """Retrieve the current status and result of a background job."""
+async def get_job(
+    job_id: str,
+    response: Response,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    """Retrieve current status/result of an in-memory, non-durable background job."""
     from core.job_queue import get_job
-    job = await get_job(job_id)
+    job = await get_job(job_id, owner_principal_id=principal.principal_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     payload = dict(job)
     payload.pop("event_seq", None)
+    payload.pop("owner_principal_id", None)
     payload["contract"] = _job_contract_payload()
+    payload["job_runtime_warning"] = _job_runtime_warning_payload()
+    _apply_job_runtime_headers(response)
     return payload
 
 
+@app.get("/jobs")
+async def list_jobs(
+    response: Response,
+    limit: int = Query(100, ge=1, le=500),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    """List background jobs for the caller (in-memory, non-durable runtime state)."""
+    from core.job_queue import list_jobs as list_jobs_impl
+
+    rows = await list_jobs_impl(owner_principal_id=principal.principal_id, limit=limit)
+    items: list[Dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        payload.pop("event_seq", None)
+        payload.pop("owner_principal_id", None)
+        payload["contract"] = _job_contract_payload()
+        payload["job_runtime_warning"] = _job_runtime_warning_payload()
+        items.append(payload)
+
+    _apply_job_runtime_headers(response)
+    return {
+        "count": len(items),
+        "items": items,
+        "contract": _job_contract_payload(),
+        "job_runtime_warning": _job_runtime_warning_payload(),
+    }
+
+
 @app.get("/jobs/{job_id}/events")
-async def job_events(request: Request, job_id: str):
+async def job_events(
+    request: Request,
+    job_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
     """SSE stream of events for a background job."""
-    queue = await job_queue.get_job_event_queue(job_id)
+    queue = await job_queue.get_job_event_queue(job_id, owner_principal_id=principal.principal_id)
     if queue is None:
         raise HTTPException(status_code=404, detail="job not found")
 
@@ -2489,21 +2570,31 @@ async def job_events(request: Request, job_id: str):
             if evt.get("event") in ("closed", "done", "error", "cancelled"):
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    response = StreamingResponse(event_stream(), media_type="text/event-stream")
+    _apply_job_runtime_headers(response)
+    return response
 
 
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
-    """Request cancellation for a queued or running job."""
-    result = await job_queue.request_cancel_job(job_id)
+async def cancel_job(
+    job_id: str,
+    response: Response,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    """Request cancellation for a queued/running in-memory, non-durable job."""
+    result = await job_queue.request_cancel_job(job_id, owner_principal_id=principal.principal_id)
     if result.get("status") == "not_found":
         raise HTTPException(status_code=404, detail="job not found")
     payload = dict(result)
-    job = payload.get("job") or {}
+    job = dict(payload.get("job") or {})
     if isinstance(job, dict):
         job.pop("event_seq", None)
+        job.pop("owner_principal_id", None)
         job["contract"] = _job_contract_payload()
+        job["job_runtime_warning"] = _job_runtime_warning_payload()
         payload["job"] = job
+    payload["job_runtime_warning"] = _job_runtime_warning_payload()
+    _apply_job_runtime_headers(response)
     return payload
 
 
@@ -2612,7 +2703,7 @@ def _sanitize_health_key_status(status_payload: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
-@app.get("/debug/keys", dependencies=[Depends(require_admin_token)])
+@app.get("/debug/keys", dependencies=[Depends(require_admin_access)])
 async def debug_keys():
     """Return masked keys and their status (active/exhausted until). Requires admin token."""
     try:
@@ -2631,7 +2722,7 @@ async def debug_keys():
         raise HTTPException(status_code=500, detail="key manager error")
 
 
-@app.post("/debug/keys/reload", dependencies=[Depends(require_admin_token)])
+@app.post("/debug/keys/reload", dependencies=[Depends(require_admin_access)])
 async def reload_keys_endpoint():
     """Force a reload of API keys from environment variables. Requires admin token."""
     try:
@@ -2642,7 +2733,7 @@ async def reload_keys_endpoint():
         raise HTTPException(status_code=500, detail="reload failed")
 
 
-@app.get("/debug/provider-state/overrides", dependencies=[Depends(require_admin_token)])
+@app.get("/debug/provider-state/overrides", dependencies=[Depends(require_admin_access)])
 async def debug_provider_state_overrides(
     provider: Optional[str] = Query(None),
     include_inactive: bool = Query(False),
@@ -2658,7 +2749,7 @@ async def debug_provider_state_overrides(
         raise HTTPException(status_code=500, detail="provider state override query failed")
 
 
-@app.post("/debug/provider-state/overrides", dependencies=[Depends(require_admin_token)])
+@app.post("/debug/provider-state/overrides", dependencies=[Depends(require_admin_access)])
 async def debug_provider_state_override_upsert(req: ProviderStateOverrideRequest):
     try:
         scope_identifier = req.scope_identifier
@@ -2684,7 +2775,7 @@ async def debug_provider_state_override_upsert(req: ProviderStateOverrideRequest
         raise HTTPException(status_code=500, detail="provider state override upsert failed")
 
 
-@app.post("/debug/provider-state/overrides/{override_id}/disable", dependencies=[Depends(require_admin_token)])
+@app.post("/debug/provider-state/overrides/{override_id}/disable", dependencies=[Depends(require_admin_access)])
 async def debug_provider_state_override_disable(override_id: int):
     try:
         disabled = await key_manager.disable_provider_state_override(override_id)
@@ -2698,7 +2789,7 @@ async def debug_provider_state_override_disable(override_id: int):
         raise HTTPException(status_code=500, detail="provider state override disable failed")
 
 
-@app.post("/debug/provider-state/reconcile/serpapi", dependencies=[Depends(require_admin_token)])
+@app.post("/debug/provider-state/reconcile/serpapi", dependencies=[Depends(require_admin_access)])
 async def debug_provider_state_reconcile_serpapi(
     key_name_fingerprints: Optional[list[str]] = None,
 ):
@@ -2726,14 +2817,14 @@ async def liveness():
 @app.get("/health/ready")
 async def readiness():
     """Kubernetes readiness probe."""
-    if not getattr(app.state, "startup_complete", False):
+    if not _get_startup_complete_state(app):
         health = {"status": "starting"}
         return Response(
             content=json.dumps(health),
             status_code=503,
             media_type="application/json"
         )
-    prewarm = getattr(app.state, "llm_prewarm", {}) or {}
+    prewarm = _get_llm_prewarm_state(app)
     return {
         "status": "ok",
         "llm_prewarm": {
@@ -2821,7 +2912,7 @@ async def health():
         return ("ok" if usable else "unavailable"), usable
 
     dependencies = {
-        "app": "ok" if getattr(app.state, "startup_complete", False) else "fail",
+        "app": "ok" if _get_startup_complete_state(app) else "fail",
         "key_manager": "fail",
         "database": "unavailable",
         "ollama": "not_relevant",
@@ -2834,10 +2925,10 @@ async def health():
         _check_ollama_availability_for_options(),
         _check_cloud_availability(),
     )
-    key_manager_status, key_manager_basis = key_manager_probe
+    key_manager_status, _key_manager_basis = key_manager_probe
     dependencies["key_manager"] = key_manager_status
     dependencies["database"] = database_status
-    cloud_dep_status, usable_cloud_providers = cloud_probe
+    cloud_dep_status, _usable_cloud_providers = cloud_probe
 
     llm_mode = get_llm_mode_default()
     primary_llm_backend = "ollama"
@@ -2846,7 +2937,6 @@ async def health():
     fallback_dependencies: list[str] = []
     required_unavailable: list[str] = []
     fallback_unavailable: list[str] = []
-    not_relevant_dependencies: list[str] = []
 
     ollama_status = "ok" if ollama_available else "unavailable"
 
@@ -2855,13 +2945,11 @@ async def health():
         required_dependencies = ["ollama"]
         dependencies["ollama"] = ollama_status
         dependencies["cloud"] = "not_relevant"
-        not_relevant_dependencies = ["cloud"]
     elif llm_mode == LLM_MODE_CLOUD_ONLY:
         primary_llm_backend = "cloud"
         required_dependencies = ["cloud"]
         dependencies["cloud"] = cloud_dep_status
         dependencies["ollama"] = "not_relevant"
-        not_relevant_dependencies = ["ollama"]
     elif llm_mode == LLM_MODE_CLOUD_FIRST:
         primary_llm_backend = "cloud"
         fallback_llm_backend = "ollama"
@@ -2904,10 +2992,9 @@ async def health():
     if key_manager_status != "ok" and status == "ok":
         status = "degraded"
 
-    prewarm = getattr(app.state, "llm_prewarm", {}) or {}
+    prewarm = _get_llm_prewarm_state(app)
     prewarm_enabled = bool(prewarm.get("enabled", False))
     prewarm_status = str(prewarm.get("status", "disabled"))
-    provider_runtime_status = get_provider_runtime_status()
     if (
         prewarm_enabled
         and primary_llm_backend == "ollama"
@@ -2917,46 +3004,22 @@ async def health():
         status = "degraded"
 
     async_job_support = _get_async_job_support_state(app)
-    refresh_owner = bool(getattr(app.state, "key_manager_refresh_owner", False))
     return {
         "status": status,
         "dependencies": dependencies,
-        "llm_mode": llm_mode,
-        "primary_llm_backend": primary_llm_backend,
-        "fallback_llm_backend": fallback_llm_backend,
-        "health_basis": {
-            "required_dependencies": required_dependencies,
-            "fallback_dependencies": fallback_dependencies,
-            "required_unavailable": required_unavailable,
-            "fallback_unavailable": fallback_unavailable,
-            "not_relevant_dependencies": not_relevant_dependencies,
-            "usable_cloud_providers": usable_cloud_providers,
-            "cloud_provider_runtime": provider_runtime_status,
-            "key_manager": key_manager_basis,
-            "llm_prewarm_enabled": prewarm_enabled,
-            "llm_prewarm_status": prewarm_status,
-        },
         "llm_prewarm": {
             "enabled": prewarm_enabled,
             "best_effort": bool(prewarm.get("best_effort", True)),
             "status": prewarm_status,
-            "model": prewarm.get("model"),
-            "attempts": int(prewarm.get("attempts", 0) or 0),
-            "last_error": prewarm.get("last_error"),
-            "last_updated": prewarm.get("last_updated"),
         },
         "external_dependency_checks": {
             "checked": False,
             "note": "Use /health/deep for external provider health (cloud, airline, weather).",
             "deep_endpoint": "/health/deep",
         },
-        "runtime_topology": {
-            "pid": os.getpid(),
-            "refresh_owner": refresh_owner,
-            "worker_role": _worker_runtime_role(refresh_owner),
-            "async_jobs_enabled": bool(async_job_support.get("enabled", True)),
-            "async_job_support": async_job_support,
-        },
+        "async_jobs_enabled": bool(async_job_support.get("enabled", True)),
+        "async_job_contract": _job_contract_payload(),
+        "async_job_runtime_warning": _job_runtime_warning_payload(),
     }
 
 
@@ -3062,7 +3125,11 @@ def _effective_timeout_snapshot() -> dict:
     }
 
 
-@app.get("/llm/options")
+@app.get(
+    "/llm/options",
+    response_model=LLMOptionsResponseContract,
+    dependencies=[Depends(require_admin_diagnostic_access)],
+)
 async def llm_options():
     refresh_provider_chain_from_env(force=False)
     runtime_status = get_provider_runtime_status()
@@ -3139,7 +3206,7 @@ async def llm_options():
     }
 
 
-@app.get("/health/deep")
+@app.get("/health/deep", dependencies=[Depends(require_admin_diagnostic_access)])
 async def health_deep():
     """Deep health check (includes external API checks)."""
     logger.debug("deep health check (external APIs)")
@@ -3153,20 +3220,20 @@ async def health_deep():
     return result
 
 
-@app.get("/health/keys")
+@app.get("/health/keys", dependencies=[Depends(require_admin_diagnostic_access)])
 async def health_keys():
     """Return high-level key status (public, no detailed operational metadata)."""
     status = await key_manager.get_status()
     return _sanitize_health_key_status(status)
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_admin_diagnostic_access)])
 async def metrics():
     """Prometheus metrics endpoint."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/version")
+@app.get("/version", response_model=VersionResponseContract)
 async def version():
     """
     Return version information to help debug deployment consistency.

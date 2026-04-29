@@ -4,6 +4,16 @@ type Props = {
   finalJson: TripPlan | null;
   isStreaming: boolean;
   reasoningSteps?: string[];
+  approvalRequired?: {
+    planId: string;
+    action: string;
+    message: string;
+  } | null;
+  approvalResult?: {
+    approved: boolean;
+    planId: string;
+  } | null;
+  onApprove?: (approved: boolean) => void;
 };
 
 function extractReasoning(finalJson: TripPlan | null): string[] {
@@ -62,7 +72,14 @@ function normalizeLiveReasoning(step: string): string {
   return "Route ranking is balancing travel time, stop count, and fare so the final pick stays practical.";
 }
 
-export default function AIReasoningPanel({ finalJson, isStreaming, reasoningSteps = [] }: Props) {
+export default function AIReasoningPanel({
+  finalJson,
+  isStreaming,
+  reasoningSteps = [],
+  approvalRequired,
+  approvalResult,
+  onApprove,
+}: Props) {
   const finalReasoning = extractReasoning(finalJson);
   const visibleReasoning = finalReasoning.length > 0
     ? finalReasoning
@@ -73,7 +90,34 @@ export default function AIReasoningPanel({ finalJson, isStreaming, reasoningStep
     <div className="reasoning-panel" data-testid="reasoning-panel">
       <h3 className="reasoning-title">Selection evidence</h3>
 
-      {visibleReasoning.length > 0 ? (
+      {approvalRequired && onApprove ? (
+        <div className="approval-gate" data-testid="approval-gate">
+          <p className="approval-gate__message">Waiting for your approval...</p>
+          <p className="approval-gate__detail">{approvalRequired.message}</p>
+          <div className="approval-gate__actions">
+            <button
+              className="approval-gate__btn approval-gate__btn--approve"
+              onClick={() => onApprove(true)}
+              data-testid="approve-btn"
+            >
+              Approve
+            </button>
+            <button
+              className="approval-gate__btn approval-gate__btn--reject"
+              onClick={() => onApprove(false)}
+              data-testid="reject-btn"
+            >
+              Reject
+            </button>
+          </div>
+        </div>
+      ) : approvalResult ? (
+        <div className="approval-result" data-testid="approval-result">
+          <p className={`approval-result__status ${approvalResult.approved ? "approved" : "rejected"}`}>
+            {approvalResult.approved ? "Approved \u2014 continuing" : "Rejected \u2014 plan cancelled"}
+          </p>
+        </div>
+      ) : visibleReasoning.length > 0 ? (
         <ol className="reasoning-list">
           {visibleReasoning.map((step, index) => (
             <li
@@ -98,7 +142,7 @@ export default function AIReasoningPanel({ finalJson, isStreaming, reasoningStep
         </div>
       )}
 
-      {showFooter ? (
+      {showFooter && !approvalRequired && !approvalResult ? (
         <div className="reasoning-foot">
           {isStreaming ? "Evaluating top route trade-offs..." : "Reasoning updates appear as soon as results start."}
         </div>

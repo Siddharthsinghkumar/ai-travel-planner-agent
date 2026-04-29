@@ -1,5 +1,14 @@
-import { useEffect, useRef, useState } from "react";
-import { API_BASE, getJson, postJson } from "./lib/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  API_BASE,
+  BOOKING_AUTH_TOKEN_CHANGED_EVENT,
+  clearConfiguredAuthToken,
+  getConfiguredAuthToken,
+  getJson,
+  postJson,
+  resolveApiUrl,
+  setConfiguredAuthToken,
+} from "./lib/api";
 import { useStreamingPlan } from "./hooks/useStreamingPlan";
 import { useAsyncJob } from "./hooks/useAsyncJob";
 
@@ -28,6 +37,9 @@ import type {
   LLMOptionsResponse,
   ServerVersionMeta,
   BookingActionResponse,
+  BookingHandoffCapabilities,
+  BookingResolveHandoffResponse,
+  BookingResolveState,
   BookingRecord,
   PriceAlert,
   PriceTrackingStatus,
@@ -37,6 +49,32 @@ import { formatFlightSummaryLine, formatPriceINR, formatTemperatureC } from "./l
 type ThemePreference = "system" | "dark" | "light";
 
 const THEME_STORAGE_KEY = "travelyst_theme_preference";
+let devLlmOptionsBootstrapPromise: Promise<LLMOptionsResponse | null> | null = null;
+let devServerVersionBootstrapPromise: Promise<ServerVersionMeta | null> | null = null;
+
+async function fetchDevLlmOptionsOnce(): Promise<LLMOptionsResponse | null> {
+  if (!devLlmOptionsBootstrapPromise) {
+    devLlmOptionsBootstrapPromise = fetch(`${API_BASE}/llm/options`, { cache: "no-store" })
+      .then(async (resp) => (resp.ok ? ((await resp.json()) as LLMOptionsResponse) : null))
+      .catch((err) => {
+        devLlmOptionsBootstrapPromise = null;
+        throw err;
+      });
+  }
+  return devLlmOptionsBootstrapPromise;
+}
+
+async function fetchServerVersionOnce(): Promise<ServerVersionMeta | null> {
+  if (!devServerVersionBootstrapPromise) {
+    devServerVersionBootstrapPromise = fetch(`${API_BASE}/version`, { cache: "no-store" })
+      .then(async (resp) => (resp.ok ? ((await resp.json()) as ServerVersionMeta) : null))
+      .catch((err) => {
+        devServerVersionBootstrapPromise = null;
+        throw err;
+      });
+  }
+  return devServerVersionBootstrapPromise;
+}
 
 function readThemePreference(): ThemePreference {
   if (typeof window === "undefined") return "system";
@@ -180,6 +218,67 @@ function buildMultiCityNarrative(legs: MultiCityLeg[]): string {
   return `Multi-city itinerary\n\n${sections.join("\n\n")}`;
 }
 
+function describeBookingMode(
+  {
+    capabilities,
+    hasBookingAuth,
+    bookingAuthMode,
+  }: {
+    capabilities: BookingHandoffCapabilities | null;
+    hasBookingAuth: boolean;
+    bookingAuthMode: "authenticated_token" | "local_dev_unauthed" | null;
+  }
+): string {
+  if (capabilities?.auth_rejected) {
+    if (capabilities.resolve_available_now && capabilities.auth_mode === "local_dev_unauthed") {
+      return "Booking mode: configured bearer token was rejected; local-dev unauthenticated loopback mode is active.";
+    }
+    return "Booking mode: configured bearer token was rejected by backend auth.";
+  }
+  if (capabilities?.blocked_reason === "missing_token") {
+    return "Booking mode: no bearer token configured.";
+  }
+  if (capabilities?.blocked_reason === "loopback_required_for_local_dev") {
+    return "Booking mode: local-dev unauthenticated mode is enabled, but this request is not loopback-eligible.";
+  }
+  if (capabilities?.auth_mode === "local_dev_unauthed") {
+    return "Booking mode: local-dev unauthenticated handoff resolution is active (loopback only).";
+  }
+  if (capabilities?.auth_mode === "authenticated_token") {
+    return "Booking mode: authenticated bearer token is active.";
+  }
+  if (capabilities?.auth_mode === "auth_required") {
+    return capabilities.message || "Booking mode: authentication is required for lazy handoff resolution.";
+  }
+  if (bookingAuthMode === "local_dev_unauthed") {
+    return "Booking mode: local-dev unauthenticated handoff resolution (loopback only).";
+  }
+  if (hasBookingAuth || bookingAuthMode === "authenticated_token") {
+    return "Booking mode: authenticated bearer token.";
+  }
+  return "Booking mode: no auth token detected. Lazy Book requires auth unless backend local-dev override is enabled.";
+}
+
+function isInvalidAuthErrorMessage(message: string): boolean {
+  const lowered = String(message || "").toLowerCase();
+  return lowered.includes("invalid authentication token") || lowered.includes("invalid authorization header");
+}
+
+function bookingFlightIdentity(flight: Flight): string {
+  // Deliberately excludes booking_token: token is absent in partial (streaming) flights
+  // but present in final flights. Using token in the key would produce different keys for
+  // the same flight as it transitions from partial→final, losing any in-progress resolve state.
+  // The booking_token is still included in the API request payload for backend coalescing.
+  return [
+    String(flight.flight_no || "").trim(),
+    String(flight.airline || "").trim(),
+    String(flight.departure_time || "").trim(),
+    String(flight.arrival_time || "").trim(),
+    String(flight.price_inr ?? "").trim(),
+    String(flight.date || "").trim(),
+  ].join("|");
+}
+
 export default function App() {
   const [serverStatus, setServerStatus] = useState<"checking" | "online" | "offline">("checking");
   const [lastPayload, setLastPayload] = useState<AskPayload | null>(null);
@@ -194,6 +293,10 @@ export default function App() {
   const [bookingItems, setBookingItems] = useState<BookingRecord[]>([]);
   const [bookingActionMessage, setBookingActionMessage] = useState<string | null>(null);
   const [bookingActionError, setBookingActionError] = useState<string | null>(null);
+  const [bookingAuthMode, setBookingAuthMode] = useState<"authenticated_token" | "local_dev_unauthed" | null>(null);
+  const [bookingAuthToken, setBookingAuthToken] = useState<string>(() => getConfiguredAuthToken());
+  const [bookingHandoffCapabilities, setBookingHandoffCapabilities] = useState<BookingHandoffCapabilities | null>(null);
+  const [bookingResolveStateByRow, setBookingResolveStateByRow] = useState<Record<string, BookingResolveState>>({});
   const [priceAlerts, setPriceAlerts] = useState<PriceAlert[]>([]);
   const [priceAlertError, setPriceAlertError] = useState<string | null>(null);
   const [priceTrackingStatus, setPriceTrackingStatus] = useState<PriceTrackingStatus | null>(null);
@@ -204,7 +307,11 @@ export default function App() {
     return resolveTheme(readThemePreference(), window.matchMedia("(prefers-color-scheme: dark)").matches);
   });
   const autoScrolledRef = useRef(false);
+  const bookingResolveInflightRef = useRef<Map<string, Promise<BookingResolveHandoffResponse>>>(new Map());
+  const healthPollInFlightRef = useRef(false);
   const liveRegionRef = useRef<HTMLElement | null>(null);
+  const resultsSectionRef = useRef<HTMLElement | null>(null);
+  const resultsAutoScrollVersionRef = useRef(-1);
   const [recentQueries, setRecentQueries] = useState<string[]>(() => {
     if (typeof window === "undefined") return [];
     const saved = localStorage.getItem("recent_queries");
@@ -216,11 +323,13 @@ export default function App() {
       return [];
     }
   });
+  const [showAllInventory, setShowAllInventory] = useState(false);
 
   const {
     tokens,
     finalJson: streamFinalJson,
     partialFlights,
+    partialTopFlights,
     partialBestFlight,
     partialWeather,
     reasoningSteps,
@@ -231,7 +340,10 @@ export default function App() {
     rawStream,
     start,
     cancel,
-    reset
+    reset,
+    approvalRequired,
+    approvalResult,
+    respondToApproval,
   } = useStreamingPlan();
   const asyncJob = useAsyncJob();
   const isDevMode = (() => {
@@ -282,21 +394,44 @@ export default function App() {
   }, [themePreference]);
 
   useEffect(() => {
+    let cancelled = false;
+    let activeController: AbortController | null = null;
+
     const checkServer = () => {
-      fetch(`${API_BASE}/health`)
+      if (cancelled || healthPollInFlightRef.current) return;
+      const controller = new AbortController();
+      activeController = controller;
+      healthPollInFlightRef.current = true;
+
+      fetch(`${API_BASE}/health`, { signal: controller.signal, cache: "no-store" })
         .then(async (res) => {
+          if (cancelled) return;
           const payload = await res.json().catch(() => null);
           if (payload && typeof payload === "object") {
             setHealthSnapshot(payload as Record<string, unknown>);
           }
           setServerStatus(res.ok ? "online" : "offline");
         })
-        .catch(() => setServerStatus("offline"));
+        .catch(() => {
+          if (!cancelled) setServerStatus("offline");
+        })
+        .finally(() => {
+          if (activeController === controller) {
+            activeController = null;
+          }
+          healthPollInFlightRef.current = false;
+        });
     };
 
     checkServer();
     const intervalId = setInterval(checkServer, 5000);
-    return () => clearInterval(intervalId);
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+      activeController?.abort();
+      activeController = null;
+      healthPollInFlightRef.current = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -310,10 +445,8 @@ export default function App() {
 
     const fetchLlmOptions = async () => {
       try {
-        const resp = await fetch(`${API_BASE}/llm/options`);
-        if (!resp.ok) return;
-        const data = (await resp.json()) as LLMOptionsResponse;
-        if (!cancelled) {
+        const data = await fetchDevLlmOptionsOnce();
+        if (!cancelled && data) {
           setLlmOptions(data);
         }
       } catch {
@@ -335,10 +468,8 @@ export default function App() {
     let cancelled = false;
     const fetchVersion = async () => {
       try {
-        const resp = await fetch(`${API_BASE}/version`);
-        if (!resp.ok) return;
-        const data = (await resp.json()) as ServerVersionMeta;
-        if (!cancelled) setServerVersion(data);
+        const data = await fetchServerVersionOnce();
+        if (!cancelled && data) setServerVersion(data);
       } catch {
         // Keep empty on failure.
       }
@@ -364,7 +495,7 @@ export default function App() {
           : ["gemini"];
     const effectiveProvider = llmOptions.effective_default_provider || llmOptions.defaults?.cloud_provider;
     if (effectiveProvider && providerChoices.includes(effectiveProvider)) {
-      setDevCloudProvider(effectiveProvider);
+      setDevCloudProvider((prev) => (providerChoices.includes(prev) ? prev : effectiveProvider));
     } else if (!providerChoices.includes(devCloudProvider)) {
       setDevCloudProvider(providerChoices[0]);
     }
@@ -384,40 +515,18 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [isDevMode]);
 
-  useEffect(() => {
-    const targets = document.querySelectorAll(".reveal");
-    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (prefersReducedMotion) {
-      targets.forEach((target) => target.classList.add("visible"));
-      return;
-    }
-
-    targets.forEach((target, index) => {
-      const revealDelay = `${Math.min(index, 8) * 60}ms`;
-      (target as HTMLElement).style.setProperty("--reveal-delay", revealDelay);
-    });
-
-    const io = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            entry.target.classList.add("visible");
-            io.unobserve(entry.target);
-          }
-        });
-      },
-      { threshold: 0.16 }
-    );
-
-    targets.forEach((target) => io.observe(target));
-    return () => io.disconnect();
-  }, []);
-
   function handleSubmit(payload: AskPayload) {
     setLastPayload(payload);
     autoScrolledRef.current = false;
     setBookingActionMessage(null);
     setBookingActionError(null);
+    setBookingAuthMode(null);
+    setBookingResolveStateByRow({});
+    bookingResolveInflightRef.current.clear();
+    setShowAllInventory(false);
+    setBookingItems([]);
+    setPriceAlerts([]);
+    void refreshBookingHandoffCapabilities();
     if (asyncMode) {
       reset();
       asyncJob.clearJob();
@@ -430,17 +539,56 @@ export default function App() {
 
   const debugInfo = (finalJson?.debug_info ?? null) as TripPlan["debug_info"];
   const routeSummary = buildRouteSummary(debugInfo, lastPayload);
+  const finalTopFlightsFromDebug = Array.isArray(debugInfo?.top_flights) ? (debugInfo.top_flights as Flight[]) : undefined;
+  const finalTopFlights = finalTopFlightsFromDebug || (Array.isArray(finalJson?.top_flights) ? finalJson.top_flights : undefined);
+  const rankedShortlist = Array.isArray(finalTopFlights) && finalTopFlights.length > 0 ? finalTopFlights : undefined;
   const finalFlightsFromDebug = Array.isArray(debugInfo?.all_flights) ? (debugInfo.all_flights as Flight[]) : undefined;
   const finalFlights = finalFlightsFromDebug || (Array.isArray(finalJson?.all_flights) ? finalJson.all_flights : undefined);
+  const inventoryFlights = Array.isArray(finalFlights) && finalFlights.length > 0 ? finalFlights : undefined;
+  const partialRankedShortlist =
+    Array.isArray(partialTopFlights) && partialTopFlights.length > 0 ? partialTopFlights : undefined;
   const multiCityLegs = Array.isArray(finalJson?.legs) ? (finalJson.legs as MultiCityLeg[]) : [];
   const isMultiCity = Boolean(finalJson?.multicity) || multiCityLegs.length > 0;
   const multiCityFlights = multiCityLegs
     .map((leg) => leg.best_flight)
     .filter((flight): flight is Flight => Boolean(flight));
-  const flights = finalFlights || (isMultiCity ? multiCityFlights : undefined) || partialFlights || undefined;
+  const flights =
+    showAllInventory && inventoryFlights
+      ? inventoryFlights
+      : rankedShortlist ||
+        inventoryFlights ||
+        (isMultiCity ? multiCityFlights : undefined) ||
+        partialRankedShortlist ||
+        partialFlights ||
+        undefined;
   const bestFlight = finalJson?.best_flight || (isMultiCity ? multiCityFlights[0] : undefined) || partialBestFlight || undefined;
   const hasFlights = Array.isArray(flights) && flights.length > 0;
   const flightsCount = Array.isArray(flights) ? flights.length : 0;
+  const hasRankedShortlist = Boolean(rankedShortlist && rankedShortlist.length > 0);
+  const flightCountsFromDebug = (debugInfo?.flight_counts ?? finalJson?.flight_counts ?? null) as Record<string, number> | null;
+  const rawProviderCount = typeof flightCountsFromDebug?.raw_provider === "number" ? flightCountsFromDebug.raw_provider : 0;
+  const postFilterCount = typeof flightCountsFromDebug?.post_filter === "number" ? flightCountsFromDebug.post_filter : 0;
+  const truthfulInventoryCount = rawProviderCount > 0
+    ? rawProviderCount
+    : postFilterCount > 0
+      ? postFilterCount
+      : (Array.isArray(inventoryFlights) ? inventoryFlights.length : flightsCount);
+  const inventoryCount = truthfulInventoryCount;
+  const isStreamingOrPending = isStreaming || isFallback || ["queued", "running"].includes(String(asyncJob.status));
+  const isStreamingPhase = isStreamingOrPending && !finalJson;
+  const shortlistCountLabel = hasFlights
+    ? isStreamingOrPending
+      ? `Loading flights from provider... ${flightsCount} so far.`
+      : hasRankedShortlist
+        ? flightsCount < inventoryCount
+          ? `Showing top ${flightsCount} ranked flight${flightsCount === 1 ? "" : "s"} of ${inventoryCount} from provider.`
+          : `Showing all ${flightsCount} ranked flight${flightsCount === 1 ? "" : "s"} from provider.`
+        : flightsCount < inventoryCount
+          ? `Showing ${flightsCount} flight${flightsCount === 1 ? "" : "s"} of ${inventoryCount} from provider.`
+          : `Showing all ${flightsCount} ranked flight${flightsCount === 1 ? "" : "s"} from provider.`
+    : isStreamingOrPending
+      ? "Searching provider inventory..."
+      : "Ranked shortlist appears once flight inventory is available.";
   const finalRecord = (finalJson ?? null) as Record<string, unknown> | null;
   const reasoningFromDebug = stringifyReasoningCandidate(
     debugInfo?.agent_reasoning ??
@@ -469,6 +617,12 @@ export default function App() {
   const weatherData = finalWeatherData || partialWeather;
   const returnTrip = finalJson?.return_trip || null;
   const returnTripFlight = returnTrip?.best_flight;
+  const returnTripDepartDate =
+    typeof returnTrip?.search_date === "string" && returnTrip.search_date.trim().length > 0
+      ? returnTrip.search_date
+      : typeof debugInfo?.intent?.return_date === "string"
+        ? debugInfo.intent.return_date
+        : "";
   const returnTripWeather = returnTrip?.weather && typeof returnTrip.weather === "object" ? returnTrip.weather : null;
   const returnTripWarnings = Array.isArray(returnTrip?.warnings) ? returnTrip.warnings.filter(Boolean) : [];
   const resultWarnings = Array.isArray(finalJson?.warnings) ? finalJson.warnings.filter(Boolean) : [];
@@ -487,6 +641,47 @@ export default function App() {
         ? weatherData.location_label
         : undefined;
   const intentRecord = (debugInfo?.intent ?? {}) as Record<string, unknown>;
+  type BookingRouteContext = {
+    origin: string;
+    destination: string;
+    depart_date: string;
+    return_date?: string;
+  };
+  const buildBookingResolveRowKey = (flight: Flight, routeContext?: BookingRouteContext) => {
+    const contextOrigin = (routeContext?.origin || actionOrigin || "").trim().toUpperCase();
+    const contextDestination = (routeContext?.destination || actionDestination || "").trim().toUpperCase();
+    const contextDepartDate = (routeContext?.depart_date || actionDepartDate || "").trim();
+    const contextReturnDate = (routeContext?.return_date || actionReturnDate || "").trim();
+    return [
+      contextOrigin,
+      contextDestination,
+      contextDepartDate,
+      contextReturnDate,
+      bookingFlightIdentity(flight),
+    ].join("::");
+  };
+  const isResolveFailureRetryable = ({
+    blockedReason,
+    blockedCategory,
+    retryableFlag,
+  }: {
+    blockedReason?: string | null;
+    blockedCategory?: string | null;
+    retryableFlag?: boolean | null;
+  }): boolean => {
+    // Backend retryable flag is authoritative when present.
+    if (typeof retryableFlag === "boolean") return retryableFlag;
+    // Fallback heuristics only when backend didn't classify.
+    const category = String(blockedCategory || "").trim().toLowerCase();
+    const reason = String(blockedReason || "").trim().toLowerCase();
+    if (category === "allowlist_policy") return false;
+    if (reason === "booking_token_missing") return false;
+    if (reason === "provider_domain_not_allowlisted") return false;
+    return true;
+  };
+  const upsertBookingResolveState = (rowKey: string, next: BookingResolveState) => {
+    setBookingResolveStateByRow((prev) => ({ ...prev, [rowKey]: next }));
+  };
   const actionOrigin =
     toIata(intentRecord.origin_iata) ||
     toIata(routeLabels.origin_iata) ||
@@ -503,9 +698,137 @@ export default function App() {
         : lastPayload?.date || "";
   const actionReturnDate =
     typeof intentRecord.return_date === "string" ? intentRecord.return_date : undefined;
+  const canActionRouteContext = Boolean(actionOrigin && actionDestination && actionDepartDate);
+  const returnRouteContext: BookingRouteContext | null =
+    actionDestination && actionOrigin && returnTripDepartDate
+      ? {
+          origin: actionDestination,
+          destination: actionOrigin,
+          depart_date: returnTripDepartDate,
+        }
+      : null;
+  const returnTripHasDirectHandoff = Boolean(
+    typeof returnTripFlight?.handoff_url === "string" && returnTripFlight.handoff_url.trim().length > 0
+  );
+  const returnTripHasBookingToken = Boolean(
+    typeof returnTripFlight?.booking_token === "string" && returnTripFlight.booking_token.trim().length > 0
+  );
   const isBusy = isStreaming || isFallback || asyncJobActive;
-  const canAction = Boolean(actionOrigin && actionDestination && actionDepartDate);
+  const activeBookingToken = bookingAuthToken.trim();
+  const hasBookingAuth = activeBookingToken.length > 0;
+  const capabilityResolveAvailable = Boolean(bookingHandoffCapabilities?.resolve_available_now);
+  const capabilityMissingTokenWhileConfigured = Boolean(
+    hasBookingAuth &&
+      bookingHandoffCapabilities?.blocked_reason === "missing_token" &&
+      !bookingHandoffCapabilities?.auth_rejected
+  );
+  const canResolveHandoffNow =
+    capabilityResolveAvailable || capabilityMissingTokenWhileConfigured || (!bookingHandoffCapabilities && hasBookingAuth);
+  const canBookingActions = canActionRouteContext && hasBookingAuth;
+  const bookingResolveBlockedReason = (() => {
+    if (!canActionRouteContext) {
+      return "Booking handoff requires route/date context for this selection.";
+    }
+    if (canResolveHandoffNow) {
+      return null;
+    }
+    if (bookingHandoffCapabilities?.blocked_reason === "invalid_token") {
+      return "Configured token was rejected by backend auth. Update it to match AUTH_TOKEN / AUTH_BEARER_TOKENS.";
+    }
+    if (bookingHandoffCapabilities?.blocked_reason === "missing_token") {
+      return "No bearer token was provided for booking handoff resolution. Set the same backend bearer token used by curl.";
+    }
+    return (
+      bookingHandoffCapabilities?.message ||
+      "Authentication required for booking handoff resolution. Configure a bearer token, or enable local-dev unauthenticated mode explicitly."
+    );
+  })();
+  const returnTripResolveBlockedReason = !returnRouteContext
+    ? "Missing return-leg route/date context for booking resolution."
+    : canResolveHandoffNow
+      ? null
+      : bookingHandoffCapabilities?.message ||
+        "Authentication required for return-leg booking handoff resolution.";
+  const returnTripCanResolveOnClick = Boolean(
+    returnTripFlight &&
+      !returnTripHasDirectHandoff &&
+      returnTripHasBookingToken &&
+      returnRouteContext &&
+      canResolveHandoffNow
+  );
+  const returnTripBookingHint = returnTripHasDirectHandoff
+    ? "Return leg provider handoff is ready."
+    : returnTripCanResolveOnClick
+      ? "Return handoff is deferred and can be resolved on click."
+      : returnTripHasBookingToken
+        ? returnTripResolveBlockedReason || "Return handoff can be attempted on demand."
+        : "Return booking handoff is unavailable for this row.";
+  const outboundRouteContext: BookingRouteContext | undefined = canActionRouteContext
+    ? {
+        origin: actionOrigin,
+        destination: actionDestination,
+        depart_date: actionDepartDate,
+        return_date: actionReturnDate,
+      }
+    : undefined;
+  const hydratedFlightsForUi = useMemo(() => {
+    if (!Array.isArray(flights) || flights.length === 0) return flights;
+    return flights.map((flight) => {
+      const rowKey = buildBookingResolveRowKey(flight, outboundRouteContext);
+      const rowState = bookingResolveStateByRow[rowKey];
+      if (!rowState) return flight;
+      if (rowState.status === "resolved" && rowState.handoff_url) {
+        return {
+          ...flight,
+          handoff_url: rowState.handoff_url,
+          booking_handoff: {
+            ...(flight.booking_handoff || {}),
+            status: "booking_ready",
+            booking_exit_quality: "booking_ready",
+            reason: "resolved_booking_handoff_row_state",
+            source: "booking_handoff_resolve",
+          },
+        } as Flight;
+      }
+      if (rowState.status === "failed") {
+        return {
+          ...flight,
+          booking_handoff: {
+            ...(flight.booking_handoff || {}),
+            status: "unavailable",
+            booking_exit_quality: "unavailable",
+            reason: rowState.blocked_reason || "booking_handoff_unavailable",
+          },
+        } as Flight;
+      }
+      return flight;
+    });
+  }, [flights, bookingResolveStateByRow, outboundRouteContext]);
+  const bookingActionDisabledHint = hasBookingAuth
+    ? null
+    : "Hold/Track actions require API auth. Set the same backend bearer token used by curl (or configure VITE_AUTH_TOKEN).";
+  const bookingCapabilityBlockedReason = bookingHandoffCapabilities?.blocked_reason || null;
+  const showBookingTokenSetupActions = Boolean(
+    !canResolveHandoffNow &&
+      (
+        bookingCapabilityBlockedReason === "missing_token" ||
+        bookingCapabilityBlockedReason === "invalid_token" ||
+        (!bookingHandoffCapabilities && !hasBookingAuth)
+      )
+  );
+  const bookingTokenSetupHint =
+    bookingCapabilityBlockedReason === "invalid_token"
+      ? "Configured token was rejected by backend auth. Update it to match AUTH_TOKEN / AUTH_BEARER_TOKENS."
+      : hasBookingAuth && bookingCapabilityBlockedReason === "missing_token"
+        ? "A booking token is stored in the browser, but backend still reports missing Authorization. Re-save token and retry."
+      : "Set the same backend bearer token used by curl to enable browser Book requests.";
   const actionDisabled = isBookingActionBusy || isBusy;
+  const bookingModeText = describeBookingMode({
+    capabilities: bookingHandoffCapabilities,
+    hasBookingAuth,
+    bookingAuthMode,
+  });
+  const getFlightRowKey = (flight: Flight) => buildBookingResolveRowKey(flight, outboundRouteContext);
 
   const upsertBooking = (booking: BookingRecord) => {
     setBookingItems((prev) => {
@@ -537,6 +860,54 @@ export default function App() {
     };
   };
 
+  // Scope booking items to the current query route so historical holds from
+  // different routes/dates don't clutter the panel (#4/#5/#10/#6/#7).
+  const currentRouteBookingItems = useMemo(() => {
+    if (!actionOrigin && !actionDestination && !actionDepartDate) return bookingItems;
+    let items = bookingItems.filter((booking) => {
+      const f = booking.flight && typeof booking.flight === "object" ? (booking.flight as Record<string, unknown>) : {};
+      const bOrigin = toIata(f.origin);
+      const bDest = toIata(f.destination);
+      const bDate = typeof f.date === "string" ? f.date.trim() : "";
+      // If booking has no route info at all, keep it (legacy).
+      if (!bOrigin && !bDest && !bDate) return true;
+      const routeMatch =
+        (!actionOrigin || bOrigin === actionOrigin) &&
+        (!actionDestination || bDest === actionDestination);
+      // If we have a depart date context, also require date match to exclude
+      // historical HELD records from previous searches on the same route.
+      const dateMatch = !actionDepartDate || !bDate || bDate === actionDepartDate;
+      return routeMatch && dateMatch;
+    });
+    // Deduplicate: keep only the newest HELD record per flight identity
+    // (airline + flight_no + date).  Older duplicates are hidden.
+    const seen = new Map<string, BookingRecord>();
+    for (const b of items) {
+      const f = b.flight && typeof b.flight === "object" ? (b.flight as Record<string, unknown>) : {};
+      const key = `${toText(f.airline)}::${toText(f.flight_no)}::${toText(f.date)}`;
+      const existing = seen.get(key);
+      if (!existing || b.id > existing.id) {
+        seen.set(key, b);
+      }
+    }
+    return Array.from(seen.values());
+  }, [bookingItems, actionOrigin, actionDestination, actionDepartDate]);
+
+  // Similarly scope price alerts to the current route AND date.
+  const currentRoutePriceAlerts = useMemo(() => {
+    if (!actionOrigin && !actionDestination && !actionDepartDate) return priceAlerts;
+    return priceAlerts.filter((alert) => {
+      const aOrigin = toIata(alert.origin);
+      const aDest = toIata(alert.destination);
+      const aDate = typeof alert.travel_date === "string" ? alert.travel_date.trim() : "";
+      const routeMatch =
+        (!actionOrigin || aOrigin === actionOrigin) &&
+        (!actionDestination || aDest === actionDestination);
+      const dateMatch = !actionDepartDate || !aDate || aDate === actionDepartDate;
+      return routeMatch && dateMatch;
+    });
+  }, [priceAlerts, actionOrigin, actionDestination, actionDepartDate]);
+
   const buildBookingActionPayload = (flight: Flight) => {
     if (!actionOrigin || !actionDestination || !actionDepartDate) {
       return null;
@@ -556,16 +927,418 @@ export default function App() {
     };
   };
 
-  const refreshBookings = async () => {
+  const buildBookingResolvePayload = (flight: Flight, routeContext?: BookingRouteContext) => {
+    const effectiveOrigin = routeContext?.origin || actionOrigin;
+    const effectiveDestination = routeContext?.destination || actionDestination;
+    const effectiveDepartDate = routeContext?.depart_date || actionDepartDate;
+    const effectiveReturnDate = routeContext?.return_date ?? actionReturnDate;
+    if (!effectiveOrigin || !effectiveDestination || !effectiveDepartDate) {
+      return null;
+    }
+    return {
+      flight,
+      origin: effectiveOrigin,
+      destination: effectiveDestination,
+      depart_date: effectiveDepartDate,
+      return_date: effectiveReturnDate,
+      passengers: 1,
+    };
+  };
+  const bookingAuthTokenForRequests = hasBookingAuth ? activeBookingToken : undefined;
+
+  const resolveBookingForFlight = async (
+    flight: Flight,
+    routeContext?: BookingRouteContext
+  ): Promise<BookingResolveHandoffResponse> => {
+    const rowKey = buildBookingResolveRowKey(flight, routeContext);
+
+    // Fast path: if the flight already has a resolved handoff_url from the
+    // streaming response, skip the API call entirely and return the existing URL.
+    const existingHandoffUrl = typeof flight.handoff_url === "string" ? flight.handoff_url.trim() : "";
+    const existingMeta = flight.booking_handoff as Record<string, unknown> | undefined;
+    const existingStatus = String(existingMeta?.status || "").toLowerCase();
+    if (existingHandoffUrl && existingStatus === "booking_ready") {
+      const normalizedUrl = resolveApiUrl(existingHandoffUrl);
+      upsertBookingResolveState(rowKey, {
+        status: "resolved",
+        message: "Provider handoff URL already available from search results.",
+        handoff_url: normalizedUrl,
+        blocked_reason: null,
+        blocked_category: null,
+        retryable: false,
+        updated_at: Date.now(),
+      });
+      return {
+        action: "resolve_booking_handoff",
+        success: true,
+        handoff_url: normalizedUrl,
+        booking_handoff: existingMeta || {},
+        blocked_reason: null,
+        blocked_category: null,
+        retryable: false,
+        message: "Provider handoff URL already available from search results.",
+        auth_mode: bookingAuthMode || "authenticated_token",
+        auth_required: false,
+        owner_principal_id: null,
+        best_flight: flight,
+      };
+    }
+
+    const payload = buildBookingResolvePayload(flight, routeContext);
+    if (!payload) {
+      upsertBookingResolveState(rowKey, {
+        status: "failed",
+        message: "Missing route or date context — resubmit with a specific origin, destination, and date.",
+        blocked_reason: "missing_route_context",
+        blocked_category: "provider_unavailable",
+        retryable: false,
+        updated_at: Date.now(),
+      });
+      throw new Error("Missing route/date context required to resolve booking handoff.");
+    }
+    const existingInflight = bookingResolveInflightRef.current.get(rowKey);
+    if (existingInflight) {
+      return existingInflight;
+    }
+    setBookingActionError(null);
+    setBookingActionMessage(null);
+    upsertBookingResolveState(rowKey, {
+      status: "resolving",
+      message: "Resolving provider handoff for this row...",
+      retryable: true,
+      updated_at: Date.now(),
+    });
+    let resolveFailureClassified = false;
+    const runResolve = async () => {
+      let data: BookingResolveHandoffResponse;
+      const capabilityAuthMode = bookingHandoffCapabilities?.resolve_auth_mode === "omit" ? "omit" : "auto";
+      try {
+        data = await postJson<BookingResolveHandoffResponse>("/booking/handoff/resolve", payload, {
+          authMode: capabilityAuthMode,
+          authToken: bookingAuthTokenForRequests,
+          timeoutMs: 18000,
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Booking handoff request failed.";
+        let shouldRetryUnauthed = false;
+        if (isInvalidAuthErrorMessage(message)) {
+          shouldRetryUnauthed = Boolean(
+            bookingHandoffCapabilities?.local_dev_unauth_available ||
+              bookingHandoffCapabilities?.auth_mode === "local_dev_unauthed"
+          );
+          if (!shouldRetryUnauthed) {
+            try {
+              const fallbackCapabilities = await getJson<BookingHandoffCapabilities>(
+                `/booking/handoff/capabilities?ts=${Date.now()}`,
+                {
+                  authMode: "omit",
+                  cache: "no-store",
+                  timeoutMs: 8000,
+                }
+              );
+              setBookingHandoffCapabilities(fallbackCapabilities);
+              if (
+                fallbackCapabilities?.auth_mode === "authenticated_token" ||
+                fallbackCapabilities?.auth_mode === "local_dev_unauthed"
+              ) {
+                setBookingAuthMode(fallbackCapabilities.auth_mode);
+              }
+              shouldRetryUnauthed = Boolean(
+                fallbackCapabilities?.resolve_available_now &&
+                  (
+                    fallbackCapabilities?.auth_mode === "local_dev_unauthed" ||
+                    fallbackCapabilities?.resolve_auth_mode === "omit"
+                  )
+              );
+            } catch {
+              shouldRetryUnauthed = false;
+            }
+          }
+        }
+        if (!shouldRetryUnauthed) {
+          const lowered = message.toLowerCase();
+          const timedOut = lowered.includes("abort") || lowered.includes("timeout");
+          upsertBookingResolveState(rowKey, {
+            status: "failed",
+            message: timedOut
+              ? "Booking resolve timed out. Retry this row."
+              : message || "Booking handoff request failed.",
+            blocked_reason: timedOut ? "resolve_request_timeout" : "resolve_request_failed",
+            blocked_category: timedOut ? "request_exception" : "provider_unavailable",
+            retryable: true,
+            updated_at: Date.now(),
+          });
+          resolveFailureClassified = true;
+          throw err;
+        }
+        data = await postJson<BookingResolveHandoffResponse>("/booking/handoff/resolve", payload, {
+          authMode: "omit",
+          authToken: bookingAuthTokenForRequests,
+          timeoutMs: 18000,
+        });
+      }
+      const authMode = data?.auth_mode;
+      if (authMode === "authenticated_token" || authMode === "local_dev_unauthed") {
+        setBookingAuthMode(authMode);
+      }
+      if (!data?.success || !data?.handoff_url) {
+        const blockedReason = typeof data?.blocked_reason === "string" ? data.blocked_reason.trim() : "";
+        const blockedCategory = typeof data?.blocked_category === "string" ? data.blocked_category.trim() : "";
+        const retryable = isResolveFailureRetryable({
+          blockedReason,
+          blockedCategory,
+          retryableFlag: data?.retryable,
+        });
+        const fallbackMessage =
+          blockedReason === "booking_token_missing"
+            ? "This flight row has no provider booking token."
+            : "Provider handoff is unavailable for this itinerary.";
+        const message = data?.message || fallbackMessage;
+        upsertBookingResolveState(rowKey, {
+          status: "failed",
+          message,
+          blocked_reason: blockedReason || "booking_handoff_unavailable",
+          blocked_category: blockedCategory || "provider_unavailable",
+          retryable,
+          updated_at: Date.now(),
+        });
+        resolveFailureClassified = true;
+        throw new Error(message);
+      }
+      const normalizedHandoffUrl = resolveApiUrl(data.handoff_url);
+      upsertBookingResolveState(rowKey, {
+        status: "resolved",
+        message: data.message || "Provider handoff resolved.",
+        handoff_url: normalizedHandoffUrl,
+        blocked_reason: null,
+        blocked_category: null,
+        retryable: false,
+        updated_at: Date.now(),
+      });
+      setBookingActionMessage(data.message || "Provider handoff resolved.");
+      // Sync: patch any matching held record in local state so the booking panel shows
+      // the resolved checkout link without needing a manual Refresh click.
+      setBookingItems((prev) =>
+        prev.map((item) => {
+          if (item.handoff_url) return item; // already has a URL — don't overwrite
+          const itemFlight = item.flight as (Flight & Record<string, unknown>) | undefined;
+          if (!itemFlight) return item;
+          const itemIdentity = bookingFlightIdentity(itemFlight as Flight);
+          const resolvedIdentity = bookingFlightIdentity(flight);
+          if (itemIdentity !== resolvedIdentity) return item;
+          return {
+            ...item,
+            handoff_url: normalizedHandoffUrl,
+            checkout_ready: true,
+            checkout_status: "booking_ready",
+          };
+        })
+      );
+      return { ...data, handoff_url: normalizedHandoffUrl };
+    };
+    const resolvePromise = runResolve().finally(() => {
+      bookingResolveInflightRef.current.delete(rowKey);
+    });
+    bookingResolveInflightRef.current.set(rowKey, resolvePromise);
     try {
-      const data = await getJson<{ items: BookingRecord[] }>(`/bookings?limit=50`);
-      setBookingItems(data.items || []);
+      return await resolvePromise;
+    } catch (err) {
+      if (!resolveFailureClassified) {
+        upsertBookingResolveState(rowKey, {
+          status: "failed",
+          message: err instanceof Error ? err.message : "Booking handoff failed.",
+          blocked_reason: "booking_handoff_failed",
+          blocked_category: "provider_unavailable",
+          retryable: true,
+          updated_at: Date.now(),
+        });
+      }
+      throw err;
+    }
+  };
+
+  const openResolvedHandoffInNewTab = async (
+    resolveFn: () => Promise<BookingResolveHandoffResponse>,
+    fallbackError: string
+  ) => {
+    const pendingTab = window.open("about:blank", "_blank");
+    const renderPendingTab = (title: string, html: string) => {
+      if (!pendingTab || pendingTab.closed) return;
+      try {
+        pendingTab.opener = null;
+        pendingTab.document.title = title;
+        pendingTab.document.body.innerHTML = html;
+      } catch {
+        // Ignore browser-specific rendering restrictions.
+      }
+    };
+    if (pendingTab) {
+      renderPendingTab(
+        "Resolving booking handoff",
+        '<main style="font-family: ui-sans-serif, system-ui, sans-serif; padding: 24px; color: #1f2937;">' +
+          '<h2 style="margin: 0 0 8px 0; font-size: 18px;">Resolving booking handoff</h2>' +
+          '<p style="margin: 0;">Fetching a secure checkout URL from the provider. This tab will redirect automatically when ready.</p>' +
+        "</main>"
+      );
+    }
+    try {
+      const resolved = await resolveFn();
+      const handoffUrl = typeof resolved?.handoff_url === "string" ? resolved.handoff_url.trim() : "";
+      if (!handoffUrl) {
+        throw new Error(resolved?.message || fallbackError);
+      }
+      const resolvedUrl = resolveApiUrl(handoffUrl);
+      if (pendingTab && !pendingTab.closed) {
+        pendingTab.location.replace(resolvedUrl);
+      } else {
+        window.location.assign(resolvedUrl);
+      }
+    } catch (err) {
+      // Close the pending tab on failure so the user doesn't need to dismiss it manually.
+      // The caller sets bookingActionError inline with the error message.
+      try { pendingTab?.close(); } catch { /* ignore */ }
+      throw err;
+    }
+  };
+
+  const refreshBookingHandoffCapabilities = async (tokenOverride?: string) => {
+    const requestToken =
+      typeof tokenOverride === "string" ? tokenOverride.trim() : bookingAuthTokenForRequests;
+    const capabilitiesPath = `/booking/handoff/capabilities?ts=${Date.now()}`;
+    try {
+      const data = await getJson<BookingHandoffCapabilities>(capabilitiesPath, {
+        authToken: requestToken,
+        cache: "no-store",
+      });
+      setBookingHandoffCapabilities(data);
+      if (data?.auth_mode === "authenticated_token" || data?.auth_mode === "local_dev_unauthed") {
+        setBookingAuthMode(data.auth_mode);
+      } else {
+        setBookingAuthMode(null);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unable to load booking handoff capabilities.";
+      if (isInvalidAuthErrorMessage(message)) {
+        try {
+          const fallbackData = await getJson<BookingHandoffCapabilities>(capabilitiesPath, {
+            authMode: "omit",
+            cache: "no-store",
+          });
+          setBookingHandoffCapabilities(fallbackData);
+          if (fallbackData?.auth_mode === "authenticated_token" || fallbackData?.auth_mode === "local_dev_unauthed") {
+            setBookingAuthMode(fallbackData.auth_mode);
+          } else {
+            setBookingAuthMode(null);
+          }
+          return;
+        } catch {
+          // fall back to explicit blocked state below
+        }
+        setBookingHandoffCapabilities({
+          action: "booking_handoff_capabilities",
+          resolve_available_now: false,
+          auth_mode: "auth_required",
+          resolve_auth_mode: "auto",
+          auth_required: true,
+          has_valid_token: false,
+          token_present: Boolean(requestToken),
+          auth_rejected: true,
+          auth_error: "invalid_token",
+          blocked_reason: "invalid_token",
+          local_dev_unauth_configured: false,
+          local_dev_unauth_enabled: false,
+          loopback_request: false,
+          loopback_eligible: false,
+          local_dev_unauth_available: false,
+          message,
+        });
+        return;
+      }
+      setBookingHandoffCapabilities(null);
+    }
+  };
+
+  const synchronizeBookingAuthToken = () => {
+    setBookingAuthToken(getConfiguredAuthToken());
+  };
+
+  const configureBookingAuthToken = async () => {
+    if (typeof window === "undefined") return;
+    const currentToken = getConfiguredAuthToken();
+    const provided = window.prompt(
+      "Paste the backend bearer token used by curl (token value only, no \"Bearer\" prefix).",
+      currentToken
+    );
+    if (provided === null) return;
+    const normalized = setConfiguredAuthToken(provided);
+    setBookingAuthToken(normalized);
+    setBookingActionError(null);
+    setBookingActionMessage(
+      normalized
+        ? "Booking auth token saved in browser storage for lazy Book requests."
+        : "Booking auth token cleared from browser storage."
+    );
+    await refreshBookingHandoffCapabilities(normalized);
+  };
+
+  const removeBookingAuthToken = async () => {
+    clearConfiguredAuthToken();
+    setBookingAuthToken("");
+    setBookingActionError(null);
+    setBookingActionMessage("Booking auth token cleared from browser storage.");
+    await refreshBookingHandoffCapabilities("");
+  };
+
+  const refreshBookings = async () => {
+    if (!hasBookingAuth) {
+      setBookingItems([]);
+      setBookingActionError(null);
+      return;
+    }
+    try {
+      const data = await getJson<{ items: BookingRecord[] }>(`/bookings?limit=50`, {
+        authToken: bookingAuthTokenForRequests,
+      });
+      const items = data.items || [];
+      setBookingItems(items);
+      // Sync: if any held record has a persisted handoff_url, propagate it back into
+      // the shortlist resolve state so the flight card "Book now" link stays in sync.
+      if (outboundRouteContext && Array.isArray(flights) && flights.length > 0) {
+        for (const booking of items) {
+          if (!booking.handoff_url || booking.status !== "HELD") continue;
+          const bookingFlight = booking.flight as (Flight & Record<string, unknown>) | undefined;
+          if (!bookingFlight) continue;
+          const identity = bookingFlightIdentity(bookingFlight as Flight);
+          for (const flight of flights) {
+            if (bookingFlightIdentity(flight) === identity) {
+              const rowKey = buildBookingResolveRowKey(flight, outboundRouteContext);
+              const current = bookingResolveStateByRow[rowKey];
+              if (!current || (current.status !== "resolved" && current.status !== "resolving")) {
+                upsertBookingResolveState(rowKey, {
+                  status: "resolved",
+                  message: "Provider handoff resolved (from held record).",
+                  handoff_url: booking.handoff_url,
+                  blocked_reason: null,
+                  blocked_category: null,
+                  retryable: false,
+                  updated_at: Date.now(),
+                });
+              }
+              break;
+            }
+          }
+        }
+      }
     } catch (err: unknown) {
       setBookingActionError(err instanceof Error ? err.message : "Failed to refresh bookings");
     }
   };
 
   const handleHoldFlight = async (flight: Flight) => {
+    if (!hasBookingAuth) {
+      setBookingActionError("Booking actions require API auth token.");
+      return;
+    }
     const payload = buildBookingActionPayload(flight);
     if (!payload) {
       setBookingActionError("Missing route/date for booking action.");
@@ -575,9 +1348,26 @@ export default function App() {
     setBookingActionError(null);
     setBookingActionMessage(null);
     try {
-      const data = await postJson<BookingActionResponse>("/booking/hold", payload);
+      const data = await postJson<BookingActionResponse>("/booking/hold", payload, {
+        authToken: bookingAuthTokenForRequests,
+      });
       if (data?.booking) upsertBooking(data.booking);
       setBookingActionMessage(data?.message || "Flight held successfully.");
+      // Sync: if hold resolved a handoff URL, update the shortlist row state so the card
+      // immediately shows a "Book now" link instead of the deferred resolve button.
+      const holdHandoffUrl = typeof data?.booking?.handoff_url === "string" ? data.booking.handoff_url.trim() : "";
+      if (holdHandoffUrl && outboundRouteContext) {
+        const rowKey = buildBookingResolveRowKey(flight, outboundRouteContext);
+        upsertBookingResolveState(rowKey, {
+          status: "resolved",
+          message: data?.message || "Provider handoff resolved during hold.",
+          handoff_url: resolveApiUrl(holdHandoffUrl),
+          blocked_reason: null,
+          blocked_category: null,
+          retryable: false,
+          updated_at: Date.now(),
+        });
+      }
     } catch (err: unknown) {
       setBookingActionError(err instanceof Error ? err.message : "Hold request failed");
     } finally {
@@ -586,6 +1376,10 @@ export default function App() {
   };
 
   const handleTrackFlight = async (flight: Flight) => {
+    if (!hasBookingAuth) {
+      setBookingActionError("Booking actions require API auth token.");
+      return;
+    }
     const payload = buildBookingActionPayload(flight);
     if (!payload) {
       setBookingActionError("Missing route/date for tracking.");
@@ -595,7 +1389,9 @@ export default function App() {
     setBookingActionError(null);
     setBookingActionMessage(null);
     try {
-      const data = await postJson<BookingActionResponse>("/booking/track-price", payload);
+      const data = await postJson<BookingActionResponse>("/booking/track-price", payload, {
+        authToken: bookingAuthTokenForRequests,
+      });
       if (data?.booking) upsertBooking(data.booking);
       setBookingActionMessage(data?.message || "Price tracking activated.");
     } catch (err: unknown) {
@@ -610,7 +1406,11 @@ export default function App() {
     setBookingActionError(null);
     setBookingActionMessage(null);
     try {
-      const data = await postJson<BookingActionResponse>("/booking/cancel", { booking_id: bookingId });
+      const data = await postJson<BookingActionResponse>(
+        "/booking/cancel",
+        { booking_id: bookingId },
+        { authToken: bookingAuthTokenForRequests }
+      );
       setBookingActionMessage(data?.message || "Booking cancelled.");
       setBookingItems((prev) =>
         prev.map((item) => (item.id === bookingId ? { ...item, status: data.success ? "CANCELLED" : item.status } : item))
@@ -623,8 +1423,15 @@ export default function App() {
   };
 
   const refreshAlerts = async () => {
+    if (!hasBookingAuth) {
+      setPriceAlerts([]);
+      setPriceAlertError(null);
+      return;
+    }
     try {
-      const data = await getJson<{ items: PriceAlert[] }>("/price-tracking/alerts");
+      const data = await getJson<{ items: PriceAlert[] }>("/price-tracking/alerts", {
+        authToken: bookingAuthTokenForRequests,
+      });
       setPriceAlerts(data.items || []);
       setPriceAlertError(null);
     } catch (err: unknown) {
@@ -633,8 +1440,13 @@ export default function App() {
   };
 
   const acknowledgeAlert = async (alertId: number) => {
+    if (!hasBookingAuth) return;
     try {
-      await postJson<{ acknowledged: boolean }>(`/price-tracking/alerts/${alertId}/ack`, {});
+      await postJson<{ acknowledged: boolean }>(
+        `/price-tracking/alerts/${alertId}/ack`,
+        {},
+        { authToken: bookingAuthTokenForRequests }
+      );
       setPriceAlerts((prev) => prev.filter((item) => item.alert_id !== alertId));
     } catch (err: unknown) {
       setPriceAlertError(err instanceof Error ? err.message : "Failed to acknowledge alert");
@@ -642,19 +1454,77 @@ export default function App() {
   };
 
   useEffect(() => {
-    getJson<PriceTrackingStatus>("/price-tracking/status")
-      .then((data) => setPriceTrackingStatus(data))
-      .catch(() => setPriceTrackingStatus(null));
-  }, []);
-  useEffect(() => {
-    refreshBookings();
+    if (typeof window === "undefined") return;
+    const watchedKeys = new Set(["travelyst_auth_token", "AUTH_TOKEN", "auth_token"]);
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage) return;
+      if (event.key && !watchedKeys.has(event.key)) return;
+      synchronizeBookingAuthToken();
+    };
+    const onTokenChanged = () => {
+      synchronizeBookingAuthToken();
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(BOOKING_AUTH_TOKEN_CHANGED_EVENT, onTokenChanged);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(BOOKING_AUTH_TOKEN_CHANGED_EVENT, onTokenChanged);
+    };
   }, []);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshBookingHandoffCapabilities is an inline function that changes every render; we intentionally fire on token/status changes only.
   useEffect(() => {
-    if (priceTrackingStatus?.enabled) {
+    let cancelled = false;
+    const loadCapabilities = async () => {
+      if (cancelled) return;
+      await refreshBookingHandoffCapabilities();
+    };
+    loadCapabilities();
+    return () => {
+      cancelled = true;
+    };
+  }, [bookingAuthToken, serverStatus]);
+
+  useEffect(() => {
+    if (!hasBookingAuth) {
+      setPriceTrackingStatus(null);
+      return;
+    }
+    let cancelled = false;
+    getJson<PriceTrackingStatus>("/price-tracking/status", {
+      authToken: bookingAuthTokenForRequests,
+    })
+      .then((data) => { if (!cancelled) setPriceTrackingStatus(data); })
+      .catch(() => { if (!cancelled) setPriceTrackingStatus(null); });
+    return () => { cancelled = true; };
+  }, [bookingAuthToken, bookingAuthTokenForRequests, hasBookingAuth]);
+  useEffect(() => {
+    if (!hasBookingAuth) {
+      setBookingItems([]);
+      setBookingActionError(null);
+      return;
+    }
+    void refreshBookings();
+  }, [bookingAuthToken]);
+
+  // Auto-sync HELD record URLs back to shortlist when streaming/job finishes and flights settle.
+  const flightsSettledRef = useRef(false);
+  useEffect(() => {
+    if (isBusy) {
+      flightsSettledRef.current = false;
+      return;
+    }
+    if (hasFlights && hasBookingAuth && !flightsSettledRef.current) {
+      flightsSettledRef.current = true;
+      refreshBookings();
+    }
+  }, [isBusy, hasFlights, hasBookingAuth]);
+
+  useEffect(() => {
+    if (hasBookingAuth && priceTrackingStatus?.enabled) {
       refreshAlerts();
     }
-  }, [priceTrackingStatus?.enabled]);
+  }, [hasBookingAuth, priceTrackingStatus?.enabled]);
   const streamPaneTokens = isMultiCity && multiCityNarrative.trim().length > 0 ? "" : tokens;
   const hasTokenContent = streamPaneTokens.length > 0;
   const hasReasoningContent =
@@ -694,11 +1564,12 @@ export default function App() {
         .filter(Boolean)
         .join(" · ")
     : "Weather updates appear once results load.";
+  const bestFlightHasPrice = typeof bestFlight?.price_inr === "number" && bestFlight.price_inr > 0;
   const highlights = bestFlight
     ? [
         {
           title: "Best Flight",
-          text: `${bestFlight.airline} ${bestFlight.flight_no} · ${bestFlight.departure_time} → ${bestFlight.arrival_time} · ${formatPriceINR(bestFlight.price_inr)}`
+          text: `${bestFlight.airline} ${bestFlight.flight_no} · ${bestFlight.departure_time} → ${bestFlight.arrival_time}${bestFlightHasPrice ? ` · ${formatPriceINR(bestFlight.price_inr)}` : ""}`
         },
         {
           title: "Destination Weather",
@@ -728,12 +1599,17 @@ export default function App() {
   const isDegradedResult = resultStatus === "degraded";
   const noFlightsFailure =
     responseMeta?.failure_reason === "no_flights" || responseMeta?.no_flights_reason === "no_flights";
+  const failureDomain = responseMeta?.failure_domain || finalJson?.failure_domain;
+  const isProviderLimited = failureDomain === "upstream_provider" || failureDomain === "search_outcome";
+  const isAppBroken = failureDomain === "internal_backend";
   const degradedSummary =
     finalJson?.fallback_note ||
     finalJson?.degradation?.message ||
     responseMeta?.fallback_note ||
     responseMeta?.degradation_message ||
-    "Some explanation details are unavailable right now, but the trip data shown is still usable.";
+    (isProviderLimited
+      ? "The provider could not complete this search, but any results shown are still usable."
+      : "Some explanation details are unavailable right now, but the trip data shown is still usable.");
   const bestFlightHasHandoff = Boolean(
     typeof bestFlight?.handoff_url === "string" && bestFlight.handoff_url.trim().length > 0
   );
@@ -771,14 +1647,21 @@ export default function App() {
         ? "Needs retry"
         : hasFlights
           ? "Decision-ready"
-          : isBusy
-            ? "Analyzing"
-            : "Awaiting query";
+          : isStreamingPhase
+            ? "Gathering evidence"
+            : isBusy
+              ? "Analyzing"
+              : "Awaiting query";
   const showProofSurface = Boolean(lastPayload || isBusy || hasFlights || finalJson || activeError);
+  const resultsFirstMode = showProofSurface;
+  const showExperienceNarrative = !resultsFirstMode;
+  const showSearchEnhancers = !resultsFirstMode;
   const showBookingPanel =
-    bookingItems.length > 0 || Boolean(bookingActionMessage) || Boolean(bookingActionError) || isBookingActionBusy;
+    hasBookingAuth &&
+    (currentRouteBookingItems.length > 0 || Boolean(bookingActionMessage) || Boolean(bookingActionError) || isBookingActionBusy);
   const showAlertsPanel =
-    priceAlerts.length > 0 || Boolean(priceAlertError) || Boolean(priceTrackingStatus);
+    hasBookingAuth &&
+    (currentRoutePriceAlerts.length > 0 || Boolean(priceAlertError) || Boolean(priceTrackingStatus));
   const trackingMeta = (priceTrackingStatus?.status ?? {}) as Record<string, unknown>;
   const trackingLastCompleted =
     typeof trackingMeta.last_completed_at === "string" ? trackingMeta.last_completed_at : "";
@@ -854,10 +1737,53 @@ export default function App() {
         : "Light";
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const targets = Array.from(document.querySelectorAll<HTMLElement>(".reveal"));
+    if (!targets.length) return;
+
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (prefersReducedMotion) {
+      targets.forEach((target) => target.classList.add("visible"));
+      return;
+    }
+
+    targets.forEach((target, index) => {
+      const revealDelay = `${Math.min(index, 8) * 60}ms`;
+      target.style.setProperty("--reveal-delay", revealDelay);
+    });
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("visible");
+            io.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.16 }
+    );
+
+    targets.forEach((target) => {
+      if (target.classList.contains("visible")) return;
+      io.observe(target);
+    });
+    return () => io.disconnect();
+  }, [resultVersion, showExperienceNarrative, showProofSurface]);
+
+  useEffect(() => {
     if (!isBusy && !activeError && finalJson) {
       setResultVersion((v) => v + 1);
     }
   }, [finalJson, isBusy, activeError]);
+
+  useEffect(() => {
+    if (!showProofSurface || isBusy || !hasFlights) return;
+    if (typeof window === "undefined") return;
+    if (resultsAutoScrollVersionRef.current === resultVersion) return;
+    resultsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    resultsAutoScrollVersionRef.current = resultVersion;
+  }, [hasFlights, isBusy, resultVersion, showProofSurface]);
 
   useEffect(() => {
     if (!isBusy || !hasLiveUpdate || autoScrolledRef.current) return;
@@ -915,29 +1841,52 @@ export default function App() {
 
         <main className="app-main">
           <div className="experience-shell">
-          <section id="planner" className="hero experience-section experience-section--hero">
-            <div className="hero-intro reveal">
+          <section
+            id="planner"
+            className={[
+              "hero",
+              "experience-section",
+              "experience-section--hero",
+              resultsFirstMode ? "hero--results-mode" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            <div className={["hero-intro", "reveal", resultsFirstMode ? "hero-intro--compact" : ""].filter(Boolean).join(" ")}>
               <div className="hero-badge">
                 <span className="badge-dot" aria-hidden="true" />
-                {heroBadgeText}
+                {resultsFirstMode ? "Refine and book" : heroBadgeText}
               </div>
-              <h1 className="hero-title">
-                <span className="title-line-1">Plan your next journey</span>
-                <span className="title-line-2">with premium AI travel guidance.</span>
+              <h1 className={["hero-title", resultsFirstMode ? "hero-title--compact" : ""].filter(Boolean).join(" ")}>
+                {resultsFirstMode ? (
+                  <>
+                    <span className="title-line-1">Your ranked flights are ready.</span>
+                    <span className="title-line-2">Pick an option and open provider checkout.</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="title-line-1">Plan your next journey</span>
+                    <span className="title-line-2">with premium AI travel guidance.</span>
+                  </>
+                )}
               </h1>
-              <p className="hero-sub">
-                Describe the trip in natural language and get ranked flights, weather-aware guidance, and booking-ready options in one polished decision flow.
+              <p className={["hero-sub", resultsFirstMode ? "hero-sub--compact" : ""].filter(Boolean).join(" ")}>
+                {resultsFirstMode
+                  ? "The ranked shortlist is the primary surface below. Rows show immediate handoff, lazy resolve-on-click when enabled for this mode, or an explicit blocked/unavailable state."
+                  : "Describe the trip in natural language and get ranked flights, weather-aware guidance, and booking-ready options in one polished decision flow."}
               </p>
-              <div className="hero-trust-row" aria-label="Trust indicators">
-                {heroTrustSignals.map((signal) => (
-                  <span key={signal} className="hero-trust-pill">{signal}</span>
-                ))}
-              </div>
+              {!resultsFirstMode && (
+                <div className="hero-trust-row" aria-label="Trust indicators">
+                  {heroTrustSignals.map((signal) => (
+                    <span key={signal} className="hero-trust-pill">{signal}</span>
+                  ))}
+                </div>
+              )}
             </div>
 
             <section className="hero-grid">
               <div className="hero-left">
-                <div className="search-card">
+                <div className={["search-card", resultsFirstMode ? "search-card--compact" : ""].filter(Boolean).join(" ")}>
                   <QueryForm
                     onSubmit={handleSubmit}
                     disabled={isBusy}
@@ -962,7 +1911,11 @@ export default function App() {
                           ? activeError
                           : noFlightsFailure
                             ? activeError
-                            : `We couldn't finish your plan. ${activeError}`}
+                            : isProviderLimited
+                              ? `Provider limitation: ${activeError}`
+                              : isAppBroken
+                                ? `Service error: ${activeError}`
+                                : `We couldn't finish your plan. ${activeError}`}
                       </span>
                       {lastPayload && (
                         <button
@@ -991,7 +1944,7 @@ export default function App() {
 
                 </div>
 
-                {showHighlights && (
+                {showSearchEnhancers && showHighlights && (
                   <div className="highlights-row" aria-label="Trip highlights">
                     {highlights.map((highlight) => (
                       <article key={highlight.title} className="highlight-card">
@@ -1002,24 +1955,26 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="suggestions-row sugg-strip">
-                  <div className="sugg-scroll">
-                    {suggestionChips.map((item) => (
-                      <button
-                        key={item}
-                        type="button"
-                        className="s-chip history-chip"
-                        title={item}
-                        aria-label={item}
-                        onClick={() => {
-                          window.dispatchEvent(new CustomEvent<string>("travelyst:suggest", { detail: item }));
-                        }}
-                      >
-                        <span className="s-chip__label">{item}</span>
-                      </button>
-                    ))}
+                {showSearchEnhancers && (
+                  <div className="suggestions-row sugg-strip">
+                    <div className="sugg-scroll">
+                      {suggestionChips.map((item) => (
+                        <button
+                          key={item}
+                          type="button"
+                          className="s-chip history-chip"
+                          title={item}
+                          aria-label={item}
+                          onClick={() => {
+                            window.dispatchEvent(new CustomEvent<string>("travelyst:suggest", { detail: item }));
+                          }}
+                        >
+                          <span className="s-chip__label">{item}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
+                )}
 
                 <article
                   ref={(node) => { liveRegionRef.current = node; }}
@@ -1113,7 +2068,14 @@ export default function App() {
                       <span className="r-dot" aria-hidden="true" />
                       AI reasoning trace
                     </div>
-                    <AIReasoningPanel finalJson={finalJson} isStreaming={isBusy} reasoningSteps={reasoningSteps} />
+                    <AIReasoningPanel
+                      finalJson={finalJson}
+                      isStreaming={isBusy}
+                      reasoningSteps={reasoningSteps}
+                      approvalRequired={approvalRequired}
+                      approvalResult={approvalResult}
+                      onApprove={respondToApproval}
+                    />
                   </article>
                 )}
                 {isDevMode && (
@@ -1131,130 +2093,152 @@ export default function App() {
                 </aside>
               )}
             </section>
-            <a href="#route-reveal" className="hero-scroll-cue">
-              How the planner thinks ↓
-            </a>
+            {!resultsFirstMode && (
+              <a href="#route-reveal" className="hero-scroll-cue">
+                How the planner thinks ↓
+              </a>
+            )}
           </section>
 
-          <div className="experience-divider reveal" aria-hidden="true" />
+          {showExperienceNarrative && (
+            <>
+              <div className="experience-divider reveal" aria-hidden="true" />
 
-          <section id="route-reveal" className="experience-section experience-section--route reveal" aria-label="How the planner thinks">
-            <div className="route-reveal-shell">
-              <div className="route-reveal-intro">
-                <div className="section-head route-reveal-intro__head">
-                  <p className="section-label">How the planner thinks</p>
-                  <h2 className="section-title">A guided four-step path from intent to booking confidence</h2>
-                </div>
-                <p className="route-reveal-intro__sub">
-                  Follow how your travel intent becomes a ranked shortlist with weather context and booking confidence.
-                </p>
-                <div className="route-reveal-progress" aria-hidden="true">
-                  <div className="route-reveal-progress__fill" style={{ width: `${Math.max(routeProgressPercent, 0)}%` }} />
-                </div>
-                <p className="route-reveal-intro__status">{routeNarrativeStatus}</p>
-              </div>
-              <div className="route-reveal-track">
-                {routeRevealSteps.map((step, index) => (
-                  <article
-                    key={step.id}
-                    className={`route-reveal-card ${step.active ? "route-reveal-card--active" : ""}`}
-                    style={{ animationDelay: `${index * 80}ms` }}
-                  >
-                    <div className="route-reveal-card__rail" aria-hidden="true" />
-                    <div className="route-reveal-card__body">
-                      <div className="route-reveal-card__index">0{index + 1}</div>
-                      <h3 className="route-reveal-card__title">{step.title}</h3>
-                      <p className="route-reveal-card__desc">{step.description}</p>
+              <section id="route-reveal" className="experience-section experience-section--route reveal" aria-label="How the planner thinks">
+                <div className="route-reveal-shell">
+                  <div className="route-reveal-intro">
+                    <div className="section-head route-reveal-intro__head">
+                      <p className="section-label">How the planner thinks</p>
+                      <h2 className="section-title">A guided four-step path from intent to booking confidence</h2>
                     </div>
-                  </article>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          <div className="experience-divider reveal" aria-hidden="true" />
-
-          <section className="experience-section experience-section--curation reveal" aria-label="Curated route moods">
-            <div className="section-head">
-              <p className="section-label">Curated lanes</p>
-              <h2 className="section-title">Editorial route rhythms for every trip profile</h2>
-            </div>
-            <div className="curation-grid">
-              {curatedPanels.map((panel, index) => (
-                <article key={panel.title} className={`curation-card curation-card--${panel.mood} ${index === 0 ? "curation-card--featured" : ""}`}>
-                  <div className="curation-card__media-wrap" aria-hidden="true">
-                    <img src={panel.image} alt="" className="curation-card__media" loading="lazy" decoding="async" />
+                    <p className="route-reveal-intro__sub">
+                      Follow how your travel intent becomes a ranked shortlist with weather context and booking confidence.
+                    </p>
+                    <div className="route-reveal-progress" aria-hidden="true">
+                      <div className="route-reveal-progress__fill" style={{ width: `${Math.max(routeProgressPercent, 0)}%` }} />
+                    </div>
+                    <p className="route-reveal-intro__status">{routeNarrativeStatus}</p>
                   </div>
-                  <div className="curation-card__veil" aria-hidden="true" />
-                  <div className="curation-card__content">
-                    <p className="curation-card__kicker">{panel.title}</p>
-                    <h3 className="curation-card__route">{panel.route}</h3>
-                    <p className="curation-card__note">{panel.note}</p>
+                  <div className="route-reveal-track">
+                    {routeRevealSteps.map((step, index) => (
+                      <article
+                        key={step.id}
+                        className={`route-reveal-card ${step.active ? "route-reveal-card--active" : ""}`}
+                        style={{ animationDelay: `${index * 80}ms` }}
+                      >
+                        <div className="route-reveal-card__rail" aria-hidden="true" />
+                        <div className="route-reveal-card__body">
+                          <div className="route-reveal-card__index">0{index + 1}</div>
+                          <h3 className="route-reveal-card__title">{step.title}</h3>
+                          <p className="route-reveal-card__desc">{step.description}</p>
+                        </div>
+                      </article>
+                    ))}
                   </div>
-                </article>
-              ))}
-            </div>
-          </section>
-
-          <div className="experience-divider reveal" aria-hidden="true" />
-
-          <section className="experience-section experience-section--immersive reveal" aria-label="Immersive route map">
-            <div className="immersive-shell">
-              <div className="immersive-shell__header">
-                <p className="section-label">Spatial route plane</p>
-                <h2 className="section-title">A cinematic confidence map for route quality and handoff readiness</h2>
-                <p className="immersive-shell__sub">
-                  One immersive product moment, designed to preview route intelligence without distracting from planning or results.
-                </p>
-              </div>
-              <div className="immersive-scene" aria-hidden="true">
-                <div className="immersive-scene__halo immersive-scene__halo--top" />
-                <div className="immersive-scene__halo immersive-scene__halo--bottom" />
-                <div className="immersive-scene__plane" />
-                <svg className="immersive-scene__routes" viewBox="0 0 720 320" preserveAspectRatio="none">
-                  <defs>
-                    <linearGradient id="routePrimary" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stopColor="rgba(124, 98, 255, 0.95)" />
-                      <stop offset="100%" stopColor="rgba(90, 198, 255, 0.9)" />
-                    </linearGradient>
-                    <linearGradient id="routeSecondary" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stopColor="rgba(88, 233, 191, 0.9)" />
-                      <stop offset="100%" stopColor="rgba(120, 164, 255, 0.82)" />
-                    </linearGradient>
-                  </defs>
-                  <path className="immersive-route immersive-route--primary" d="M82 248 C 220 82, 366 92, 556 236" stroke="url(#routePrimary)" />
-                  <path className="immersive-route immersive-route--secondary" d="M142 262 C 285 138, 406 126, 630 224" stroke="url(#routeSecondary)" />
-                </svg>
-
-                <div className="immersive-waypoint immersive-waypoint--left">
-                  <span className="immersive-waypoint__label">DEL</span>
                 </div>
-                <div className="immersive-waypoint immersive-waypoint--mid">
-                  <span className="immersive-waypoint__label">BOM</span>
+              </section>
+
+              <div className="experience-divider reveal" aria-hidden="true" />
+
+              <section className="experience-section experience-section--curation reveal" aria-label="Curated route moods">
+                <div className="section-head">
+                  <p className="section-label">Curated lanes</p>
+                  <h2 className="section-title">Editorial route rhythms for every trip profile</h2>
                 </div>
-                <div className="immersive-waypoint immersive-waypoint--right">
-                  <span className="immersive-waypoint__label">GOI</span>
+                <div className="curation-grid">
+                  {curatedPanels.map((panel, index) => (
+                    <article key={panel.title} className={`curation-card curation-card--${panel.mood} ${index === 0 ? "curation-card--featured" : ""}`}>
+                      <div className="curation-card__media-wrap" aria-hidden="true">
+                        <img src={panel.image} alt="" className="curation-card__media" loading="lazy" decoding="async" />
+                      </div>
+                      <div className="curation-card__veil" aria-hidden="true" />
+                      <div className="curation-card__content">
+                        <p className="curation-card__kicker">{panel.title}</p>
+                        <h3 className="curation-card__route">{panel.route}</h3>
+                        <p className="curation-card__note">{panel.note}</p>
+                      </div>
+                    </article>
+                  ))}
                 </div>
+              </section>
 
-                <div className="immersive-chip immersive-chip--flight">Top fare trajectory · ₹5.4k band</div>
-                <div className="immersive-chip immersive-chip--weather">Weather layer synced · warm coastal window</div>
-                <div className="immersive-chip immersive-chip--handoff">Booking handoff confidence · provider-backed</div>
+              <div className="experience-divider reveal" aria-hidden="true" />
 
-                <div className="immersive-scene__glow" />
-              </div>
-            </div>
-          </section>
+              <section className="experience-section experience-section--immersive reveal" aria-label="Immersive route map">
+                <div className="immersive-shell">
+                  <div className="immersive-shell__header">
+                    <p className="section-label">Spatial route plane</p>
+                    <h2 className="section-title">A cinematic confidence map for route quality and handoff readiness</h2>
+                    <p className="immersive-shell__sub">
+                      One immersive product moment, designed to preview route intelligence without distracting from planning or results.
+                    </p>
+                  </div>
+                  <div className="immersive-scene" aria-hidden="true">
+                    <div className="immersive-scene__halo immersive-scene__halo--top" />
+                    <div className="immersive-scene__halo immersive-scene__halo--bottom" />
+                    <div className="immersive-scene__plane" />
+                    <svg className="immersive-scene__routes" viewBox="0 0 720 320" preserveAspectRatio="none">
+                      <defs>
+                        <linearGradient id="routePrimary" x1="0%" y1="0%" x2="100%" y2="0%">
+                          <stop offset="0%" stopColor="rgba(124, 98, 255, 0.95)" />
+                          <stop offset="100%" stopColor="rgba(90, 198, 255, 0.9)" />
+                        </linearGradient>
+                        <linearGradient id="routeSecondary" x1="0%" y1="0%" x2="100%" y2="0%">
+                          <stop offset="0%" stopColor="rgba(88, 233, 191, 0.9)" />
+                          <stop offset="100%" stopColor="rgba(120, 164, 255, 0.82)" />
+                        </linearGradient>
+                      </defs>
+                      <path className="immersive-route immersive-route--primary" d="M82 248 C 220 82, 366 92, 556 236" stroke="url(#routePrimary)" />
+                      <path className="immersive-route immersive-route--secondary" d="M142 262 C 285 138, 406 126, 630 224" stroke="url(#routeSecondary)" />
+                    </svg>
 
-          <div className="experience-divider reveal" aria-hidden="true" />
+                    <div className="immersive-waypoint immersive-waypoint--left">
+                      <span className="immersive-waypoint__label">DEL</span>
+                    </div>
+                    <div className="immersive-waypoint immersive-waypoint--mid">
+                      <span className="immersive-waypoint__label">BOM</span>
+                    </div>
+                    <div className="immersive-waypoint immersive-waypoint--right">
+                      <span className="immersive-waypoint__label">GOI</span>
+                    </div>
 
-          <section id="results" className="experience-section experience-section--proof">
+                    <div className="immersive-chip immersive-chip--flight">Top fare trajectory · ₹5.4k band</div>
+                    <div className="immersive-chip immersive-chip--weather">Weather layer synced · warm coastal window</div>
+                    <div className="immersive-chip immersive-chip--handoff">Booking handoff confidence · provider-backed</div>
+
+                    <div className="immersive-scene__glow" />
+                  </div>
+                </div>
+              </section>
+
+              <div className="experience-divider reveal" aria-hidden="true" />
+            </>
+          )}
+
+          <section
+            id="results"
+            ref={(node) => {
+              resultsSectionRef.current = node;
+            }}
+            className={[
+              "experience-section",
+              "experience-section--proof",
+              resultsFirstMode ? "experience-section--proof-results-first" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
             <div className="section-head reveal">
-              <p className="section-label">Product proof</p>
-              <h2 className="section-title">Choose faster with clear ranking, evidence, and booking confidence</h2>
+              <p className="section-label">{resultsFirstMode ? "Flight options" : "Product proof"}</p>
+              <h2 className="section-title">
+                {resultsFirstMode
+                  ? "Scan flights quickly and book from the ranked shortlist"
+                  : "Choose faster with clear ranking, evidence, and booking confidence"}
+              </h2>
             </div>
             {showProofSurface ? (
               <>
-                <div className="proof-overview-grid reveal" data-testid="proof-overview">
+                <div className="proof-overview-grid" data-testid="proof-overview">
                   <article className="r-card proof-card proof-card--best">
                     <div className="proof-card__head">
                       <p className="proof-card__kicker">Top recommendation</p>
@@ -1265,7 +2249,7 @@ export default function App() {
                     {bestFlight ? (
                       <>
                         <h3 className="proof-card__title">
-                          {bestFlight.airline} {bestFlight.flight_no} · {formatPriceINR(bestFlight.price_inr)}
+                          {bestFlight.airline} {bestFlight.flight_no}{bestFlightHasPrice ? ` · ${formatPriceINR(bestFlight.price_inr)}` : ""}
                         </h3>
                         <p className="proof-card__summary">
                           {bestFlight.departure_time} → {bestFlight.arrival_time} · {bestFlight.duration_min} min · {bestFlightStopSummary}
@@ -1290,7 +2274,7 @@ export default function App() {
                       <li className="proof-evidence-item">
                         <span className="proof-evidence-item__label">Ranked shortlist</span>
                         <span className="proof-evidence-item__value">
-                          {hasFlights ? `${flightsCount} candidate${flightsCount === 1 ? "" : "s"} compared` : isBusy ? "Compiling live options" : "No shortlist yet"}
+                          {hasFlights ? shortlistCountLabel : isBusy ? "Compiling live options" : "No shortlist yet"}
                         </span>
                       </li>
                       <li className="proof-evidence-item">
@@ -1310,7 +2294,7 @@ export default function App() {
                     </ul>
                   </article>
                 </div>
-                <div className="result-wrap reveal" data-testid="result-wrap">
+                <div className="result-wrap" data-testid="result-wrap">
                   {isMultiCity && multiCityLegs.length > 0 && (
                     <article className="r-card results-card" data-testid="multicity-itinerary">
                       <div className="r-label r-label--secondary">
@@ -1323,14 +2307,69 @@ export default function App() {
                   <article className={flightsCardClass} data-testid="ranked-shortlist">
                     <div className="r-label r-label--secondary">
                       <span className="r-dot" aria-hidden="true" />
-                      Ranked shortlist
+                      {showAllInventory ? "Full inventory" : "Ranked shortlist"}
                     </div>
+                    <p className="results-callout">
+                      {shortlistCountLabel} Book opens immediately when a provider handoff URL exists; otherwise Book resolves handoff lazily for that selected row only when current auth/setup mode allows it.
+                    </p>
+                    {inventoryFlights && inventoryFlights.length > (rankedShortlist?.length || 0) && (
+                      <button
+                        type="button"
+                        className="inventory-toggle-btn"
+                        onClick={() => setShowAllInventory((prev) => !prev)}
+                        aria-label={showAllInventory ? "Show ranked shortlist only" : "Show all flights from provider"}
+                      >
+                        {showAllInventory ? `Show top ${rankedShortlist?.length || 0} ranked` : `Show all ${inventoryFlights.length} flights`}
+                      </button>
+                    )}
+                    <p className="results-callout">{bookingModeText}</p>
+                    {bookingResolveBlockedReason && (
+                      <div className="notice notice--inline" data-testid="notice-inline">
+                        <span className="min-w-0 break-words">{bookingResolveBlockedReason}</span>
+                      </div>
+                    )}
+                    {showBookingTokenSetupActions && (
+                      <div className="notice notice--inline" data-testid="notice-inline">
+                        <span className="min-w-0 break-words">{bookingTokenSetupHint}</span>
+                        <div className="booking-auth-token-actions">
+                          <button
+                            type="button"
+                            className="booking-card__refresh"
+                            onClick={configureBookingAuthToken}
+                            disabled={actionDisabled}
+                            data-testid="booking-auth-configure"
+                          >
+                            {hasBookingAuth ? "Update booking token" : "Set booking token"}
+                          </button>
+                          {hasBookingAuth && (
+                            <button
+                              type="button"
+                              className="booking-card__refresh"
+                              onClick={removeBookingAuthToken}
+                              disabled={actionDisabled}
+                              data-testid="booking-auth-clear"
+                            >
+                              Clear token
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {!hasBookingAuth && (
+                      <div className="notice notice--inline" data-testid="notice-inline">
+                        <span className="min-w-0 break-words">{bookingActionDisabledHint}</span>
+                      </div>
+                    )}
                     <FlightsList
-                      flights={flights}
+                      flights={hydratedFlightsForUi}
                       bestFlight={bestFlight}
                       isLoading={isBusy && !hasFlights}
-                      onHold={canAction ? handleHoldFlight : undefined}
-                      onTrack={canAction ? handleTrackFlight : undefined}
+                      onBook={canResolveHandoffNow ? (flight) => resolveBookingForFlight(flight) : undefined}
+                      bookBlockedReason={bookingResolveBlockedReason || undefined}
+                      flightKeyFor={getFlightRowKey}
+                      bookingResolveStateByKey={bookingResolveStateByRow}
+                      onHold={canBookingActions ? handleHoldFlight : undefined}
+                      onTrack={canBookingActions ? handleTrackFlight : undefined}
                       actionDisabled={actionDisabled}
                     />
                   </article>
@@ -1344,6 +2383,7 @@ export default function App() {
                         {returnTripFlight.airline} {returnTripFlight.flight_no} · {returnTripFlight.departure_time} →{" "}
                         {returnTripFlight.arrival_time} · {formatPriceINR(returnTripFlight.price_inr)}
                       </p>
+                      <p className="flight-item__meta">{returnTripBookingHint}</p>
                       {returnTripWeather && (
                         <p className="flight-item__meta">
                           Weather:{" "}
@@ -1355,6 +2395,57 @@ export default function App() {
                             .join(", ")}
                         </p>
                       )}
+                      <div className="flight-card__actions">
+                        {returnTripHasDirectHandoff && (
+                          <a
+                            href={resolveApiUrl(returnTripFlight.handoff_url as string)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="flight-card__link flight-card__link--primary"
+                            data-testid="return-booking-link"
+                          >
+                            Book return now
+                          </a>
+                        )}
+                        {!returnTripHasDirectHandoff && returnTripHasBookingToken && (
+                          <>
+                            {returnTripCanResolveOnClick ? (
+                              <button
+                                type="button"
+                                className="flight-card__link flight-card__link--primary"
+                                disabled={actionDisabled}
+                                data-testid="return-booking-resolve"
+                                onClick={async () => {
+                                  if (!returnRouteContext) {
+                                    setBookingActionError("Missing return-leg route/date context for booking resolution.");
+                                    return;
+                                  }
+                                  setIsBookingActionBusy(true);
+                                  setBookingActionError(null);
+                                  try {
+                                    await openResolvedHandoffInNewTab(
+                                      () => resolveBookingForFlight(returnTripFlight, returnRouteContext),
+                                      "Return-leg booking handoff failed."
+                                    );
+                                  } catch (err: unknown) {
+                                    setBookingActionError(
+                                      err instanceof Error ? err.message : "Return-leg booking handoff failed."
+                                    );
+                                  } finally {
+                                    setIsBookingActionBusy(false);
+                                  }
+                                }}
+                              >
+                                {isBookingActionBusy ? "Resolving return booking..." : "Book return (resolve on click)"}
+                              </button>
+                            ) : (
+                              <span className="fl-meta" data-testid="return-booking-blocked-note">
+                                {returnTripResolveBlockedReason || "Return booking handoff is unavailable for this row."}
+                              </span>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </article>
                   )}
                   {(showBookingPanel || showAlertsPanel) && (
@@ -1388,9 +2479,9 @@ export default function App() {
                             <span className="min-w-0 break-words">{bookingActionError}</span>
                           </div>
                         )}
-                        {bookingItems.length > 0 ? (
+                        {currentRouteBookingItems.length > 0 ? (
                           <div className="booking-list">
-                            {bookingItems.map((booking) => {
+                            {currentRouteBookingItems.map((booking) => {
                               const details = describeBooking(booking);
                               const status = String(booking.status || "UNKNOWN").toUpperCase();
                               const statusLabel = status === "CONFIRMED" ? "LEGACY_CONFIRMED" : status;
@@ -1489,9 +2580,9 @@ export default function App() {
                             <span className="min-w-0 break-words">{priceAlertError}</span>
                           </div>
                         )}
-                        {priceAlerts.length > 0 ? (
+                        {currentRoutePriceAlerts.length > 0 ? (
                           <div className="alert-list">
-                            {priceAlerts.map((alert) => (
+                            {currentRoutePriceAlerts.map((alert) => (
                               <div key={alert.alert_id} className="alert-item">
                                 <div className="alert-item__main">
                                   <p className="alert-item__title">

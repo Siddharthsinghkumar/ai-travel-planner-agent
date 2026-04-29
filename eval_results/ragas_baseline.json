@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-04-29T11:05:33.568423+00:00",
+  "label": "pre-RAG baseline",
+  "num_test_cases": 3,
+  "overall_scores": {
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.0,
+    "context_relevance": 0.0
+  },
+  "per_question": [
+    {
+      "question": "Find cheapest flight from Delhi to Mumbai on 2026-05-15",
+      "answer": "Placeholder answer for test case 1. Server was not available during evaluation.",
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevancy": 0.0,
+        "context_relevance": 0.0
+      }
+    },
+    {
+      "question": "What is the weather in Bangalore tomorrow?",
+      "answer": "Placeholder answer for test case 2. Server was not available during evaluation.",
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevancy": 0.0,
+        "context_relevance": 0.0
+      }
+    },
+    {
+      "question": "Book a direct flight from BLR to DEL with hand baggage only",
+      "answer": "Placeholder answer for test case 3. Server was not available during evaluation.",
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevancy": 0.0,
+        "context_relevance": 0.0
+      }
+    }
+  ]
+}

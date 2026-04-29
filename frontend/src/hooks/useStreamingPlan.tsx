@@ -1,6 +1,6 @@
 // src/hooks/useStreamingPlan.tsx
 import { useCallback, useRef, useState } from "react";
-import { API_BASE } from "../lib/api";
+import { API_BASE, postJson } from "../lib/api";
 import type { AskPayload, Flight, TripPlan } from "../lib/types";
 
 type ResponseMeta = {
@@ -86,6 +86,7 @@ export function useStreamingPlan() {
   const [tokens, setTokens] = useState("");
   const [finalJson, setFinalJson] = useState<TripPlan | null>(null);
   const [partialFlights, setPartialFlights] = useState<Flight[] | null>(null);
+  const [partialTopFlights, setPartialTopFlights] = useState<Flight[] | null>(null);
   const [partialBestFlight, setPartialBestFlight] = useState<Flight | null>(null);
   const [partialWeather, setPartialWeather] = useState<Record<string, unknown> | null>(null);
   const [reasoningSteps, setReasoningSteps] = useState<string[]>([]);
@@ -94,6 +95,15 @@ export function useStreamingPlan() {
   const [error, setError] = useState<string | null>(null);
   const [responseMeta, setResponseMeta] = useState<ResponseMeta | null>(null);
   const [rawStream, setRawStream] = useState("");
+  const [approvalRequired, setApprovalRequired] = useState<{
+    planId: string;
+    action: string;
+    message: string;
+  } | null>(null);
+  const [approvalResult, setApprovalResult] = useState<{
+    approved: boolean;
+    planId: string;
+  } | null>(null);
 
   const controllerRef = useRef<AbortController | null>(null);
   const bufferRef = useRef("");
@@ -105,11 +115,14 @@ export function useStreamingPlan() {
     setTokens("");
     setFinalJson(null);
     setPartialFlights(null);
+    setPartialTopFlights(null);
     setPartialBestFlight(null);
     setPartialWeather(null);
     setReasoningSteps([]);
     setRawStream("");
     setResponseMeta(null);
+    setError(null);
+    setIsFallback(false);
   }, []);
 
   const isRecoverableStreamError = useCallback((message: string) => {
@@ -316,6 +329,12 @@ export function useStreamingPlan() {
           if (eventType === "flights") {
             try {
               const parsed = JSON.parse(eventData) as Record<string, unknown>;
+              if (Array.isArray(parsed?.top_flights)) {
+                setPartialTopFlights(parsed.top_flights as Flight[]);
+                if (parsed.top_flights.length > 0) {
+                  hasHydratedResultData = true;
+                }
+              }
               if (Array.isArray(parsed?.all_flights)) {
                 setPartialFlights(parsed.all_flights as Flight[]);
                 if (parsed.all_flights.length > 0) {
@@ -347,6 +366,37 @@ export function useStreamingPlan() {
               }
             } catch {
               // Ignore malformed structured frame and continue streaming.
+            }
+          }
+
+          if (eventType === "approval_required") {
+            try {
+              const parsed = JSON.parse(eventData) as Record<string, unknown>;
+              if (typeof parsed?.plan_id === "string") {
+                setApprovalRequired({
+                  planId: parsed.plan_id as string,
+                  action: typeof parsed.action === "string" ? parsed.action : "booking_handoff",
+                  message: typeof parsed.message === "string" ? parsed.message : "Approval required before proceeding.",
+                });
+                setApprovalResult(null);
+              }
+            } catch {
+              // Ignore malformed approval event.
+            }
+          }
+
+          if (eventType === "approval_result") {
+            try {
+              const parsed = JSON.parse(eventData) as Record<string, unknown>;
+              if (typeof parsed?.plan_id === "string" && typeof parsed.approved === "boolean") {
+                setApprovalResult({
+                  approved: parsed.approved as boolean,
+                  planId: parsed.plan_id as string,
+                });
+                setApprovalRequired(null);
+              }
+            } catch {
+              // Ignore malformed approval result.
             }
           }
         };
@@ -556,10 +606,20 @@ export function useStreamingPlan() {
     [clearVisibleResultState, isRecoverableStreamError, runFallbackRequest, triggerFallback]
   );
 
+  const respondToApproval = useCallback(async (approved: boolean) => {
+    if (!approvalRequired) return;
+    try {
+      await postJson(`/plan/${approvalRequired.planId}/approve`, { approved });
+    } catch (err) {
+      console.error("Approval request failed:", err);
+    }
+  }, [approvalRequired]);
+
   return {
     tokens,
     finalJson,
     partialFlights,
+    partialTopFlights,
     partialBestFlight,
     partialWeather,
     reasoningSteps,
@@ -571,5 +631,8 @@ export function useStreamingPlan() {
     start,
     cancel,
     reset,
+    approvalRequired,
+    approvalResult,
+    respondToApproval,
   };
 }

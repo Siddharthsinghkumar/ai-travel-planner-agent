@@ -6,7 +6,8 @@ Responsibilities:
 - Retrieve and validate flight & weather data
 - Apply preference-aware scoring
 - Generate LLM explanations
-- Persist full audit trail to PostgreSQL
+- Persist audit/state through the shared SQL persistence layer
+  (SQLite is the canonical single-node deployment default; PostgreSQL is optional/non-canonical)
 
 UI-agnostic, FastAPI-ready.
 Fully async with production-grade improvements.
@@ -47,6 +48,22 @@ except ImportError:
 from tools.airline_api import search_flights as _search_flights_impl, AirlineAPIError
 from tools.weather_api import check_weather as _check_weather_impl, get_forecast_for_date as _get_forecast_for_date_impl
 from agents.llm_router import generate, AllBackendsFailed
+from agents.preference_memory import preference_store, extract_preferences_from_query
+# Cache infrastructure - imported from focused module
+from agents.cache_infra import async_cache, create_cached_fetcher, CacheLock, DISABLE_CACHE
+
+# Intent parsing - imported from focused module  
+from agents.intent_parser import normalize_trip, extract_stopover, _infer_route_pair_from_query
+
+# Flight normalization - imported from focused module
+from agents.flight_normalizer import normalize_flights, normalize_flight_field, normalize_airport
+
+# Weather fetching - imported from focused module
+# Note: get_weather_once and _normalize_weather_for_display are nested in _plan_trip_internal
+# so they use the local weather_cache closure. The module version is available for standalone use.
+
+# Circuit management - imported from focused module
+from agents.circuit_manager import check_llm_circuit, record_llm_success, record_llm_failure
 from core.llm_mode import (
     get_llm_mode_and_priority,
     LLM_MODE_OLLAMA_ONLY,
@@ -88,6 +105,50 @@ logger = logging.getLogger("planner_agent")
 _FLIGHT_GET_WARNING_LOGGED = False
 
 # ----------------------------------------------------------------------
+# HITL Approval Gate infrastructure
+# ----------------------------------------------------------------------
+class ApprovalState:
+    def __init__(self):
+        self._events: Dict[str, asyncio.Event] = {}
+        self._decisions: Dict[str, Optional[bool]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_approval(self, plan_id: str, timeout: float = 120.0) -> Optional[bool]:
+        async with self._lock:
+            evt = asyncio.Event()
+            self._events[plan_id] = evt
+            self._decisions[plan_id] = None
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            async with self._lock:
+                self._decisions[plan_id] = False
+            return False
+        async with self._lock:
+            return self._decisions.get(plan_id, False)
+
+    async def set_decision(self, plan_id: str, approved: bool) -> bool:
+        async with self._lock:
+            if plan_id not in self._events:
+                return False
+            self._decisions[plan_id] = approved
+            self._events[plan_id].set()
+            return True
+
+    def clear(self, plan_id: str) -> None:
+        self._events.pop(plan_id, None)
+        self._decisions.pop(plan_id, None)
+
+_approval_store = ApprovalState()
+
+def _sse_event(event_name: str, payload: Dict[str, Any]) -> str:
+    """
+    Return a preformatted SSE frame.
+    These frames are passed through unchanged by the API streaming wrapper.
+    """
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+# ----------------------------------------------------------------------
 # Environment flags & configurable timeouts
 # ----------------------------------------------------------------------
 USE_CLOUD_FALLBACK = get_env_bool("USE_CLOUD_LLM", default=True)
@@ -102,6 +163,10 @@ PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS = max(
 PLANNER_LLM_WARNINGS_MAX_CHARS = max(
     200,
     get_env_int("PLANNER_LLM_WARNINGS_MAX_CHARS", 1200),
+)
+PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS = max(
+    240,
+    get_env_int("PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS", 900),
 )
 PLANNER_LLM_MAX_FLIGHTS_ONE_WAY = max(3, get_env_int("PLANNER_LLM_MAX_FLIGHTS_ONE_WAY", 8))
 PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP = max(2, get_env_int("PLANNER_LLM_MAX_FLIGHTS_ROUND_TRIP", 4))
@@ -135,6 +200,21 @@ def _apply_prompt_hard_limit(prompt_text: str, *, hard_limit: int) -> Tuple[str,
         return prompt_text, False
 
     marker = "\n\n[...prompt trimmed for runtime stability...]\n\n"
+    anchor_positions = [
+        idx
+        for idx in (
+            prompt_text.rfind("\nIMPORTANT: Only reference the exact flights listed above."),
+            prompt_text.rfind("\nUser's question:"),
+        )
+        if idx >= 0
+    ]
+    if anchor_positions:
+        anchor_idx = min(anchor_positions)
+        anchored_tail = prompt_text[anchor_idx:]
+        max_head = hard_limit - len(marker) - len(anchored_tail)
+        if max_head >= 160:
+            return f"{prompt_text[:max_head]}{marker}{anchored_tail}", True
+
     min_head = int(hard_limit * 0.55)
     min_tail = hard_limit - min_head - len(marker)
     if min_tail < 120:
@@ -188,8 +268,8 @@ PLANNER_INCLUDE_BACKEND_STATUS = get_env_bool("PLANNER_INCLUDE_BACKEND_STATUS", 
 FLIGHT_TOOL_TIMEOUT = get_env_float("FLIGHT_TOOL_TIMEOUT", 8.0)
 WEATHER_TOOL_TIMEOUT = get_env_float("WEATHER_TOOL_TIMEOUT", 5.0)
 LLM_CORRECTION_TIMEOUT = get_env_float("LLM_CORRECTION_TIMEOUT", 5.0)
-FLIGHT_SEARCH_BASE_RESULTS = 10
-FLIGHT_SEARCH_MAX_RESULTS_CAP = 14
+FLIGHT_SEARCH_BASE_RESULTS = get_env_int("FLIGHT_SEARCH_BASE_RESULTS", 40)
+FLIGHT_SEARCH_MAX_RESULTS_CAP = get_env_int("FLIGHT_SEARCH_MAX_RESULTS_CAP", 80)
 FLIGHT_SEARCH_WEAK_ROUTE_BONUS = 2
 FLIGHT_SEARCH_ROUND_TRIP_BONUS = 2
 FLIGHT_SEARCH_DEEP_SEARCH_BONUS = 2
@@ -198,6 +278,10 @@ FLIGHT_SEARCH_DEEP_SEARCH_BONUS = 2
 RETURN_TRIP_TIMEOUT = get_env_float("RETURN_TRIP_TIMEOUT", 40.0)
 BOOKING_HANDOFF_TIMEOUT = get_env_float("BOOKING_HANDOFF_TIMEOUT", 1.2)
 PER_FLIGHT_HANDOFF_LIMIT = max(1, get_env_int("PER_FLIGHT_HANDOFF_LIMIT", 3))
+RANKED_SHORTLIST_DISPLAY_LIMIT = max(
+    PER_FLIGHT_HANDOFF_LIMIT,
+    min(80, get_env_int("RANKED_SHORTLIST_DISPLAY_LIMIT", 10)),
+)
 PER_FLIGHT_HANDOFF_PROBE_LIMIT = max(
     PER_FLIGHT_HANDOFF_LIMIT,
     min(8, get_env_int("PER_FLIGHT_HANDOFF_PROBE_LIMIT", PER_FLIGHT_HANDOFF_LIMIT + 2)),
@@ -261,14 +345,6 @@ logger.info(
 )
 
 
-def _sse_event(event_name: str, payload: Dict[str, Any]) -> str:
-    """
-    Return a preformatted SSE frame.
-    These frames are passed through unchanged by the API streaming wrapper.
-    """
-    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
 _WEATHER_TEMP_FIELDS = {"temperature_c", "feels_like_c", "temp_min_c", "temp_max_c"}
 
 
@@ -308,9 +384,7 @@ def _record_price_snapshot_safe(*args, **kwargs):
     Lazy wrapper to avoid eager DB initialization during module import.
     Tracking setup treats persistence failures as hard errors.
     """
-    from tools.price_tracker import record_price_snapshot
-
-    snapshot_id = record_price_snapshot(*args, **kwargs)
+    snapshot_id = _record_price_snapshot_impl(*args, **kwargs)
     if not isinstance(snapshot_id, int) or snapshot_id <= 0:
         raise RuntimeError("snapshot_persist_failed")
     return snapshot_id
@@ -334,8 +408,7 @@ def _flight_value_safe(flight_obj: Any, key: str, default: Any = None) -> Any:
 
 async def _build_booking_handoff_url_safe(*args, **kwargs):
     try:
-        from tools.booking_handoff import build_booking_handoff_url
-        return await build_booking_handoff_url(*args, **kwargs)
+        return await _build_booking_handoff_url_impl(*args, **kwargs)
     except Exception:
         if kwargs.get("return_details"):
             return {
@@ -676,9 +749,7 @@ def _booking_handoff_cache_snapshot() -> Dict[str, Any]:
     Returns compact cache stats for cold-vs-hot booking handoff diagnostics.
     """
     try:
-        from tools.booking_handoff import booking_resolution_cache_stats
-
-        stats = booking_resolution_cache_stats()
+        stats = _booking_resolution_cache_stats_impl()
         entries = int(stats.get("entries") or 0)
         ttl_sec = int(stats.get("ttl_sec") or 0)
         return {
@@ -751,43 +822,37 @@ def _booking_handoff_candidate_signal(flight_obj: Any) -> int:
 
 
 async def _hold_booking_safe(*args, **kwargs):
-    from tools.booking_handoff import hold_booking
-    return await hold_booking(*args, **kwargs)
+    return await _hold_booking_impl(*args, **kwargs)
 
 
 def _cancel_booking_safe(*args, **kwargs):
-    from tools.booking_handoff import cancel_booking
-    return cancel_booking(*args, **kwargs)
+    return _cancel_booking_impl(*args, **kwargs)
 
 
 def _parse_price_insights_safe(*args, **kwargs):
     try:
-        from tools.price_tracker import parse_price_insights
-        return parse_price_insights(*args, **kwargs)
+        return _parse_price_insights_impl(*args, **kwargs)
     except Exception:
         return None
 
 
 def _format_price_insights_for_llm_safe(*args, **kwargs):
     try:
-        from tools.price_tracker import format_price_insights_for_llm
-        return format_price_insights_for_llm(*args, **kwargs)
+        return _format_price_insights_for_llm_impl(*args, **kwargs)
     except Exception:
         return ""
 
 
 def _analyze_price_trend_safe(*args, **kwargs):
     try:
-        from tools.price_tracker import analyze_price_trend
-        return analyze_price_trend(*args, **kwargs)
+        return _analyze_price_trend_impl(*args, **kwargs)
     except Exception:
         return None
 
 
 def _predict_future_price_safe(*args, **kwargs):
     try:
-        from tools.price_tracker import predict_future_price
-        return predict_future_price(*args, **kwargs)
+        return _predict_future_price_impl(*args, **kwargs)
     except Exception:
         return None
 
@@ -831,6 +896,57 @@ def _extract_booking_id(user_query: str) -> Optional[int]:
             except Exception:
                 return None
     return None
+
+
+def _coerce_action_prefetched_selection(
+    flights: Optional[List[Union[Dict, "Flight"]]],
+    *,
+    origin: Optional[str],
+    destination: Optional[str],
+    date: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build a hold/track action selection from pre-fetched flights when available.
+    This lets action intents skip redundant planning pre-work in trusted call paths.
+    """
+    if not flights:
+        return None
+
+    candidate = flights[0]
+    if hasattr(candidate, "model_dump"):
+        best_flight = candidate.model_dump()
+    elif isinstance(candidate, dict):
+        best_flight = dict(candidate)
+    elif hasattr(candidate, "__dict__"):
+        best_flight = dict(vars(candidate))
+    else:
+        return None
+
+    resolved_origin = _sanitize_iata_code(
+        origin
+        or str(best_flight.get("origin") or "")
+        or str(best_flight.get("departure_iata") or "")
+    )
+    resolved_destination = _sanitize_iata_code(
+        destination
+        or str(best_flight.get("destination") or "")
+        or str(best_flight.get("arrival_iata") or "")
+    )
+    depart_date = (
+        str(date or "").strip()
+        or str(best_flight.get("date") or "").strip()
+        or str(best_flight.get("search_date") or "").strip()
+    )
+
+    if not resolved_origin or not resolved_destination or not depart_date:
+        return None
+    return {
+        "best_flight": best_flight,
+        "origin": resolved_origin,
+        "destination": resolved_destination,
+        "depart_date": depart_date,
+        "selection_source": "prefetched_flight",
+    }
 
 def _resolve_city_to_iata_with_trace(city_text: str) -> Tuple[Optional[str], Dict[str, Any]]:
     """
@@ -1018,6 +1134,34 @@ def _infer_route_pair_from_query(user_query: str) -> Tuple[Optional[str], Option
             trace["source"] = phrase_pair_source
             return resolved_origin, resolved_destination, trace
 
+    # 1b) Adjacent city-pair fallback for terse phrases like "Delhi Mumbai trip on ...".
+    pair_noise_words = {
+        "flight", "flights", "trip", "book", "booking", "ticket", "tickets",
+        "from", "to", "on", "at", "for", "via", "through",
+        "just", "only", "cabin", "bag", "bags", "baggage", "luggage", "hand", "carry", "carryon",
+    }
+    simple_words = [m.group(0) for m in re.finditer(r"[A-Za-z]{3,}", user_query)]
+    for idx in range(0, len(simple_words) - 1):
+        first = simple_words[idx].strip()
+        second = simple_words[idx + 1].strip()
+        if not first or not second:
+            continue
+        if first.lower() in pair_noise_words or second.lower() in pair_noise_words:
+            continue
+        resolved_first, first_trace = _resolve_city_to_iata_with_trace(first)
+        resolved_second, second_trace = _resolve_city_to_iata_with_trace(second)
+        if resolved_first and resolved_second and resolved_first != resolved_second:
+            trace["adjacent_city_pair"] = {
+                "first_text": first,
+                "second_text": second,
+                "first_iata": resolved_first,
+                "second_iata": resolved_second,
+                "first_resolution_basis": (first_trace or {}).get("resolution_basis"),
+                "second_resolution_basis": (second_trace or {}).get("resolution_basis"),
+            }
+            trace["source"] = "deterministic_adjacent_city_pair"
+            return resolved_first, resolved_second, trace
+
     # 2) resolver-backed city phrase scan in appearance order.
     noise_words = {
         "flight", "flights", "from", "to", "on", "at", "for", "via", "through",
@@ -1026,6 +1170,8 @@ def _infer_route_pair_from_query(user_query: str) -> Tuple[Optional[str], Option
         "urgent", "flexible", "book", "booking", "ticket", "tickets", "find",
         "cheapest", "cheap", "and", "with", "under", "tomorrow", "today", "next",
         "this", "day", "days", "week", "weeks", "plan",
+        # Keep short baggage/cabin preference words from making simple route phrases look ambiguous.
+        "just", "only", "cabin", "bag", "bags", "baggage", "luggage", "hand", "carry", "carryon",
     }
     words = [(m.start(), m.group(0), m.group(0).lower()) for m in re.finditer(r"[A-Za-z]{2,}", user_query)]
     meaningful_tokens = [w for _, _, w in words if w not in noise_words and len(w) > 1]
@@ -1134,8 +1280,6 @@ def _build_flight_search_profile(intent: "ParsedIntent", normalization_debug: Di
         "is_round_trip": bool(intent.return_date),
     }
 
-# ----------------------------------------------------------------------
-# LLM circuit breaker with auto-recovery
 # ----------------------------------------------------------------------
 _llm_failures = 0
 _llm_failure_lock = asyncio.Lock()
@@ -1353,63 +1497,6 @@ def _get_cache_lock(key):
         _cache_locks[key] = lock
     return lock
 
-def async_cache(ttl: int, maxsize: int = 1000):
-    """
-    Decorator that caches the result of an async function for `ttl` seconds.
-    Uses per-key locks to prevent cache stampede and bounded cache to limit memory.
-    """
-    def decorator(func):
-        # Use TTLCache if available, else simple dict (unbounded)
-        if TTLCache:
-            cache = TTLCache(maxsize=maxsize, ttl=ttl)
-        else:
-            cache = {}
-            logger.warning("cachetools not installed, using unbounded cache (memory may grow)")
-
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Build cache key
-            key = (func.__name__, args, frozenset(kwargs.items()))
-            lock = _get_cache_lock(key)
-
-            async with lock:
-                if not DISABLE_CACHE:                    # skip entire cache block in dev
-                    if TTLCache:
-                        if key in cache:
-                            logger.debug(f"Cache hit for {func.__name__}")
-                            return cache[key]
-                    else:
-                        now = time.monotonic()
-                        if key in cache:
-                            result, timestamp = cache[key]
-                            if now - timestamp < ttl:
-                                logger.debug(f"Cache hit for {func.__name__}")
-                                return result
-
-                logger.debug(f"Cache miss for {func.__name__}")
-                result = await func(*args, **kwargs)
-
-                if not DISABLE_CACHE:                    # don't store if cache disabled
-                    if TTLCache:
-                        cache[key] = result
-                    else:
-                        cache[key] = (result, now)
-
-                return result
-
-        return wrapper
-    return decorator
-
-def create_cached_fetcher(ttl: int, maxsize: int, fetch_func: Callable):
-    """
-    Create an async cached version of a fetch function.
-    The fetch function must accept the same arguments each time.
-    """
-    @async_cache(ttl=ttl, maxsize=maxsize)
-    async def cached(*args, **kwargs):
-        return await fetch_func(*args, **kwargs)
-    return cached
-
 # ----------------------------------------------------------------------
 # Shared module-level cached tool instances (system-wide cache)
 # ----------------------------------------------------------------------
@@ -1461,36 +1548,6 @@ async def _call_with_retries(fn: Callable, attempts: int = FLIGHT_RETRY_ATTEMPTS
 
     # all attempts failed — re-raise last exception (caller will convert to fallback)
     raise last_exc
-
-# ----------------------------------------------------------------------
-# Helper to normalize raw flight data into Flight objects
-# ----------------------------------------------------------------------
-def normalize_flights(raw_flights: List[Any], default_date: str) -> List['Flight']:
-    normalized = []
-    for f in raw_flights:
-
-        # Case 1: dict
-        if isinstance(f, dict):
-            flight_data = dict(f)
-
-        # Case 2: tool Flight or any object with __dict__
-        elif hasattr(f, "__dict__"):
-            flight_data = dict(vars(f))
-
-        else:
-            logger.warning(f"Skipping unknown flight type: {type(f)}")
-            continue
-
-        # Ensure date
-        if 'date' not in flight_data or not flight_data.get('date'):
-            flight_data['date'] = default_date
-
-        try:
-            normalized.append(Flight(**flight_data))
-        except ValidationError as e:
-            logger.warning(f"Skipping invalid flight after conversion: {e}")
-
-    return normalized
 
 # ----------------------------------------------------------------------
 # Pydantic models for validation and structured output
@@ -1606,140 +1663,6 @@ class MultiCityResult(BaseModel):
     legs: List[PlanResult]
 
 PlanResult.model_rebuild()
-
-# ----------------------------------------------------------------------
-# Route extraction from natural language (pure regex, no IATA logic)
-# ----------------------------------------------------------------------
-def extract_stopover(query_text: str) -> Dict[str, Optional[str]]:
-    """
-    Robust extraction for 'via' stopover phrases.
-    Returns dict with keys: origin_text, destination_text, via_text
-    Accepts multiword city names and many phrasings.
-    """
-    q = query_text.strip()
-    tail_guard = (
-        r'(?=(?:\s*[,;.]?\s*)(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in|'
-        r'on|for|at|tomorrow|today|next|this|return(?:ing)?|coming\s+back|'
-        r'leave|leav(?:e|ing)|depart(?:ing)?|after|before|under|with|by)\b|$)'
-    )
-
-    def _clean_fragment(text: Optional[str]) -> Optional[str]:
-        if text is None:
-            return None
-        cleaned = re.sub(r"\s+", " ", text).strip(" ,.-")
-        # Strip directive/boilerplate prefixes so route fragments remain city-focused.
-        for _ in range(3):
-            next_cleaned = cleaned
-            next_cleaned = re.sub(
-                r"^(?:please\s+|kindly\s+)?(?:find|search|show|get|book)(?:\s+me)?\s+",
-                "",
-                next_cleaned,
-                flags=re.IGNORECASE,
-            )
-            next_cleaned = re.sub(
-                r"^(?:a|an|the|flight|flights|trip|from|to|round[\s-]*trip|one[\s-]*way|return(?:\s+flight)?|multi[\s-]*city)\s+",
-                "",
-                next_cleaned,
-                flags=re.IGNORECASE,
-            )
-            if next_cleaned == cleaned:
-                break
-            cleaned = next_cleaned
-        cleaned = re.sub(r"\s+(?:on|for|at)\s+\d{4}-\d{2}-\d{2}\s*$", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(
-            r"\s+(?:leave|leav(?:e|ing)|depart(?:ing)?|return(?:ing)?)\b.*$",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        return cleaned or None
-
-    # from <A> to <B> [via <C>]
-    m = re.search(
-        rf'\bfrom\s+([A-Za-z][A-Za-z\s-]{{1,80}}?)\s+to\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
-        q,
-        re.IGNORECASE,
-    )
-    if m:
-        origin = _clean_fragment(m.group(1))
-        destination = _clean_fragment(m.group(2))
-        via_match = re.search(
-            rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
-            q,
-            re.IGNORECASE,
-        )
-        via = _clean_fragment(via_match.group(1)) if via_match else None
-        return {"origin_text": origin, "destination_text": destination, "via_text": via}
-
-    # <A> to <B> [via <C>]
-    m = re.search(
-        rf'\b([A-Za-z][A-Za-z\s-]{{1,80}}?)\s+to\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
-        q,
-        re.IGNORECASE,
-    )
-    if m:
-        origin = _clean_fragment(m.group(1))
-        destination = _clean_fragment(m.group(2))
-        via_match = re.search(
-            rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
-            q,
-            re.IGNORECASE,
-        )
-        via = _clean_fragment(via_match.group(1)) if via_match else None
-        return {"origin_text": origin, "destination_text": destination, "via_text": via}
-
-    # via <C> alone
-    m = re.search(
-        rf'\b(?:via|through|stopover(?:\s+in)?|connecting\s+(?:via|through)|stop\s+in)\s+([A-Za-z][A-Za-z\s-]{{1,80}}?){tail_guard}',
-        q,
-        re.IGNORECASE,
-    )
-    if m:
-        return {"origin_text": None, "destination_text": None, "via_text": _clean_fragment(m.group(1))}
-
-    return {"origin_text": None, "destination_text": None, "via_text": None}
-
-def normalize_trip(user_query: str, include_trace: bool = False) -> Dict[str, Any]:
-    """
-    Build a canonical trip object from raw user_query using regex and centralised resolver.
-    Returns dict with keys: origin_iata, destination_iata, via_iata.
-    """
-    parts = extract_stopover(user_query)
-
-    origin_iata = None
-    dest_iata = None
-    via_iata = None
-
-    route_trace: Dict[str, Any] = {
-        "raw_fragments": parts,
-        "origin_resolution": None,
-        "destination_resolution": None,
-        "via_resolution": None,
-    }
-
-    if parts["origin_text"]:
-        origin_iata, origin_trace = _resolve_city_to_iata_with_trace(parts["origin_text"])
-        route_trace["origin_resolution"] = origin_trace
-        logger.debug(f"normalize_trip: origin_text='{parts['origin_text']}' -> origin_iata={origin_iata}")
-
-    if parts["destination_text"]:
-        dest_iata, destination_trace = _resolve_city_to_iata_with_trace(parts["destination_text"])
-        route_trace["destination_resolution"] = destination_trace
-        logger.debug(f"normalize_trip: dest_text='{parts['destination_text']}' -> dest_iata={dest_iata}")
-
-    if parts["via_text"]:
-        via_iata, via_trace = _resolve_city_to_iata_with_trace(parts["via_text"])
-        route_trace["via_resolution"] = via_trace
-        logger.debug(f"normalize_trip: via_text='{parts['via_text']}' -> via_iata={via_iata}")
-
-    payload: Dict[str, Any] = {
-        "origin_iata": origin_iata,
-        "destination_iata": dest_iata,
-        "via_iata": via_iata,
-    }
-    if include_trace:
-        payload["route_trace"] = route_trace
-    return payload
 
 # ----------------------------------------------------------------------
 # Preference extraction constants
@@ -2050,7 +1973,18 @@ def parse_intent(user_query: str) -> ParsedIntent:
             intent.layover_limit_minutes = 180  # 3 hours
 
     # --- Baggage preference ---
-    if "hand baggage" in q or "cabin only" in q:
+    if any(
+        token in q
+        for token in (
+            "hand baggage",
+            "hand luggage",
+            "cabin only",
+            "cabin bag",
+            "carry on",
+            "carry-on",
+            "carryon",
+        )
+    ):
         intent.baggage_pref = "hand"
     elif "check-in" in q:
         intent.baggage_pref = "checked"
@@ -2155,19 +2089,12 @@ def parse_intent(user_query: str) -> ParsedIntent:
 # ----------------------------------------------------------------------
 def price_to_int(price: Union[str, int]) -> int:
     if isinstance(price, int):
-        return price
+        return price if price > 0 else 10**9
     try:
-        return int(str(price).replace('₹', '').replace(',', '').strip())
+        val = int(str(price).replace('₹', '').replace(',', '').strip())
+        return val if val > 0 else 10**9
     except:
         return 10**9
-
-def normalize_flight_field(value: Any) -> str:
-    """Convert flight field to a normalized string for matching."""
-    if value is None:
-        return ""
-    if isinstance(value, int):
-        return str(value)
-    return str(value).strip().lower()
 
 def filter_flights(flights: List[Flight], intent: ParsedIntent) -> List[Flight]:
     """Apply all user filters to the flight list with tolerant matching."""
@@ -2488,6 +2415,69 @@ def _explanation_degradation_note(reason: Optional[str], message: Optional[str])
     return f"LLM explanation degraded ({safe_reason}): {safe_message}"
 
 
+def _llm_execution_payload(
+    *,
+    source: str,
+    backend: Optional[str],
+    degraded: bool,
+    reason: Optional[str] = None,
+    request_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    effective_mode: Optional[str] = None,
+    cloud_provider: Optional[str] = None,
+    escalated: Optional[bool] = None,
+    timeout_sec: Optional[float] = None,
+    latency_sec: Optional[float] = None,
+    backend_status: Optional[Dict[str, Any]] = None,
+    runtime: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "source": source,
+        "backend": backend or "unknown",
+        "degraded": bool(degraded),
+    }
+    if reason:
+        payload["reason"] = reason
+    if request_id:
+        payload["request_id"] = request_id
+    if mode:
+        payload["mode"] = mode
+    if effective_mode:
+        payload["effective_mode"] = effective_mode
+    if cloud_provider:
+        payload["cloud_provider"] = cloud_provider
+    if escalated is not None:
+        payload["escalated"] = bool(escalated)
+    if timeout_sec is not None:
+        payload["timeout_sec"] = float(timeout_sec)
+    if latency_sec is not None:
+        payload["latency_sec"] = round(float(latency_sec), 3)
+    if backend_status:
+        payload["backend_status"] = backend_status
+    if isinstance(runtime, dict):
+        runtime_key_map = (
+            "model",
+            "num_ctx",
+            "thinking_mode",
+            "prompt_chars",
+            "prompt_est_tokens",
+            "system_chars",
+            "response_chars",
+            "first_chunk_latency_sec",
+            "first_token_latency_sec",
+            "request_start_epoch_ms",
+            "first_chunk_epoch_ms",
+            "first_token_epoch_ms",
+            "completion_epoch_ms",
+        )
+        for key in runtime_key_map:
+            value = runtime.get(key)
+            if value is None:
+                continue
+            payload[key] = value
+    return payload
+
+
 async def generate_explanation(
     user_query: str,
     intent: ParsedIntent,
@@ -2501,7 +2491,7 @@ async def generate_explanation(
     price_analysis_str: str = "",   # NEW: structured price trend info
     price_prediction_str: str = "", # NEW: price prediction advice
     booking_url: Optional[str] = None,  # NEW: optional booking link
-) -> Tuple[str, Optional[Dict[str, Any]]]:
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
     """Call LLM to produce a natural language response, with timeout and circuit breaker."""
     try:
         llm_mode_hint, llm_priority_hint = await get_llm_mode_and_priority()
@@ -2509,14 +2499,24 @@ async def generate_explanation(
         llm_mode_hint, llm_priority_hint = "unknown", "unknown"
 
     if await check_llm_circuit(llm_mode=llm_mode_hint, effective_mode=llm_mode_hint):
-        logger.warning("LLM circuit breaker open, returning deterministic summary")
+        logger.info("LLM circuit breaker open, returning deterministic summary")
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
-            error="circuit breaker open", location=intent.destination_iata
+            error="circuit breaker open",
+            location=intent.destination_iata,
+            intent=intent,
+            warnings=warnings,
         ), _llm_degradation_payload(
             reason="upstream_unavailable",
             message="LLM circuit breaker is open; explanation generated via deterministic fallback.",
             provider="router",
+        ), _llm_execution_payload(
+            source="deterministic_fallback",
+            backend="router",
+            degraded=True,
+            reason="upstream_unavailable",
+            mode=llm_mode_hint,
+            effective_mode=llm_mode_hint,
         )
 
     # Cap flights shown in prompt to reduce token usage.
@@ -2552,6 +2552,18 @@ async def generate_explanation(
     trip_description_for_prompt = _truncate_for_prompt(
         trip_description,
         PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS,
+    )
+    price_insights_for_prompt = _truncate_for_prompt(
+        price_insights_str or "",
+        PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
+    )
+    price_analysis_for_prompt = _truncate_for_prompt(
+        price_analysis_str or "",
+        PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
+    )
+    price_prediction_for_prompt = _truncate_for_prompt(
+        price_prediction_str or "",
+        PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
     )
 
     # Ensure weather values are plain (not enum objects) and build readable string
@@ -2608,8 +2620,9 @@ async def generate_explanation(
 
     # Carbon display
     carbon_display = "N/A"
-    if best_flight.carbon_emissions_g is not None:
-        carbon_kg = round(best_flight.carbon_emissions_g / 1000, 1)
+    carbon_val = getattr(best_flight, 'carbon_emissions_g', None)
+    if carbon_val is not None:
+        carbon_kg = round(carbon_val / 1000, 1)
         carbon_display = f"{carbon_kg} kg CO₂"
 
     # CRITICAL CONSTRAINT for unknown stops
@@ -2655,6 +2668,13 @@ async def generate_explanation(
             f"{weather_display['temp_max_c']}°C as the 'low' temperature."
         )
 
+    multicity_response_constraint = ""
+    if intent.stopover_city:
+        multicity_response_constraint = (
+            "\nMULTICITY RESPONSE RULE: Keep the answer concise (maximum 6 short sentences total). "
+            "Use explicit 'Leg 1:' and 'Leg 2:' sections and include one weather line per leg."
+        )
+
     # Construct system prompt with airline rule only if the best flight does NOT match the preference
     airline_rule = ""
     if intent.preferred_airlines:
@@ -2671,10 +2691,13 @@ async def generate_explanation(
             )
 
     # Prepend a facts block to ensure origin/destination appear explicitly
+    # and that critical grounding instructions survive any hard truncation.
     facts_block = (
         f"Origin: {intent.origin_iata or 'unknown'}\n"
         f"Destination: {intent.destination_iata or 'unknown'}\n"
         f"Departure date: {intent.date or 'not specified'}\n"
+        "CRITICAL: Only reference flights, airlines, and prices from the exact list below. "
+        "NEVER invent or fabricate flight details.\n"
     )
     if intent.return_date:
         facts_block += f"Return date: {intent.return_date}\n"
@@ -2687,6 +2710,8 @@ async def generate_explanation(
         "with a note that it differs from the preference — do NOT create fictional alternatives. "
         "RULE: If a flight data field is 'unknown (no data available)', you are PROHIBITED from "
         "stating or implying its value. "
+        "GROUNDING RULE: Only reference flights from the exact list provided under 'Flight options'. "
+        "Do NOT mention flights, airlines, or prices that are not in that list. "
         "IATA RULE: Whenever you mention a city's weather, always include its IATA code in "
         "parentheses, e.g. 'Weather for Bangalore (BLR)' or 'Mumbai (BOM)'. "
         "CITY NAME RULE: When writing about the flight destination, use ONLY the correct city name "
@@ -2703,7 +2728,7 @@ async def generate_explanation(
     ) -> str:
         return f"""
 CRITICAL CONSTRAINT: The stops field for this flight is '{stops_display}'.
-{constraint_note}{baggage_constraint}{layover_constraint}{temp_constraint}
+{constraint_note}{baggage_constraint}{layover_constraint}{temp_constraint}{multicity_response_constraint}
 
 You are a helpful travel assistant helping a user plan {trip_description_block}.
 
@@ -2722,9 +2747,9 @@ Best matching flight:
   Stops: {stops_display}{f" ({best_flight.layover_info})" if best_flight.layover_info else ""} |
   Baggage: {best_flight.baggage} |
   Carbon emissions: {carbon_display}
-{f"{chr(10)}{price_insights_str}" if price_insights_str else ""}
-{f"{chr(10)}{price_analysis_str}" if price_analysis_str else ""}
-{f"{chr(10)}{price_prediction_str}" if price_prediction_str else ""}
+{f"{chr(10)}{price_insights_for_prompt}" if price_insights_for_prompt else ""}
+{f"{chr(10)}{price_analysis_for_prompt}" if price_analysis_for_prompt else ""}
+{f"{chr(10)}{price_prediction_for_prompt}" if price_prediction_for_prompt else ""}
 Weather FORECAST for {intent.destination_iata} on {forecast_label}{approx_note}:
 {weather_str}
 
@@ -2828,9 +2853,14 @@ Please recommend the best flight, explain why it matches their preferences, ment
             "has_return_date": bool(intent.return_date),
             "has_weather_payload": bool(weather_display),
             "has_price_context": bool(
-                (price_insights_str or "").strip()
-                or (price_analysis_str or "").strip()
-                or (price_prediction_str or "").strip()
+                (price_insights_for_prompt or "").strip()
+                or (price_analysis_for_prompt or "").strip()
+                or (price_prediction_for_prompt or "").strip()
+            ),
+            "price_context_trimmed": bool(
+                price_insights_for_prompt != (price_insights_str or "")
+                or price_analysis_for_prompt != (price_analysis_str or "")
+                or price_prediction_for_prompt != (price_prediction_str or "")
             ),
             "has_booking_url": bool((booking_url or "").strip()),
             "trip_description_chars": len(trip_description or ""),
@@ -2851,24 +2881,45 @@ Please recommend the best flight, explain why it matches their preferences, ment
             "router_timeout_sec": router_timeout_hint,
         },
     )
+    llm_start = time.monotonic()
     try:
-        llm_text = await generate(
+        llm_result = await generate(
             prompt=full_prompt,
             system=system,
             model=planner_model,
             stream=False,
+            return_metadata=True,
         )
+        if isinstance(llm_result, dict):
+            llm_text = str(llm_result.get("response") or "")
+            llm_metadata: Dict[str, Any] = dict(llm_result)
+        else:
+            llm_text = str(llm_result or "")
+            llm_metadata = {
+                "backend": "unknown",
+                "mode": llm_mode_hint,
+                "effective_mode": llm_mode_hint,
+                "cloud_provider": None,
+                "escalated": False,
+                "request_id": None,
+            }
         # Detect when llm_router itself returned an internal fallback string instead of raising
         if LLMROUTER_FALLBACK_MARKER in (llm_text or ""):
             logger.warning("generate() returned internal backend-failure fallback; retrying once")
             await asyncio.sleep(1)
             try:
-                llm_text = await generate(
+                llm_result = await generate(
                     prompt=full_prompt,
                     system=system,
                     model=planner_model,
                     stream=False,
+                    return_metadata=True,
                 )
+                if isinstance(llm_result, dict):
+                    llm_text = str(llm_result.get("response") or "")
+                    llm_metadata = dict(llm_result)
+                else:
+                    llm_text = str(llm_result or "")
             except Exception:
                 llm_text = ""
             if not llm_text or LLMROUTER_FALLBACK_MARKER in llm_text:
@@ -2881,15 +2932,59 @@ Please recommend the best flight, explain why it matches their preferences, ment
                 )
                 return generate_deterministic_summary(
                     best_flight, weather, filters_applied,
-                    error="All LLM backends failed", location=intent.destination_iata
+                    error="All LLM backends failed",
+                    location=intent.destination_iata,
+                    intent=intent,
+                    warnings=warnings,
                 ), _llm_degradation_payload(
                     reason="upstream_unavailable",
                     message="All configured LLM backends failed; explanation generated via deterministic fallback.",
                     provider="router",
+                ), _llm_execution_payload(
+                    source="deterministic_fallback",
+                    backend=str(llm_metadata.get("backend") or "router"),
+                    degraded=True,
+                    reason="upstream_unavailable",
+                    request_id=(
+                        str(llm_metadata.get("request_id"))
+                        if llm_metadata.get("request_id")
+                        else None
+                    ),
+                    mode=str(llm_metadata.get("mode") or llm_mode_hint),
+                    effective_mode=str(llm_metadata.get("effective_mode") or llm_mode_hint),
+                    cloud_provider=(
+                        str(llm_metadata.get("cloud_provider"))
+                        if llm_metadata.get("cloud_provider")
+                        else None
+                    ),
+                    escalated=bool(llm_metadata.get("escalated")),
+                    timeout_sec=max(router_local_timeout_hint, planner_timeout),
+                    latency_sec=(time.monotonic() - llm_start),
+                    runtime=llm_metadata,
                 )
         llm_text = _enforce_narrative_consistency(llm_text, best_flight, weather)
         await record_llm_success()
-        return llm_text, None
+        return llm_text, None, _llm_execution_payload(
+            source="router_completion",
+            backend=str(llm_metadata.get("backend") or "unknown"),
+            degraded=False,
+            request_id=(
+                str(llm_metadata.get("request_id"))
+                if llm_metadata.get("request_id")
+                else None
+            ),
+            mode=str(llm_metadata.get("mode") or llm_mode_hint),
+            effective_mode=str(llm_metadata.get("effective_mode") or llm_mode_hint),
+            cloud_provider=(
+                str(llm_metadata.get("cloud_provider"))
+                if llm_metadata.get("cloud_provider")
+                else None
+            ),
+            escalated=bool(llm_metadata.get("escalated")),
+            timeout_sec=max(router_local_timeout_hint, planner_timeout),
+            latency_sec=(time.monotonic() - llm_start),
+            runtime=llm_metadata,
+        )
     except (TimeoutError, asyncio.TimeoutError):
         timeout_budget = max(router_local_timeout_hint, planner_timeout)
         logger.error("LLM call timed out after %.2fs", timeout_budget)
@@ -2903,11 +2998,23 @@ Please recommend the best flight, explain why it matches their preferences, ment
         )
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
-            error="timed out", location=intent.destination_iata
+            error="timed out",
+            location=intent.destination_iata,
+            intent=intent,
+            warnings=warnings,
         ), _llm_degradation_payload(
             reason="upstream_timeout",
             message=f"LLM explanation timed out after {timeout_budget}s; deterministic fallback used.",
             provider="router",
+        ), _llm_execution_payload(
+            source="deterministic_fallback",
+            backend="router",
+            degraded=True,
+            reason="upstream_timeout",
+            mode=llm_mode_hint,
+            effective_mode=llm_mode_hint,
+            timeout_sec=timeout_budget,
+            latency_sec=(time.monotonic() - llm_start),
         )
     except AllBackendsFailed as e:
         status = e.as_dict()
@@ -2943,7 +3050,9 @@ Please recommend the best flight, explain why it matches their preferences, ment
             weather,
             filters_applied,
             error=_safe_llm_error_message(e),
-            location=intent.destination_iata
+            location=intent.destination_iata,
+            intent=intent,
+            warnings=warnings,
         ), _llm_degradation_payload(
             reason="upstream_unavailable",
             message=(
@@ -2952,6 +3061,21 @@ Please recommend the best flight, explain why it matches their preferences, ment
                 else "LLM backends unavailable; deterministic explanation fallback used."
             ),
             provider="router",
+            backend_status=status,
+        ), _llm_execution_payload(
+            source="deterministic_fallback",
+            backend=primary_backend or "router",
+            degraded=True,
+            reason="upstream_unavailable",
+            mode=str(status.get("mode") or llm_mode_hint),
+            effective_mode=str(status.get("effective_mode") or llm_mode_hint),
+            cloud_provider=(
+                str(status.get("cloud_provider"))
+                if status.get("cloud_provider")
+                else None
+            ),
+            timeout_sec=max(router_local_timeout_hint, planner_timeout),
+            latency_sec=(time.monotonic() - llm_start),
             backend_status=status,
         )
     except Exception as e:
@@ -2974,16 +3098,33 @@ Please recommend the best flight, explain why it matches their preferences, ment
         )
         return generate_deterministic_summary(
             best_flight, weather, filters_applied,
-            error=_safe_llm_error_message(e), location=intent.destination_iata
+            error=_safe_llm_error_message(e),
+            location=intent.destination_iata,
+            intent=intent,
+            warnings=warnings,
         ), _llm_degradation_payload(
             reason="upstream_unavailable",
             message="LLM explanation unavailable; deterministic fallback used.",
             provider="router",
+        ), _llm_execution_payload(
+            source="deterministic_fallback",
+            backend="router",
+            degraded=True,
+            reason=counter_reason,
+            mode=llm_mode_hint,
+            effective_mode=llm_mode_hint,
+            timeout_sec=max(router_local_timeout_hint, planner_timeout),
+            latency_sec=(time.monotonic() - llm_start),
         )
 
 def generate_deterministic_summary(
-    best_flight: Flight, weather: Dict, filters: str,
-    error: str = "", location: str = ""
+    best_flight: Flight,
+    weather: Dict,
+    filters: str,
+    error: str = "",
+    location: str = "",
+    intent: Optional["ParsedIntent"] = None,
+    warnings: Optional[List[str]] = None,
 ) -> str:
     """Fallback summary when LLM is unavailable."""
     if isinstance(weather, dict):
@@ -2997,10 +3138,46 @@ def generate_deterministic_summary(
     weather_str = f"{condition}, {temp}°C" if temp != "unknown" else condition
     loc_display = f" ({location})" if location else ""
 
+    disclosure_lines: List[str] = []
+    warnings_text = " ".join(str(w or "").strip().lower() for w in (warnings or [])).strip()
+
+    preferred_airlines = list(getattr(intent, "preferred_airlines", []) or [])
+    if preferred_airlines:
+        best_airline_low = normalize_flight_field(getattr(best_flight, "airline", ""))
+        pref_low = [normalize_flight_field(a) for a in preferred_airlines if str(a).strip()]
+        airline_matched = any(
+            pref and (pref in best_airline_low or best_airline_low in pref)
+            for pref in pref_low
+        )
+        if not airline_matched:
+            disclosure_lines.append(
+                f"No matching flights were found for your preferred airline ({', '.join(preferred_airlines)}), "
+                "so this is the closest available alternative."
+            )
+    elif "relaxed airline preference" in warnings_text:
+        disclosure_lines.append(
+            "No matching flights were found for your preferred airline, so this is the closest available alternative."
+        )
+
+    hand_requested = bool(getattr(intent, "baggage_pref", None) == "hand")
+    baggage_text_low = normalize_flight_field(getattr(best_flight, "baggage", ""))
+    has_checked_like_baggage = any(x in baggage_text_low for x in ("checked", "check", "free bag", "hold"))
+    relaxed_baggage = "relaxed baggage constraint" in warnings_text
+    if hand_requested and (relaxed_baggage or has_checked_like_baggage):
+        disclosure_lines.append(
+            "No hand-baggage-only flight was available, so this option relaxes that requirement."
+        )
+    elif relaxed_baggage:
+        disclosure_lines.append(
+            "Your baggage preference could not be fully matched, so this is the closest available alternative."
+        )
+
     base = (f"I recommend {best_flight.airline} {best_flight.flight_no} at "
             f"{best_flight.departure_time} arriving {best_flight.arrival_time}. "
             f"Duration: {best_flight.duration_min} minutes, Price: {best_flight.price_inr}. "
             f"Weather at destination{loc_display}: {weather_str}. ")
+    if disclosure_lines:
+        base = " ".join(disclosure_lines) + " " + base
     if error:
         base += f"(Explanation degraded: {error}.)"
     return base
@@ -3128,8 +3305,11 @@ async def _plan_trip_internal(
     depth: int = 0,
     flight_tool: Callable = default_flight_tool,
     weather_tool: Callable = default_weather_tool,
-    skip_llm: bool = False,   # if True, return data without LLM explanation
-    resolve_booking_handoff: bool = True,  # if False, keep search cheap and defer booking resolution to explicit intent
+    skip_llm: bool = False,
+    resolve_booking_handoff: bool = False,
+    fetch_weather: bool = True,
+    plan_id: Optional[str] = None,
+    hitl_approval_timeout: float = 120.0,
 ) -> Union[PlanResult, MultiCityResult, Dict]:
     """Internal implementation without top-level timeout. Used for non‑streaming mode."""
     # Prevent excessive recursion
@@ -3154,7 +3334,6 @@ async def _plan_trip_internal(
         else create_cached_fetcher(3600, 500, weather_tool)
     )
     weather_cache: Dict[str, Any] = {}
-    weather_inflight: Dict[str, asyncio.Task] = {}
 
     def _normalize_weather_for_display(weather_value: Any, requested_location: Optional[str] = None) -> Any:
         """
@@ -3196,10 +3375,6 @@ async def _plan_trip_internal(
         if cache_key in weather_cache:
             return weather_cache[cache_key]
 
-        inflight = weather_inflight.get(cache_key)
-        if inflight is not None:
-            return await inflight
-
         async def _fetch_weather() -> Any:
             weather_query_location = location
             normalized_loc = _sanitize_iata_code(location)
@@ -3210,12 +3385,7 @@ async def _plan_trip_internal(
             weather_cache[cache_key] = normalized
             return normalized
 
-        task = asyncio.create_task(_fetch_weather())
-        weather_inflight[cache_key] = task
-        try:
-            return await task
-        finally:
-            weather_inflight.pop(cache_key, None)
+        return await _fetch_weather()
 
     # Phase timing
     phases = {}
@@ -3555,54 +3725,18 @@ async def _plan_trip_internal(
             )
 
             if isinstance(leg1, PlanResult) and isinstance(leg2, PlanResult):
-                # Single LLM call covering both legs at once
+                # Generate leg-specific LLM responses instead of a single combined prompt.
+                # This avoids a known timeout hotspot in the multicity branch while keeping
+                # strict degraded-fallback semantics per leg.
                 l1_flight = leg1.best_flight if isinstance(leg1.best_flight, Flight) else Flight(**leg1.best_flight)
                 l2_flight = leg2.best_flight if isinstance(leg2.best_flight, Flight) else Flight(**leg2.best_flight)
                 l1_weather = leg1.weather or {}
                 l2_weather = leg2.weather or {}
 
-                def _fmt_weather(w):
-                    return f"{w.get('condition','?')}, {w.get('temperature_c','?')}°C"
-
-                combined_trip_description = (
-                    f"a multi-city trip via {intent.stopover_city}\n\n"
-                    f"LEG 1: {intent.origin_iata} → {via_iata} on {search_date}\n"
-                    f"  Flight: {l1_flight.airline} {l1_flight.flight_no} | "
-                    f"{l1_flight.departure_time} → {l1_flight.arrival_time} | "
-                    f"{l1_flight.duration_min}min | {l1_flight.price_inr} | Stops: {l1_flight.stops}\n"
-                    f"  Weather at {via_iata} (stopover city): {_fmt_weather(l1_weather)}\n"
-                    f"  NOTE: The {_fmt_weather(l1_weather)} temperature is FOR {via_iata} ONLY.\n\n"
-                    f"LEG 2: {via_iata} → {intent.destination_iata} on {search_date}\n"
-                    f"  Flight: {l2_flight.airline} {l2_flight.flight_no} | "
-                    f"{l2_flight.departure_time} → {l2_flight.arrival_time} | "
-                    f"{l2_flight.duration_min}min | {l2_flight.price_inr} | Stops: {l2_flight.stops}\n"
-                    f"  Weather at {intent.destination_iata} (final destination): {_fmt_weather(l2_weather)}\n"
-                    f"  NOTE: The {_fmt_weather(l2_weather)} temperature is FOR {intent.destination_iata} ONLY.\n\n"
-                )
-
-                # Add per-leg temperature ordering constraints
-                def _temp_rule(w, loc):
-                    t_min = w.get("temp_min_c")
-                    t_max = w.get("temp_max_c")
-                    if t_min is not None and t_max is not None and t_max != t_min:
-                        return (
-                            f"TEMP RULE FOR {loc}: Daily low={t_min}°C, daily high={t_max}°C. "
-                            f"NEVER describe {t_max}°C as the 'low' temperature.\n"
-                        )
-                    return ""
-                combined_trip_description += _temp_rule(l1_weather, via_iata)
-                combined_trip_description += _temp_rule(l2_weather, intent.destination_iata)
-                combined_trip_description += (
-                    "Label your response clearly as 'Leg 1:' and 'Leg 2:' sections. "
-                    "Do NOT mix temperatures between legs."
-                )
-
                 # --- Enrich with stopover filter info ---
                 # In explicit multi-city mode we intentionally split the route into
                 # two legs around `via_iata`, so this request is considered matched
                 # by construction (layover_airports is not the right signal here).
-                matched_leg1 = 1
-                matched_leg2 = 1
                 matched_count = 2
                 debug_info_stopover = {
                     "requested": intent.stopover_city,
@@ -3613,101 +3747,65 @@ async def _plan_trip_internal(
                 }
                 logger.debug("Stopover filter applied", extra=debug_info_stopover)
 
-                if matched_count > 0:
-                    # Use first matching flight's layover_info
-                    top = l1_flight if matched_leg1 else l2_flight
-                    layover_text = top.layover_info or "No layover details available"
-                    leg_lines = []
-                    # We don't have full leg list in Flight; but we have layover_info string. Use that.
-                    combined_trip_description += f"\nTop matched itinerary has layovers: {layover_text}\nPlease explain the layovers and whether this matches the user's 'via {intent.stopover_city}' request in plain language.\n"
-                else:
-                    combined_trip_description += f"\nNo itineraries were found that stop via {intent.stopover_city}. Please explain that no flights matched the stopover requirement and suggest nearby alternatives or changing the stopover city.\n"
+                leg1_intent = intent.model_copy(deep=True)
+                leg1_intent.origin_iata = intent.origin_iata
+                leg1_intent.destination_iata = via_iata
+                leg1_intent.stopover_city = None
+                leg1_intent.return_date = None
+                leg1_intent.date = search_date
 
-                # ADD DEBUG LOGGING FOR COMBINED TRIP DESCRIPTION
-                logger.debug(
-                    "Multi-city combined_trip_description (first 500 chars): %s",
-                    combined_trip_description[:500].replace('\n', ' ')
+                leg2_intent = intent.model_copy(deep=True)
+                leg2_intent.origin_iata = via_iata
+                leg2_intent.destination_iata = intent.destination_iata
+                leg2_intent.stopover_city = None
+                leg2_intent.return_date = None
+                leg2_intent.date = search_date
+
+                leg1_query = (
+                    f"Leg 1 overview for a multi-city trip via {via_iata}: "
+                    f"{intent.origin_iata} to {via_iata} on {search_date}. "
+                    "Keep it concise and include route confirmation and packing advice."
+                )
+                leg2_query = (
+                    f"Leg 2 overview for the same trip: "
+                    f"{via_iata} to {intent.destination_iata} on {search_date}. "
+                    "Keep it concise and include route confirmation and packing advice."
                 )
 
-                # FIX: Use final destination weather (l2_weather) for the standard weather block,
-                # while the combined_trip_description already contains per-leg weather.
-                combined_llm, combined_llm_degradation = await generate_explanation(
-                    user_query=user_query,
-                    intent=intent,
+                leg1_llm, leg1_degradation, leg1_llm_execution = await generate_explanation(
+                    user_query=leg1_query,
+                    intent=leg1_intent,
                     best_flight=l1_flight,
-                    weather=l2_weather,          # final destination weather for the standard block
-                    all_flights=[l1_flight, l2_flight],
-                    filters_applied="multi-city stopover trip",
-                    trip_description=combined_trip_description,
-                    warnings=warnings,
-                    price_insights_str="",       # Not used in stopover for now
+                    weather=l1_weather,
+                    all_flights=[l1_flight],
+                    filters_applied="multi-city stopover trip (leg 1)",
+                    trip_description=f"leg 1 of a multi-city trip via {intent.stopover_city} ({via_iata})",
+                    warnings=list(warnings),
+                    price_insights_str="",
                     price_analysis_str="",
                     price_prediction_str="",
                 )
-                if combined_llm_degradation:
-                    warnings.append(
-                        f"Detailed explanation degraded ({combined_llm_degradation.get('reason')}); "
-                        "structured itinerary data is complete."
-                    )
+                leg2_llm, leg2_degradation, leg2_llm_execution = await generate_explanation(
+                    user_query=leg2_query,
+                    intent=leg2_intent,
+                    best_flight=l2_flight,
+                    weather=l2_weather,
+                    all_flights=[l2_flight],
+                    filters_applied="multi-city stopover trip (leg 2)",
+                    trip_description=f"leg 2 of a multi-city trip via {intent.stopover_city} ({via_iata})",
+                    warnings=list(warnings),
+                    price_insights_str="",
+                    price_analysis_str="",
+                    price_prediction_str="",
+                )
 
-                # Split the combined response on the "Leg 2" boundary so each leg gets its own slice.
-                split_match = re.search(r'\bLeg\s*2\b', combined_llm, re.IGNORECASE)
-                if split_match and split_match.start() > 30:
-                    leg1.llm_response = combined_llm[:split_match.start()].strip()
-                    leg2.llm_response = combined_llm[split_match.start():].strip()
-                    # If either slice is still too short, augment with template rather than fully replacing
-                    if len(leg1.llm_response) < 300:
-                        leg1.llm_response += (
-                            f"\n\nWeather details for {via_iata}: "
-                            f"Daily low: {l1_weather.get('temp_min_c', 'N/A')}°C, "
-                            f"daily high: {l1_weather.get('temp_max_c', 'N/A')}°C. "
-                            f"Pack suitable clothing for {str(l1_weather.get('condition', 'the forecast')).lower()} "
-                            f"weather with temperatures around {l1_weather.get('temperature_c', 'N/A')}°C at the stopover. "
-                            f"Precipitation chance: {l1_weather.get('precipitation_chance', 'N/A')}%."
-                        )
-                    if len(leg2.llm_response) < 300:
-                        leg2.llm_response += (
-                            f"\n\nWeather details for {intent.destination_iata}: "
-                            f"Daily low: {l2_weather.get('temp_min_c', 'N/A')}°C, "
-                            f"daily high: {l2_weather.get('temp_max_c', 'N/A')}°C. "
-                            f"Pack suitable clothing for {str(l2_weather.get('condition', 'the forecast')).lower()} "
-                            f"weather with temperatures around {l2_weather.get('temperature_c', 'N/A')}°C at your destination. "
-                            f"Precipitation chance: {l2_weather.get('precipitation_chance', 'N/A')}%."
-                        )
-                else:
-                    # Combined call failed or was too short. Use deterministic summaries for BOTH legs.
-                    l1_wx = l1_weather
-                    leg1.llm_response = (
-                        f"Leg 1: {intent.origin_iata} to {via_iata} on {search_date}\n\n"
-                        f"Flight: {l1_flight.airline} {l1_flight.flight_no} | "
-                        f"{l1_flight.departure_time} → {l1_flight.arrival_time} | "
-                        f"{l1_flight.duration_min} min | {l1_flight.price_inr} | Stops: {l1_flight.stops}\n\n"
-                        f"Weather at {via_iata} (stopover city): {_fmt_weather(l1_wx)}. "
-                        f"Daily low: {l1_wx.get('temp_min_c', 'N/A')}°C, "
-                        f"daily high: {l1_wx.get('temp_max_c', 'N/A')}°C. "
-                        f"Pack suitable clothing for {str(l1_wx.get('condition', 'the forecast')).lower()} "
-                        f"weather with temperatures around {l1_wx.get('temperature_c', 'N/A')}°C "
-                        f"at the stopover. "
-                        f"Precipitation chance: {l1_wx.get('precipitation_chance', 'N/A')}%."
-                    )
-                    l2_wx = l2_weather
-                    leg2.llm_response = (
-                        f"Leg 2: {via_iata} to {intent.destination_iata} on {search_date}\n\n"
-                        f"Flight: {l2_flight.airline} {l2_flight.flight_no} | "
-                        f"{l2_flight.departure_time} → {l2_flight.arrival_time} | "
-                        f"{l2_flight.duration_min} min | {l2_flight.price_inr} | Stops: {l2_flight.stops}\n\n"
-                        f"Weather at {intent.destination_iata} (final destination): {_fmt_weather(l2_wx)}. "
-                        f"Daily low: {l2_wx.get('temp_min_c', 'N/A')}°C, "
-                        f"daily high: {l2_wx.get('temp_max_c', 'N/A')}°C. "
-                        f"Pack suitable clothing for {str(l2_wx.get('condition', 'the forecast')).lower()} "
-                        f"weather with temperatures around {l2_wx.get('temperature_c', 'N/A')}°C "
-                        f"at your final destination. "
-                        f"Precipitation chance: {l2_wx.get('precipitation_chance', 'N/A')}%."
-                    )
+                leg1.llm_response = (leg1_llm or "").strip()
+                leg2.llm_response = (leg2_llm or "").strip()
 
                 # Add API trace and stopover filter to each leg's debug_info
                 leg1.debug_info = leg1.debug_info or {}
                 leg1.debug_info["stopover_filter"] = debug_info_stopover
+                leg1.debug_info["llm_execution"] = dict(leg1_llm_execution or {})
                 leg1.debug_info["api_trace"] = {
                     "flight": {
                         "request": {
@@ -3735,6 +3833,7 @@ async def _plan_trip_internal(
                 }
                 leg2.debug_info = leg2.debug_info or {}
                 leg2.debug_info["stopover_filter"] = debug_info_stopover
+                leg2.debug_info["llm_execution"] = dict(leg2_llm_execution or {})
                 leg2.debug_info["api_trace"] = {
                     "flight": {
                         "request": {
@@ -3760,6 +3859,45 @@ async def _plan_trip_internal(
                         "raw_response": l2_weather,
                     }
                 }
+                if leg1_degradation:
+                    leg1_note = _explanation_degradation_note(
+                        leg1_degradation.get("reason"),
+                        leg1_degradation.get("message"),
+                    )
+                    leg1.debug_info = leg1.debug_info or {}
+                    leg1.debug_info["degradation"] = leg1_degradation
+                    leg1.debug_info["llm_execution"] = {
+                        **dict(leg1_llm_execution or {}),
+                        "degraded": True,
+                        "reason": str(leg1_degradation.get("reason") or "upstream_unavailable"),
+                        "source": str((leg1_llm_execution or {}).get("source") or "deterministic_fallback"),
+                    }
+                    leg1 = leg1.model_copy(update={
+                        "result_status": "degraded",
+                        "degradation": leg1_degradation,
+                        "fallback_note": leg1.fallback_note or leg1_note,
+                        "warnings": list(leg1.warnings or []) + [leg1_note],
+                    })
+
+                if leg2_degradation:
+                    leg2_note = _explanation_degradation_note(
+                        leg2_degradation.get("reason"),
+                        leg2_degradation.get("message"),
+                    )
+                    leg2.debug_info = leg2.debug_info or {}
+                    leg2.debug_info["degradation"] = leg2_degradation
+                    leg2.debug_info["llm_execution"] = {
+                        **dict(leg2_llm_execution or {}),
+                        "degraded": True,
+                        "reason": str(leg2_degradation.get("reason") or "upstream_unavailable"),
+                        "source": str((leg2_llm_execution or {}).get("source") or "deterministic_fallback"),
+                    }
+                    leg2 = leg2.model_copy(update={
+                        "result_status": "degraded",
+                        "degradation": leg2_degradation,
+                        "fallback_note": leg2.fallback_note or leg2_note,
+                        "warnings": list(leg2.warnings or []) + [leg2_note],
+                    })
                 leg1 = leg1.model_copy(update={"stopover_filter": debug_info_stopover})
                 leg2 = leg2.model_copy(update={"stopover_filter": debug_info_stopover})
                 return MultiCityResult(legs=[leg1, leg2])
@@ -3885,7 +4023,15 @@ async def _plan_trip_internal(
     weather_reason_out = None
     weather_reason_ret = None
 
-    if dates_to_fetch:
+    if not fetch_weather:
+        weather_out = {}
+        weather_present_out = False
+        weather_reason_out = "skipped_for_action"
+        if intent.return_date and not intent.stopover_city:
+            weather_ret = {}
+            weather_present_ret = False
+            weather_reason_ret = "skipped_for_action"
+    elif dates_to_fetch:
         # Check how many weather keys are active
         status = await api_key_manager.get_status()
         weather_keys_active = sum(1 for e in status.get("weather", []) if e["active"])
@@ -3937,7 +4083,7 @@ async def _plan_trip_internal(
                         weather_ret = {}
                         weather_present_ret = False
                         weather_reason_ret = "api_failure"
-    else:
+    elif fetch_weather:
         # No weather within forecast window, use placeholders and set reason
         if not weather_out and (not dates_to_fetch or dates_to_fetch[0][0] != "outbound"):
             weather_out = {"condition": "Unpredictable this far in the future", "temperature_c": "N/A"}
@@ -3950,7 +4096,7 @@ async def _plan_trip_internal(
 
     # PATCH: If return date exists but was beyond forecast window (not added to dates_to_fetch),
     # set the placeholder now. The else branch above only runs when dates_to_fetch is entirely empty.
-    if intent.return_date and not intent.stopover_city and weather_ret is None:
+    if fetch_weather and intent.return_date and not intent.stopover_city and weather_ret is None:
         weather_ret = {"condition": "Unpredictable this far in the future", "temperature_c": "N/A"}
         weather_present_ret = False
         weather_reason_ret = "forecast_horizon_exceeded"
@@ -4394,208 +4540,278 @@ async def _plan_trip_internal(
     top_flights_payload: List[Dict[str, Any]] = []
     booking_url: Optional[str] = None
 
-    top_ranked = ranked[:PER_FLIGHT_HANDOFF_LIMIT]
+    display_ranked = ranked[: min(len(ranked), RANKED_SHORTLIST_DISPLAY_LIMIT)]
+    handoff_seed_ranked = ranked[:PER_FLIGHT_HANDOFF_LIMIT]
+    hitl_approved = True
     if resolve_booking_handoff:
-        top_signal_max = max((_booking_handoff_candidate_signal(f) for f in top_ranked), default=0)
-        weak_route_confidence = bool((search_profile or {}).get("weak_route_confidence"))
-        round_trip_low_signal = bool(intent.return_date and top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD)
-        weak_signal_candidates = bool(
-            top_signal_max <= 0
-            or (top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD and (weak_route_confidence or bool(intent.return_date)))
-        )
-        probe_limit = PER_FLIGHT_HANDOFF_PROBE_LIMIT
-        if intent.return_date:
-            probe_limit += ROUND_TRIP_HANDOFF_PROBE_BONUS
-        if weak_signal_candidates:
-            probe_limit += WEAK_ROUTE_HANDOFF_PROBE_BONUS
-        if round_trip_low_signal:
-            # Small extra probe on weak round-trip signal to avoid early fallback lock-in.
-            probe_limit += 1
-        probe_limit = max(len(top_ranked), min(PER_FLIGHT_HANDOFF_PROBE_MAX, probe_limit))
-        scan_limit = min(len(ranked), max(probe_limit, PER_FLIGHT_HANDOFF_SCAN_LIMIT))
-        if round_trip_low_signal:
-            scan_limit = min(len(ranked), scan_limit + WEAK_ROUTE_ROUND_TRIP_SCAN_BONUS)
-        if round_trip_low_signal and top_signal_max <= 0:
-            # For weak/no-signal round-trip routes, probe the full scanned window so
-            # deeper candidates still get a chance to surface booking artifacts.
-            probe_limit = min(len(ranked), max(probe_limit, scan_limit))
+        effective_plan_id = plan_id or f"plan-{intent.origin_iata}-{intent.destination_iata}-{search_date}"
 
-        probe_entries: List[Tuple[int, Any, int]] = [
-            (idx, ranked[idx], _booking_handoff_candidate_signal(ranked[idx]))
-            for idx in range(len(top_ranked))
-        ]
-        if scan_limit > len(top_ranked):
-            extra_entries: List[Tuple[int, Any, int]] = [
+        approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout)
+        _approval_store.clear(effective_plan_id)
+
+        if not approval_decision:
+            hitl_approved = False
+            booking_handoff_info = _deferred_booking_handoff_meta("hitl_approval_pending_or_rejected")
+            logger.info("hitl_approval_gate: booking handoff deferred for plan_id=%s (approved=%s)", effective_plan_id, approval_decision)
+        else:
+            logger.info("hitl_approval_gate: booking handoff approved for plan_id=%s", effective_plan_id)
+
+        if hitl_approved:
+            top_signal_max = max((_booking_handoff_candidate_signal(f) for f in handoff_seed_ranked), default=0)
+            weak_route_confidence = bool((search_profile or {}).get("weak_route_confidence"))
+            round_trip_low_signal = bool(intent.return_date and top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD)
+            weak_signal_candidates = bool(
+                top_signal_max <= 0
+                or (top_signal_max < WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD and (weak_route_confidence or bool(intent.return_date)))
+            )
+            probe_limit = PER_FLIGHT_HANDOFF_PROBE_LIMIT
+            if intent.return_date:
+                probe_limit += ROUND_TRIP_HANDOFF_PROBE_BONUS
+            if weak_signal_candidates:
+                probe_limit += WEAK_ROUTE_HANDOFF_PROBE_BONUS
+            if round_trip_low_signal:
+                # Small extra probe on weak round-trip signal to avoid early fallback lock-in.
+                probe_limit += 1
+            probe_limit = max(len(handoff_seed_ranked), min(PER_FLIGHT_HANDOFF_PROBE_MAX, probe_limit))
+            scan_limit = min(len(ranked), max(probe_limit, PER_FLIGHT_HANDOFF_SCAN_LIMIT))
+            if round_trip_low_signal:
+                scan_limit = min(len(ranked), scan_limit + WEAK_ROUTE_ROUND_TRIP_SCAN_BONUS)
+            if round_trip_low_signal and top_signal_max <= 0:
+                # For weak/no-signal round-trip routes, probe the full scanned window so
+                # deeper candidates still get a chance to surface booking artifacts.
+                probe_limit = min(len(ranked), max(probe_limit, scan_limit))
+
+            probe_entries: List[Tuple[int, Any, int]] = [
                 (idx, ranked[idx], _booking_handoff_candidate_signal(ranked[idx]))
-                for idx in range(len(top_ranked), scan_limit)
+                for idx in range(len(handoff_seed_ranked))
             ]
-            # Prefer artifact-rich candidates while keeping rank proximity as tiebreaker.
-            extra_entries.sort(key=lambda item: (item[2], -item[0]), reverse=True)
-            for entry in extra_entries:
-                if len(probe_entries) >= probe_limit:
-                    break
-                probe_entries.append(entry)
-
-        probe_ranked = [entry[1] for entry in probe_entries]
-        per_flight_handoff_timeout = PER_FLIGHT_HANDOFF_TIMEOUT + (
-            ROUND_TRIP_HANDOFF_TIMEOUT_BONUS if intent.return_date else 0.0
-        )
-        booking_stage_started = time.monotonic()
-        resolved_handoffs: List[Tuple[Any, Dict[str, Any], Optional[str]]] = []
-        if probe_ranked:
-            cache_snapshot = _booking_handoff_cache_snapshot()
-            logger.debug(
-                "booking_handoff_stage_started",
-                extra={
-                    "flight_candidates": len(top_ranked),
-                    "probe_candidates": len(probe_ranked),
-                    "probe_limit": probe_limit,
-                    "scan_limit": scan_limit,
-                    "top_signal_max": top_signal_max,
-                    "weak_route_confidence": weak_route_confidence,
-                    "weak_signal_candidates": weak_signal_candidates,
-                    "is_round_trip": bool(intent.return_date),
-                    "per_flight_timeout_sec": per_flight_handoff_timeout,
-                    **cache_snapshot,
-                },
-            )
-            resolved_handoffs = await asyncio.gather(
-                *[
-                    _resolve_flight_booking_handoff(
-                        flight_obj=flight,
-                        origin=intent.origin_iata,
-                        destination=intent.destination_iata,
-                        depart_date=search_date,
-                        return_date=intent.return_date,
-                        timeout_sec=per_flight_handoff_timeout,
-                        candidate_rank=ranked_idx + 1,
-                        probe_signal=signal,
-                        route_type="round_trip" if intent.return_date else "one_way",
-                        cache_mode_hint=cache_snapshot.get("cache_mode"),
-                    )
-                    for ranked_idx, flight, signal in probe_entries
+            if scan_limit > len(handoff_seed_ranked):
+                extra_entries: List[Tuple[int, Any, int]] = [
+                    (idx, ranked[idx], _booking_handoff_candidate_signal(ranked[idx]))
+                    for idx in range(len(handoff_seed_ranked), scan_limit)
                 ]
-            )
+                # Prefer artifact-rich candidates while keeping rank proximity as tiebreaker.
+                extra_entries.sort(key=lambda item: (item[2], -item[0]), reverse=True)
+                for entry in extra_entries:
+                    if len(probe_entries) >= probe_limit:
+                        break
+                    probe_entries.append(entry)
 
-        promotion_pool: List[Dict[str, Any]] = []
-        for idx, (resolved_flight, handoff_meta, resolved_url) in enumerate(resolved_handoffs):
-            rank = probe_entries[idx][0] + 1
-            row_primary_handoff_url, _row_secondary_url = _classify_handoff_url(
-                handoff_meta or {},
-                resolved_url,
+            probe_ranked = [entry[1] for entry in probe_entries]
+
+            # Carrier-specific timeout tuning: some carriers (SpiceJet, Air India
+            # multi-segment, Alliance Air) have slower booking-option resolution.
+            def _carrier_multiplier_for_flight(flight_obj: Any) -> float:
+                payload = {}
+                if hasattr(flight_obj, "model_dump"):
+                    payload = flight_obj.model_dump()
+                elif isinstance(flight_obj, dict):
+                    payload = flight_obj
+                elif hasattr(flight_obj, "__dict__"):
+                    payload = dict(vars(flight_obj))
+                if not payload:
+                    return 1.0
+                flight_no = str(payload.get("flight_no") or "").strip().upper()
+                if not flight_no:
+                    return 1.0
+                match = re.search(r"\b([A-Z]{2})\s*\d", flight_no)
+                if not match:
+                    return 1.0
+                code = match.group(1)
+                carrier_multipliers = {
+                    "SG": 1.5, "AI": 1.3, "9I": 1.5,
+                    "I5": 1.2, "IX": 1.3, "UK": 1.2, "6E": 1.0,
+                }
+                return carrier_multipliers.get(code, 1.0)
+
+            # Use the max carrier multiplier across all probe candidates as the
+            # per-flight timeout so no single candidate is starved by a slow carrier.
+            max_carrier_multiplier = max(
+                (_carrier_multiplier_for_flight(f) for f in probe_ranked),
+                default=1.0,
             )
-            promotion_pool.append(
-                {
-                    "rank": rank,
+            per_flight_handoff_timeout = (PER_FLIGHT_HANDOFF_TIMEOUT + (
+                ROUND_TRIP_HANDOFF_TIMEOUT_BONUS if intent.return_date else 0.0
+            )) * max_carrier_multiplier
+            booking_stage_started = time.monotonic()
+            resolved_handoffs: List[Tuple[Any, Dict[str, Any], Optional[str]]] = []
+            if probe_ranked:
+                cache_snapshot = _booking_handoff_cache_snapshot()
+                logger.debug(
+                    "booking_handoff_stage_started",
+                    extra={
+                        "flight_candidates": len(handoff_seed_ranked),
+                        "display_candidates": len(display_ranked),
+                        "probe_candidates": len(probe_ranked),
+                        "probe_limit": probe_limit,
+                        "scan_limit": scan_limit,
+                        "top_signal_max": top_signal_max,
+                        "weak_route_confidence": weak_route_confidence,
+                        "weak_signal_candidates": weak_signal_candidates,
+                        "is_round_trip": bool(intent.return_date),
+                        "per_flight_timeout_sec": per_flight_handoff_timeout,
+                        **cache_snapshot,
+                    },
+                )
+                resolved_handoffs = await asyncio.gather(
+                    *[
+                        _resolve_flight_booking_handoff(
+                            flight_obj=flight,
+                            origin=intent.origin_iata,
+                            destination=intent.destination_iata,
+                            depart_date=search_date,
+                            return_date=intent.return_date,
+                            timeout_sec=per_flight_handoff_timeout,
+                            candidate_rank=ranked_idx + 1,
+                            probe_signal=signal,
+                            route_type="round_trip" if intent.return_date else "one_way",
+                            cache_mode_hint=cache_snapshot.get("cache_mode"),
+                        )
+                        for ranked_idx, flight, signal in probe_entries
+                    ]
+                )
+
+            promotion_pool: List[Dict[str, Any]] = []
+            resolved_rows_by_rank_index: Dict[int, Dict[str, Any]] = {}
+            for idx, (resolved_flight, handoff_meta, resolved_url) in enumerate(resolved_handoffs):
+                ranked_index = probe_entries[idx][0]
+                rank = ranked_index + 1
+                row_primary_handoff_url, _row_secondary_url = _classify_handoff_url(
+                    handoff_meta or {},
+                    resolved_url,
+                )
+                resolved_rows_by_rank_index[ranked_index] = {
+                    "flight": resolved_flight,
                     "booking_handoff": handoff_meta,
                     "handoff_url": row_primary_handoff_url,
-                    "is_in_top_payload": idx < len(top_ranked),
                 }
-            )
-            if idx >= len(top_ranked):
-                continue
-            payload = (
-                resolved_flight.model_dump()
-                if hasattr(resolved_flight, "model_dump")
-                else dict(resolved_flight)
-            )
-            payload["booking_handoff"] = handoff_meta
-            payload["rank"] = rank
-            if row_primary_handoff_url:
-                payload["handoff_url"] = row_primary_handoff_url
-            else:
-                payload.pop("handoff_url", None)
-            top_flights_payload.append(payload)
-
-            if idx == 0:
-                if hasattr(resolved_flight, "model_dump"):
-                    best_flight = resolved_flight
-                booking_handoff_info = handoff_meta
-                booking_url = row_primary_handoff_url
-
-        # Promote best booking-quality exit to top-level handoff summary even if
-        # fare-ranked row 1 is a weaker fallback.
-        if promotion_pool:
-            scored: List[Tuple[int, int]] = []
-            for i, payload in enumerate(promotion_pool):
-                score = _booking_handoff_strength(payload.get("booking_handoff") or {})
-                scored.append((score, i))
-            best_handoff_idx = max(scored, key=lambda x: (x[0], -x[1]))[1]
-            promoted_payload = promotion_pool[best_handoff_idx]
-            promoted_meta = promoted_payload.get("booking_handoff") or {}
-            if isinstance(promoted_meta, dict):
-                booking_handoff_info = dict(promoted_meta)
-                selected_rank = promoted_payload.get("rank", best_handoff_idx + 1)
-                if selected_rank != 1:
-                    booking_handoff_info["selected_flight_rank"] = selected_rank
-                promoted_primary_url, _promoted_secondary_url = _classify_handoff_url(
-                    promoted_meta,
-                    promoted_payload.get("handoff_url"),
+                promotion_pool.append(
+                    {
+                        "rank": rank,
+                        "booking_handoff": handoff_meta,
+                        "handoff_url": row_primary_handoff_url,
+                        "is_in_top_payload": ranked_index < len(display_ranked),
+                    }
                 )
-                booking_url = promoted_primary_url or None
+                if ranked_index == 0:
+                    if hasattr(resolved_flight, "model_dump"):
+                        best_flight = resolved_flight
+                    booking_handoff_info = handoff_meta
+                    booking_url = row_primary_handoff_url
 
-            bucket_counts: Dict[str, int] = {}
-            for payload in promotion_pool:
-                bucket = _booking_handoff_bucket(payload.get("booking_handoff") or {})
-                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-            has_booking_ready = any(
-                _is_booking_ready_handoff(payload.get("booking_handoff") or {})
-                for payload in promotion_pool
-            )
-            cache_assisted_successes = sum(
-                1
-                for payload in promotion_pool
-                if str((payload.get("booking_handoff") or {}).get("reason") or "").endswith("_cache")
-            )
-            probe_signals: List[int] = [entry[2] for entry in probe_entries]
-            positive_signal_candidates = sum(1 for sig in probe_signals if sig > 0)
-            artifact_signal_candidates = sum(
-                1 for sig in probe_signals if sig >= WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD
-            )
-            max_probe_signal = max(probe_signals, default=0)
-            logger.debug(
-                "booking_handoff_stage_completed",
-                extra={
-                    "flight_candidates": len(top_ranked),
-                    "probe_candidates": len(probe_ranked),
-                    "probe_limit": probe_limit,
-                    "scan_limit": scan_limit,
-                    "top_signal_max": top_signal_max,
-                    "weak_route_confidence": weak_route_confidence,
-                    "weak_signal_candidates": weak_signal_candidates,
-                    "is_round_trip": bool(intent.return_date),
-                    "duration_ms": int((time.monotonic() - booking_stage_started) * 1000),
-                    "bucket_counts": bucket_counts,
-                    "has_booking_ready": has_booking_ready,
-                    "cache_assisted_successes": cache_assisted_successes,
-                    "selected_primary_rank": booking_handoff_info.get("selected_flight_rank", 1),
-                    **cache_snapshot,
-                },
-            )
+            # Promote best booking-quality exit to top-level handoff summary even if
+            # fare-ranked row 1 is a weaker fallback.
+            if promotion_pool:
+                scored: List[Tuple[int, int]] = []
+                for i, payload in enumerate(promotion_pool):
+                    score = _booking_handoff_strength(payload.get("booking_handoff") or {})
+                    scored.append((score, i))
+                best_handoff_idx = max(scored, key=lambda x: (x[0], -x[1]))[1]
+                promoted_payload = promotion_pool[best_handoff_idx]
+                promoted_meta = promoted_payload.get("booking_handoff") or {}
+                if isinstance(promoted_meta, dict):
+                    booking_handoff_info = dict(promoted_meta)
+                    selected_rank = promoted_payload.get("rank", best_handoff_idx + 1)
+                    if selected_rank != 1:
+                        booking_handoff_info["selected_flight_rank"] = selected_rank
+                    promoted_primary_url, _promoted_secondary_url = _classify_handoff_url(
+                        promoted_meta,
+                        promoted_payload.get("handoff_url"),
+                    )
+                    booking_url = promoted_primary_url or None
 
-            # Preserve ranked ordering while carrying handoff URLs for top-N flights.
-            if top_flights_payload:
-                updated_ranked = []
-                for idx, original in enumerate(ranked):
-                    if idx < len(top_ranked):
-                        updated_ranked.append(resolved_handoffs[idx][0])
-                    else:
-                        updated_ranked.append(original)
-                ranked = updated_ranked
+                bucket_counts: Dict[str, int] = {}
+                for payload in promotion_pool:
+                    bucket = _booking_handoff_bucket(payload.get("booking_handoff") or {})
+                    bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+                has_booking_ready = any(
+                    _is_booking_ready_handoff(payload.get("booking_handoff") or {})
+                    for payload in promotion_pool
+                )
+                cache_assisted_successes = sum(
+                    1
+                    for payload in promotion_pool
+                    if str((payload.get("booking_handoff") or {}).get("reason") or "").endswith("_cache")
+                )
+                probe_signals: List[int] = [entry[2] for entry in probe_entries]
+                positive_signal_candidates = sum(1 for sig in probe_signals if sig > 0)
+                artifact_signal_candidates = sum(
+                    1 for sig in probe_signals if sig >= WEAK_ROUTE_HANDOFF_SIGNAL_THRESHOLD
+                )
+                max_probe_signal = max(probe_signals, default=0)
+                logger.debug(
+                    "booking_handoff_stage_completed",
+                    extra={
+                        "flight_candidates": len(handoff_seed_ranked),
+                        "display_candidates": len(display_ranked),
+                        "probe_candidates": len(probe_ranked),
+                        "probe_limit": probe_limit,
+                        "scan_limit": scan_limit,
+                        "top_signal_max": top_signal_max,
+                        "weak_route_confidence": weak_route_confidence,
+                        "weak_signal_candidates": weak_signal_candidates,
+                        "is_round_trip": bool(intent.return_date),
+                        "duration_ms": int((time.monotonic() - booking_stage_started) * 1000),
+                        "bucket_counts": bucket_counts,
+                        "has_booking_ready": has_booking_ready,
+                        "cache_assisted_successes": cache_assisted_successes,
+                        "selected_primary_rank": booking_handoff_info.get("selected_flight_rank", 1),
+                        **cache_snapshot,
+                    },
+                )
+
+                # Preserve ranked ordering while carrying resolved row payloads back to rank list.
+                if resolved_rows_by_rank_index:
+                    updated_ranked = []
+                    for idx, original in enumerate(ranked):
+                        resolved_payload = resolved_rows_by_rank_index.get(idx)
+                        if resolved_payload is not None:
+                            updated_ranked.append(resolved_payload.get("flight"))
+                        else:
+                            updated_ranked.append(original)
+                    ranked = updated_ranked
+
+            deferred_probe_meta = _deferred_booking_handoff_meta("deferred_due_probe_budget")
+            for idx, flight in enumerate(display_ranked):
+                resolved_payload = resolved_rows_by_rank_index.get(idx)
+                row_flight = resolved_payload.get("flight") if resolved_payload else flight
+                row_handoff_meta = (
+                    resolved_payload.get("booking_handoff")
+                    if resolved_payload and isinstance(resolved_payload.get("booking_handoff"), dict)
+                    else dict(deferred_probe_meta)
+                )
+                row_primary_handoff_url = (
+                    resolved_payload.get("handoff_url")
+                    if resolved_payload and isinstance(resolved_payload.get("handoff_url"), str)
+                    else None
+                )
+                payload = (
+                    row_flight.model_dump()
+                    if hasattr(row_flight, "model_dump")
+                    else dict(row_flight)
+                )
+                payload["booking_handoff"] = row_handoff_meta
+                payload["rank"] = idx + 1
+                if row_primary_handoff_url:
+                    payload["handoff_url"] = row_primary_handoff_url
+                else:
+                    payload.pop("handoff_url", None)
+                top_flights_payload.append(payload)
     else:
         booking_handoff_info = _deferred_booking_handoff_meta()
-        for idx, flight in enumerate(top_ranked):
+        for idx, flight in enumerate(display_ranked):
             payload = flight.model_dump() if hasattr(flight, "model_dump") else dict(flight)
             payload["booking_handoff"] = dict(booking_handoff_info)
             payload["rank"] = idx + 1
             payload.pop("handoff_url", None)
             top_flights_payload.append(payload)
-        if top_flights_payload and hasattr(top_ranked[0], "model_dump"):
-            best_flight = top_ranked[0]
+        if top_flights_payload and hasattr(display_ranked[0], "model_dump"):
+            best_flight = display_ranked[0]
         logger.debug(
             "booking_handoff_stage_deferred",
             extra={
-                "flight_candidates": len(top_ranked),
+                "flight_candidates": len(handoff_seed_ranked),
+                "display_candidates": len(display_ranked),
                 "is_round_trip": bool(intent.return_date),
                 "reason": "deferred_until_booking_intent",
             },
@@ -4827,6 +5043,7 @@ async def _plan_trip_internal(
             "resolved_during_planning" if resolve_booking_handoff else "deferred_until_booking_intent"
         ),
         "per_flight_handoff_limit": PER_FLIGHT_HANDOFF_LIMIT,
+        "ranked_shortlist_display_limit": RANKED_SHORTLIST_DISPLAY_LIMIT,
         "flight_counts": {
             "pre_filter": pre_filter_count,
             "post_filter": post_filter_count,
@@ -4998,14 +5215,20 @@ async def _plan_trip_internal(
         llm_text = _ensure_route_grounding(llm_text, intent.origin_iata, intent.destination_iata)
         llm_degradation = None
         llm_degradation_note = ""
+        llm_execution = _llm_execution_payload(
+            source="skip_llm_summary",
+            backend="none",
+            degraded=False,
+            reason="skip_llm_requested",
+        )
     else:
         start = time.monotonic()
-        llm_text, llm_degradation = await generate_explanation(
+        llm_text, llm_degradation, llm_execution = await generate_explanation(
             user_query=user_query,
             intent=intent,
             best_flight=best_flight,
             weather=weather_dict,
-            all_flights=all_flights,
+            all_flights=ranked,
             filters_applied=filters_applied,
             trip_description=trip_description,
             warnings=warnings,
@@ -5045,6 +5268,8 @@ async def _plan_trip_internal(
                     f"Weather at {intent.origin_iata} on {return_date_str}: {rw_cond}, {rw_temp}°C. "
                     f"Pack accordingly for your return journey."
                 )
+
+    debug_info["llm_execution"] = llm_execution
 
     # ------------------------------------------------------------------
     # 9. Prepare result and handle round-trip
@@ -5112,6 +5337,7 @@ async def _plan_trip_internal(
     # 10. Log session (only if not skipping LLM)
     # ------------------------------------------------------------------
     if DB_AVAILABLE and not skip_llm:
+        extracted_prefs = extract_preferences_from_query(user_query)
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -5144,6 +5370,9 @@ async def _plan_trip_internal(
         except asyncio.TimeoutError:
             logger.error("Database write timed out")
 
+        if extracted_prefs:
+            preference_store.extract_and_store(user_query, None, {})
+
     # ------------------------------------------------------------------
     # 11. Final safety: ensure llm_response exists when not skipped
     # ------------------------------------------------------------------
@@ -5166,7 +5395,8 @@ async def plan_trip(
     flights: Optional[List[Union[Dict, Flight]]] = None,
     depth: int = 0,
     flight_tool: Callable = default_flight_tool,
-    weather_tool: Callable = default_weather_tool
+    weather_tool: Callable = default_weather_tool,
+    plan_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict, AsyncGenerator[str, None]]:
     """
     Public entry point for planning a trip.
@@ -5228,33 +5458,50 @@ async def plan_trip(
             }
 
         # Hold / track intents require selecting a flight first.
-        planned = await _plan_trip_internal(
+        # If the caller already provided a selected flight + route context,
+        # avoid repeating planner pre-work.
+        selection = _coerce_action_prefetched_selection(
+            flights,
             origin=origin,
             destination=destination,
             date=date,
-            user_query=user_query,
-            trip_type=trip_type,
-            flights=flights,
-            depth=depth,
-            flight_tool=flight_tool,
-            weather_tool=weather_tool,
-            skip_llm=True,
-            resolve_booking_handoff=False,
         )
-        if isinstance(planned, dict):
-            return planned
-        if isinstance(planned, MultiCityResult):
-            return {
-                "error": "Booking actions currently support single-leg selections only.",
-                "action": action,
-            }
+        if selection is None:
+            planned = await _plan_trip_internal(
+                origin=origin,
+                destination=destination,
+                date=date,
+                user_query=user_query,
+                trip_type=trip_type,
+                flights=flights,
+                depth=depth,
+                flight_tool=flight_tool,
+                weather_tool=weather_tool,
+                skip_llm=True,
+                resolve_booking_handoff=False,
+                fetch_weather=False,
+            )
+            if isinstance(planned, dict):
+                return planned
+            if isinstance(planned, MultiCityResult):
+                return {
+                    "error": "Booking actions currently support single-leg selections only.",
+                    "action": action,
+                }
 
-        best_flight = planned.best_flight or {}
-        dbg = planned.debug_info or {}
-        parsed_intent = dbg.get("intent", {}) if isinstance(dbg, dict) else {}
-        resolved_origin = parsed_intent.get("origin_iata") or origin
-        resolved_destination = parsed_intent.get("destination_iata") or destination
-        depart_date = planned.search_date or date
+            best_flight = planned.best_flight or {}
+            dbg = planned.debug_info or {}
+            parsed_intent = dbg.get("intent", {}) if isinstance(dbg, dict) else {}
+            resolved_origin = parsed_intent.get("origin_iata") or origin
+            resolved_destination = parsed_intent.get("destination_iata") or destination
+            depart_date = planned.search_date or date
+            selection_source = "planned_selection"
+        else:
+            best_flight = selection["best_flight"]
+            resolved_origin = selection["origin"]
+            resolved_destination = selection["destination"]
+            depart_date = selection["depart_date"]
+            selection_source = str(selection.get("selection_source") or "prefetched_flight")
 
         if not resolved_origin or not resolved_destination or not depart_date:
             return {
@@ -5334,6 +5581,7 @@ async def plan_trip(
                 "booking": held,
                 "best_flight": best_flight,
                 "monitoring_active": True,
+                "selection_source": selection_source,
             }
 
         return {
@@ -5352,6 +5600,7 @@ async def plan_trip(
             ),
             "booking": held,
             "best_flight": best_flight,
+            "selection_source": selection_source,
         }
 
     if action:
@@ -5379,6 +5628,7 @@ async def plan_trip(
             weather_tool=weather_tool,
             skip_llm=False,
             resolve_booking_handoff=False,
+            plan_id=plan_id,
         )
 
     # --- Streaming branch ---
@@ -5386,6 +5636,7 @@ async def plan_trip(
         stream_provider = "unknown"
         got_first_token = False
         data_result: Optional[Union[PlanResult, MultiCityResult, Dict[str, Any]]] = None
+        stream_runtime_context: Dict[str, Any] = {}
 
         def done_json_frame(payload: Dict[str, Any], status: str) -> str:
             metrics.record_stream_done_json(status)
@@ -5419,6 +5670,15 @@ async def plan_trip(
                 payload["result_status"] = "degraded"
                 payload["degradation"] = degradation
                 payload["fallback_note"] = payload.get("fallback_note") or degradation_note
+                debug_info = payload.get("debug_info") if isinstance(payload.get("debug_info"), dict) else {}
+                debug_info["llm_execution"] = _llm_execution_payload(
+                    source="stream_deterministic_fallback",
+                    backend=provider or "unknown",
+                    degraded=True,
+                    reason=reason,
+                    runtime=stream_runtime_context,
+                )
+                payload["debug_info"] = debug_info
                 if partial_llm_response:
                     payload["llm_response"] = partial_llm_response
                 return payload
@@ -5429,6 +5689,15 @@ async def plan_trip(
                 payload["result_status"] = "degraded"
                 payload["degradation"] = degradation
                 payload["fallback_note"] = payload.get("fallback_note") or degradation_note
+                payload_debug = payload.get("debug_info") if isinstance(payload.get("debug_info"), dict) else {}
+                payload_debug["llm_execution"] = _llm_execution_payload(
+                    source="stream_deterministic_fallback",
+                    backend=provider or "unknown",
+                    degraded=True,
+                    reason=reason,
+                    runtime=stream_runtime_context,
+                )
+                payload["debug_info"] = payload_debug
                 for leg in payload.get("legs", []):
                     leg_warnings = list(leg.get("warnings") or [])
                     leg_warnings.append(degradation_note)
@@ -5436,6 +5705,15 @@ async def plan_trip(
                     leg["result_status"] = "degraded"
                     leg["degradation"] = degradation
                     leg["fallback_note"] = leg.get("fallback_note") or degradation_note
+                    leg_debug = leg.get("debug_info") if isinstance(leg.get("debug_info"), dict) else {}
+                    leg_debug["llm_execution"] = _llm_execution_payload(
+                        source="stream_deterministic_fallback",
+                        backend=provider or "unknown",
+                        degraded=True,
+                        reason=reason,
+                        runtime=stream_runtime_context,
+                    )
+                    leg["debug_info"] = leg_debug
                 return payload
 
             return {
@@ -5469,6 +5747,7 @@ async def plan_trip(
                 weather_tool=weather_tool,
                 skip_llm=True,
                 resolve_booking_handoff=False,
+                plan_id=plan_id,
             )
 
             # Any dict payload at this stage is non-success for streaming.
@@ -5575,6 +5854,12 @@ async def plan_trip(
                     },
                 )
 
+            # Use the ranked shortlist (top_flights) for LLM grounding instead of
+            # the pre-filter all_flights list. This ensures the LLM only references
+            # flights that are actually shown to the user in the UI.
+            top_flights_for_llm = data_result.top_flights or []
+            llm_flight_candidates = top_flights_for_llm if top_flights_for_llm else all_flights_dicts
+
             if isinstance(weather, dict) and weather:
                 weather_payload: Dict[str, Any] = {}
                 for key, value in weather.items():
@@ -5671,14 +5956,14 @@ async def plan_trip(
             stream_max_flights_in_prompt = max(stream_min_flights, stream_max_flights_in_prompt)
             stream_flights_in_prompt = max(
                 1,
-                min(stream_max_flights_in_prompt, len(all_flights_dicts)),
+                min(stream_max_flights_in_prompt, len(llm_flight_candidates)),
             )
             flights_str = "\n".join([
                 f"- {f['airline']} {f['flight_no']} on {f.get('date','N/A')} | "
                 f"{f['departure_time']} → {f['arrival_time']} | "
                 f"{f['duration_min']} min | {f['price_inr']} | "
                 f"Stops: {f.get('stops', 'N/A')} | Baggage: {f.get('baggage', 'N/A')}"
-                for f in all_flights_dicts[:stream_flights_in_prompt]
+                for f in llm_flight_candidates[:stream_flights_in_prompt]
             ])
 
             # Format warnings if present, escalating "relaxed" warnings to mandatory instructions
@@ -5701,10 +5986,25 @@ async def plan_trip(
                 trip_description,
                 PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS,
             )
+            price_insights_for_prompt = _truncate_for_prompt(
+                price_insights_str or "",
+                PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
+            )
+            price_analysis_for_prompt = _truncate_for_prompt(
+                price_analysis_str or "",
+                PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
+            )
+            price_prediction_for_prompt = _truncate_for_prompt(
+                price_prediction_str or "",
+                PLANNER_LLM_PRICE_CONTEXT_MAX_CHARS,
+            )
             stream_prompt_trimmed = (
-                stream_flights_in_prompt < min(10, len(all_flights_dicts))
+                stream_flights_in_prompt < min(10, len(llm_flight_candidates))
                 or warnings_for_prompt != warnings_str
                 or trip_description_for_prompt != trip_description
+                or price_insights_for_prompt != (price_insights_str or "")
+                or price_analysis_for_prompt != (price_analysis_str or "")
+                or price_prediction_for_prompt != (price_prediction_str or "")
             )
 
             # Ensure weather values are plain
@@ -5759,8 +6059,9 @@ async def plan_trip(
 
             # Carbon display
             carbon_display = "N/A"
-            if best_flight.carbon_emissions_g is not None:
-                carbon_kg = round(best_flight.carbon_emissions_g / 1000, 1)
+            carbon_val = getattr(best_flight, 'carbon_emissions_g', None)
+            if carbon_val is not None:
+                carbon_kg = round(carbon_val / 1000, 1)
                 carbon_display = f"{carbon_kg} kg CO₂"
 
             # CRITICAL CONSTRAINT for unknown stops
@@ -5808,11 +6109,13 @@ async def plan_trip(
                         "Do NOT invent or fabricate alternative flights — only present flights from the data above."
                     )
 
-            # Facts block for streaming branch
+            # Facts block for streaming branch — includes critical grounding to survive truncation
             facts_block = (
                 f"Origin: {intent_dict.get('origin_iata') or 'unknown'}\n"
                 f"Destination: {intent_dict.get('destination_iata') or 'unknown'}\n"
                 f"Departure date: {intent_dict.get('date') or 'not specified'}\n"
+                "CRITICAL: Only reference flights, airlines, and prices from the exact list below. "
+                "NEVER invent or fabricate flight details.\n"
             )
             if intent_dict.get("return_date"):
                 facts_block += f"Return date: {intent_dict['return_date']}\n"
@@ -5825,6 +6128,8 @@ async def plan_trip(
                 "with a note that it differs from the preference — do NOT create fictional alternatives. "
                 "RULE: If a flight data field is 'unknown (no data available)', you are PROHIBITED from "
                 "stating or implying its value. "
+                "GROUNDING RULE: Only reference flights from the exact list provided under 'Flight options'. "
+                "Do NOT mention flights, airlines, or prices that are not in that list. "
                 "IATA RULE: Whenever you mention a city's weather, always include its IATA code in "
                 "parentheses, e.g. 'Weather for Bangalore (BLR)' or 'Mumbai (BOM)'. "
                 "CITY NAME RULE: When writing about the flight destination, use ONLY the correct city name "
@@ -5854,9 +6159,9 @@ Best matching flight:
   Stops: {stops_display}{f" ({best_flight.layover_info})" if best_flight.layover_info else ""} |
   Baggage: {best_flight.baggage} |
   Carbon emissions: {carbon_display}
-{f"{chr(10)}{price_insights_str}" if price_insights_str else ""}
-{f"{chr(10)}{price_analysis_str}" if price_analysis_str else ""}
-{f"{chr(10)}{price_prediction_str}" if price_prediction_str else ""}
+{f"{chr(10)}{price_insights_for_prompt}" if price_insights_for_prompt else ""}
+{f"{chr(10)}{price_analysis_for_prompt}" if price_analysis_for_prompt else ""}
+{f"{chr(10)}{price_prediction_for_prompt}" if price_prediction_for_prompt else ""}
 Weather FORECAST for {intent_dict.get('destination_iata')} on {forecast_label}{approx_note}:
 {weather_str}
 
@@ -5892,9 +6197,14 @@ Please recommend the best flight, explain why it matches their preferences, ment
                     "has_return_date": bool(intent_dict.get("return_date")),
                     "has_weather_payload": bool(weather_display),
                     "has_price_context": bool(
-                        (price_insights_str or "").strip()
-                        or (price_analysis_str or "").strip()
-                        or (price_prediction_str or "").strip()
+                        (price_insights_for_prompt or "").strip()
+                        or (price_analysis_for_prompt or "").strip()
+                        or (price_prediction_for_prompt or "").strip()
+                    ),
+                    "price_context_trimmed": bool(
+                        price_insights_for_prompt != (price_insights_str or "")
+                        or price_analysis_for_prompt != (price_analysis_str or "")
+                        or price_prediction_for_prompt != (price_prediction_str or "")
                     ),
                     "trip_description_chars": len(trip_description_for_prompt or ""),
                 },
@@ -6031,9 +6341,14 @@ Please recommend the best flight, explain why it matches their preferences, ment
             provider = getattr(token_stream, "provider", "unknown")
             stream_provider = provider
             metrics.record_stream_start(provider)
+            stream_runtime = getattr(token_stream, "llm_metadata", None)
+            if not isinstance(stream_runtime, dict):
+                stream_runtime = {}
+            stream_runtime_context = dict(stream_runtime)
 
             got_first_token = False
             first_token_time = None
+            first_token_epoch_ms = None
             full_response = ""
             stream_activity_chunks = 0
             thinking_heartbeat_chunks = 0
@@ -6057,6 +6372,7 @@ Please recommend the best flight, explain why it matches their preferences, ment
                             stream_activity_chunks += 1
                             if not got_first_token:
                                 first_token_time = time.monotonic() - llm_start
+                                first_token_epoch_ms = int(time.time() * 1000)
                                 try:
                                     metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
                                     metrics.observe_llm_first_token(provider, first_token_time)
@@ -6076,6 +6392,7 @@ Please recommend the best flight, explain why it matches their preferences, ment
                             stream_activity_chunks += 1
                             if not got_first_token:
                                 first_token_time = time.monotonic() - llm_start
+                                first_token_epoch_ms = int(time.time() * 1000)
                                 try:
                                     metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
                                     metrics.observe_llm_first_token(provider, first_token_time)
@@ -6096,6 +6413,7 @@ Please recommend the best flight, explain why it matches their preferences, ment
                         stream_activity_chunks += 1
                         if not got_first_token:
                             first_token_time = time.monotonic() - llm_start
+                            first_token_epoch_ms = int(time.time() * 1000)
                             try:
                                 metrics.LLM_LATENCY.labels(provider=provider).observe(first_token_time)
                                 metrics.observe_llm_first_token(provider, first_token_time)
@@ -6219,7 +6537,32 @@ Please recommend the best flight, explain why it matches their preferences, ment
             await record_llm_success()
 
             final_result = data_result.model_dump()
-            final_result["llm_response"] = full_response
+            grounded_response = full_response
+            try:
+                grounded_response = _enforce_narrative_consistency(grounded_response, best_flight, weather_dict)
+            except Exception:
+                pass
+            try:
+                grounded_response = _ensure_route_grounding(grounded_response, intent.origin_iata, intent.destination_iata)
+            except Exception:
+                pass
+            final_result["llm_response"] = grounded_response
+            final_debug_info = final_result.get("debug_info") if isinstance(final_result.get("debug_info"), dict) else {}
+            stream_runtime_payload: Dict[str, Any] = dict(stream_runtime)
+            stream_runtime_payload["response_chars"] = len(full_response or "")
+            if first_token_time is not None:
+                stream_runtime_payload["first_token_latency_sec"] = round(float(first_token_time), 3)
+            if first_token_epoch_ms is not None:
+                stream_runtime_payload["first_token_epoch_ms"] = int(first_token_epoch_ms)
+            stream_runtime_payload["completion_epoch_ms"] = int(time.time() * 1000)
+            final_debug_info["llm_execution"] = _llm_execution_payload(
+                source="stream_completion",
+                backend=provider,
+                degraded=False,
+                latency_sec=total_time,
+                runtime=stream_runtime_payload,
+            )
+            final_result["debug_info"] = final_debug_info
             # Remove debug_info if you don't want to expose internal data to the client
             # final_result.pop("debug_info", None)
             yield done_json_frame(final_result, status="success")
@@ -6341,37 +6684,3 @@ def save_session(user_query: str, agent_reasoning: dict, tool_output: dict, fina
         db.rollback()
     finally:
         db.close()
-
-# ----------------------------------------------------------------------
-# Helper: normalize airport for tests (simple deterministic fallback)
-# ----------------------------------------------------------------------
-def normalize_airport(text: Optional[str]) -> Optional[str]:
-    """
-    Normalize a free-text airport/city token into an IATA code or return None.
-    Tries (in order):
-      1. Direct resolver (city name, airport name, phrase) -> resolve_location(...)
-      2. If token is a 3-letter alpha code, return uppercased token (best-effort)
-      3. Otherwise None
-
-    This is intentionally simple and deterministic for tests.
-    """
-    if not text:
-        return None
-
-    tok = text.strip()
-    # Fast path for explicit 3-letter tokens (case-insensitive).
-    if len(tok) == 3 and tok.isalpha():
-        up = tok.upper()
-        if is_iata_token(up):
-            return up
-
-    # First try the central resolver which already supports phrases/tokens/n-grams
-    try:
-        iata = resolve_location(text)
-    except Exception:
-        iata = None
-
-    if iata:
-        return iata
-
-    return None
