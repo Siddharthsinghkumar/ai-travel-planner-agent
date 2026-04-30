@@ -1,26 +1,40 @@
-  GNU nano 7.2                       .gitignore *                               
+# Compiled Python
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+.ruff_cache/
 
-# =========================
+# Environment files (CRITICAL - secrets here)
+.env
+.env.*
+!.env.example
+
+# Local dependencies
+node_modules/
+
 # Streamlit
-# =========================
 .streamlit/
 
-# =========================
 # Logs
-# =========================
 *.log
+logs/
 
-# =========================
-# Local Data / Temp
-# =========================
+# Temporary data
 data/
 chromium137/
+__pycache__/
 
-# Old / experimental requirements
-requirements_clean.txt
-requirements-now-dev-only.txt
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
+# Build outputs
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db

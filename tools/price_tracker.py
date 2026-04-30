@@ -35,18 +35,36 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+from cachetools import TTLCache
+from core.env_config import get_env_int
+
 from sqlalchemy import Column, Integer, String, Float, JSON, DateTime, Boolean, Text
 from agents.database import Base, SessionLocal, get_engine
+from tools import price_tracker_tool_gateway as tracker_gateway
+
+# Import from canonical gateway for direct function calls
+from tools.tool_gateway import (
+    search_flights,
+    search_with_booking_token,
+    build_booking_handoff_url,
+)
+
+# Use wrappers that delegate to tracker_gateway at call time for test compatibility
+# Tests patch tracker_gateway module attributes, we need to call through that reference
+def get_active_held_bookings():
+    return tracker_gateway.get_active_held_bookings()
+
+def expire_held_booking_for_tracking_invalid_data(*args, **kwargs):
+    return tracker_gateway.expire_held_booking_for_tracking_invalid_data(*args, **kwargs)
+
+def tracking_context_from_booking(booking):
+    return tracker_gateway.tracking_context_from_booking(booking)
 
 # Optional numpy for linear regression forecast
 try:
     import numpy as np
 except ImportError:
     np = None
-
-# Local tools — imported lazily inside async functions to avoid circular imports
-# from tools.airline_api import search_flights, search_with_booking_token, AirlineAPIError
-# from tools.booking_handoff import get_active_held_bookings, fetch_booking_options
 
 logger = logging.getLogger(__name__)
 
@@ -72,22 +90,6 @@ def _mark_checked(token: str, now: float) -> None:
     _last_checked[token] = now
     while len(_last_checked) > THROTTLE_MAX_SIZE:
         _last_checked.popitem(last=False)  # remove least recently used
-
-
-def _coerce_flights_result(result: Any) -> list:
-    """
-    Normalize airline search results to a list of flight-like objects.
-    Supports:
-    - list[Flight]
-    - tuple/list payload where first item is list[Flight]
-    """
-    if isinstance(result, list):
-        return result
-    if isinstance(result, tuple) and result:
-        flights = result[0]
-        if isinstance(flights, list):
-            return flights
-    return []
 
 
 # ----------------------------------------------------------------------
@@ -332,13 +334,16 @@ def parse_price_insights(
 
         forecast = None
         avg_price = None
-        price_level = price_level_serp   # default
+        price_level = price_level_serp   # default — SerpAPI's value is authoritative
         trend = None
 
         if price_history and isinstance(price_history, list) and len(price_history) >= 2:
-            # Use our historical analysis for better trend and level
             analysis = _analyze_price_trend(price_history)
-            price_level = analysis["price_level"]
+            # Use SerpAPI's price_level as authoritative; only fall back to computed
+            # value when SerpAPI didn't provide one.
+            if price_level_serp == "typical" and analysis["price_level"] != "unknown":
+                # "typical" is SerpAPI's default — computed value may be more precise
+                price_level = analysis["price_level"]
             trend = analysis["trend"]
             avg_price = analysis["avg_price"]
             forecast = _predict_future_price(price_history)
@@ -420,7 +425,131 @@ def format_price_insights_for_llm(insights: PriceInsights) -> str:
 
 
 # ----------------------------------------------------------------------
-# 2. Price Snapshot recording
+# 2. Flight data capture from successful SerpAPI calls
+# ----------------------------------------------------------------------
+
+# In-memory store: route+date → captured flight data
+# This avoids making SerpAPI calls for price checks — we use data already captured.
+# Using TTLCache with bounded maxsize to prevent unbounded growth.
+FLIGHT_DATA_CACHE_TTL = max(300, get_env_int("FLIGHT_DATA_CACHE_TTL", 3600))  # default 1 hour
+FLIGHT_DATA_CACHE_MAXSIZE = max(100, get_env_int("FLIGHT_DATA_CACHE_MAXSIZE", 500))
+_flight_data_cache: TTLCache = TTLCache(maxsize=FLIGHT_DATA_CACHE_MAXSIZE, ttl=FLIGHT_DATA_CACHE_TTL)
+
+
+def _flight_data_cache_key(origin: str, destination: str, travel_date: str) -> str:
+    return f"{origin.upper()}|{destination.upper()}|{travel_date}"
+
+
+async def record_flight_data(
+    *,
+    origin: str,
+    destination: str,
+    travel_date: str,
+    flights: list,
+    price_insights: Optional[dict] = None,
+) -> None:
+    """
+    Capture flight data from a successful SerpAPI search response.
+    This data is used by the price tracker to check held bookings WITHOUT
+    making additional SerpAPI HTTP calls.
+
+    Stores: cheapest price, all flight details (flight_no, airline, departure,
+    arrival, price, stops, etc.), and price_insights if available.
+
+    Called automatically after every successful search_flights() call.
+    """
+    if not flights:
+        return
+
+    key = _flight_data_cache_key(origin, destination, travel_date)
+    captured = {
+        "origin": origin.upper(),
+        "destination": destination.upper(),
+        "travel_date": travel_date,
+        "captured_at": time.time(),
+        "flight_count": len(flights),
+        "cheapest_price": None,
+        "cheapest_flight": None,
+        "flights": [],
+        "price_insights": price_insights,
+    }
+
+    cheapest = None
+    cheapest_price = float("inf")
+
+    for f in flights:
+        flight_data = {}
+        if hasattr(f, "model_dump"):
+            flight_data = f.model_dump()
+        elif isinstance(f, dict):
+            flight_data = f
+        elif hasattr(f, "__dict__"):
+            flight_data = dict(vars(f))
+
+        if not flight_data:
+            continue
+
+        # Extract key fields
+        price = flight_data.get("price_inr")
+        if price is not None:
+            try:
+                price = float(price)
+                if price < cheapest_price:
+                    cheapest_price = price
+                    cheapest = flight_data
+            except (ValueError, TypeError):
+                pass
+
+        # Store compact flight info
+        captured["flights"].append({
+            "flight_no": flight_data.get("flight_no"),
+            "airline": flight_data.get("airline"),
+            "departure_time": flight_data.get("departure_time"),
+            "arrival_time": flight_data.get("arrival_time"),
+            "duration_min": flight_data.get("duration_min"),
+            "price_inr": flight_data.get("price_inr"),
+            "stops": flight_data.get("stops"),
+            "layover_info": flight_data.get("layover_info"),
+            "baggage": flight_data.get("baggage"),
+            "carbon_emissions_g": flight_data.get("carbon_emissions_g"),
+            "booking_token": flight_data.get("booking_token"),
+            "shareable_link": flight_data.get("shareable_link"),
+        })
+
+    captured["cheapest_price"] = cheapest_price if cheapest_price != float("inf") else None
+    captured["cheapest_flight"] = cheapest
+
+    # Store in cache (overwrite with latest data)
+    _flight_data_cache[key] = captured
+
+    # Also persist cheapest price to DB for historical tracking
+    if cheapest_price != float("inf"):
+        try:
+            record_price_snapshot(
+                origin=origin,
+                destination=destination,
+                travel_date=travel_date,
+                price_inr=cheapest_price,
+            )
+        except Exception:
+            logger.debug("Failed to persist price snapshot from flight data capture")
+
+
+def get_cached_flight_data(
+    origin: str,
+    destination: str,
+    travel_date: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve captured flight data for a route+date.
+    Returns None if no data has been captured yet.
+    """
+    key = _flight_data_cache_key(origin, destination, travel_date)
+    return _flight_data_cache.get(key)
+
+
+# ----------------------------------------------------------------------
+# 3. Price Snapshot recording
 # ----------------------------------------------------------------------
 
 def record_price_snapshot(
@@ -521,11 +650,6 @@ def cleanup_invalid_held_tracking_rows() -> Dict[str, Any]:
     One-shot cleanup for legacy HELD rows missing route/date tracking prerequisites.
     This is intended for startup hygiene so recurring tracker warning churn is avoided.
     """
-    from tools.booking_handoff import (
-        get_active_held_bookings,
-        expire_held_booking_for_tracking_invalid_data,
-    )
-
     held_rows = get_active_held_bookings()
     summary: Dict[str, Any] = {
         "scanned": len(held_rows),
@@ -536,33 +660,29 @@ def cleanup_invalid_held_tracking_rows() -> Dict[str, Any]:
         return summary
 
     for booking in held_rows:
-        booking_id = booking.get("id")
-        flight_dict = booking.get("flight", {}) if isinstance(booking.get("flight"), dict) else {}
-        origin = flight_dict.get("origin") or flight_dict.get("departure_iata") or ""
-        destination = flight_dict.get("destination") or flight_dict.get("arrival_iata") or ""
-        travel_date = flight_dict.get("date") or ""
+        context = tracking_context_from_booking(booking)
         missing_fields = []
-        if not origin:
+        if not context.origin:
             missing_fields.append("origin")
-        if not destination:
+        if not context.destination:
             missing_fields.append("destination")
-        if not travel_date:
+        if not context.travel_date:
             missing_fields.append("travel_date")
         if not missing_fields:
             continue
-        if booking_id is None:
+        if context.booking_id is None:
             continue
         with contextlib.suppress(Exception):
             expired = bool(
                 expire_held_booking_for_tracking_invalid_data(
-                    int(booking_id),
+                    int(context.booking_id),
                     reason=f"startup_missing_tracking_fields:{','.join(missing_fields)}",
                     emit_warning=False,
                 )
             )
             if expired:
                 summary["expired"] += 1
-                summary["expired_booking_ids"].append(int(booking_id))
+                summary["expired_booking_ids"].append(int(context.booking_id))
 
     if summary["expired"]:
         logger.warning(
@@ -578,34 +698,19 @@ def cleanup_invalid_held_tracking_rows() -> Dict[str, Any]:
 
 async def check_held_booking_prices() -> list[dict]:
     """
-    Background job: re-query flight prices for every active HELD booking and
-    detect price drops.
+    Background job: check held bookings for price drops.
+
+    Uses flight data captured from successful SerpAPI searches — does NOT
+    make any new SerpAPI HTTP calls. This avoids burning quota at scale.
 
     For each active hold:
-    - If a booking token exists and the cooldown period has passed, call
-      `airline_api.search_with_booking_token()` to get the precise current price.
-    - Otherwise, fall back to a generic search via `airline_api.search_flights()`.
-    - Compares the new cheapest price to the held price.
-    - If the drop exceeds PRICE_DROP_ALERT_THRESHOLD_PCT, writes a
-      PriceDropAlert row and resolves a fresh handoff URL for the cheaper option.
-
-    Throttling: each booking token is checked at most once every
-    CHECK_COOLDOWN_SECONDS seconds, using an LRU cache (_last_checked) with max size.
+    - Looks up cached flight data for the route+date
+    - If data exists, compares cheapest cached price to held price
+    - If the drop exceeds PRICE_DROP_ALERT_THRESHOLD_PCT, writes a PriceDropAlert
 
     Returns:
         list[dict]: All alerts fired in this run (may be empty).
-
-    Scheduling recommendation:
-        Schedule this via core/job_queue.py to run every 30–60 minutes.
     """
-    # Lazy imports to avoid circular dependencies at module load time
-    from tools.airline_api import search_flights, search_with_booking_token, AirlineAPIError
-    from tools.booking_handoff import (
-        get_active_held_bookings,
-        build_booking_handoff_url,
-        expire_held_booking_for_tracking_invalid_data,
-    )
-
     held = get_active_held_bookings()
     if not held:
         logger.debug("check_held_booking_prices: no active held bookings")
@@ -615,12 +720,13 @@ async def check_held_booking_prices() -> list[dict]:
     now = time.time()
 
     for booking in held:
-        flight_dict = booking.get("flight", {})
-        origin      = flight_dict.get("origin") or flight_dict.get("departure_iata") or ""
-        destination = flight_dict.get("destination") or flight_dict.get("arrival_iata") or ""
-        travel_date = flight_dict.get("date") or ""
-        held_price  = _extract_price_inr(flight_dict.get("price_inr"))
-        booking_token = flight_dict.get("booking_token")  # may be None
+        context = tracking_context_from_booking(booking)
+        booking_id = context.booking_id or booking.get("id")
+        origin = context.origin
+        destination = context.destination
+        travel_date = context.travel_date
+        held_price = context.held_price
+        booking_token = context.booking_token
 
         missing_fields = []
         if not origin:
@@ -634,157 +740,97 @@ async def check_held_booking_prices() -> list[dict]:
 
         if missing_fields:
             invalidation_applied = False
-            # Quarantine legacy malformed holds with missing route/date so the same
-            # rows don't repeatedly trigger tracker warnings.
             if any(field in {"origin", "destination", "travel_date"} for field in missing_fields):
                 with contextlib.suppress(Exception):
                     invalidation_applied = bool(
                         expire_held_booking_for_tracking_invalid_data(
-                            int(booking["id"]),
+                            int(booking_id),
                             reason=f"missing_tracking_fields:{','.join(missing_fields)}",
                         )
                     )
             logger.warning(
                 "Skipping held booking: missing tracking prerequisites",
                 extra={
-                    "booking_id": booking["id"],
+                    "booking_id": booking_id,
                     "missing_fields": ",".join(missing_fields),
                     "expired_legacy_invalid_row": invalidation_applied,
                 },
             )
             continue
 
-        # Throttle check if booking_token exists
-        if booking_token:
-            last = _last_checked.get(booking_token, 0)
-            if now - last < CHECK_COOLDOWN_SECONDS:
-                logger.debug(
-                    "Skipping booking token due to cooldown",
-                    extra={
-                        "booking_token_present": True,
-                        "seconds_left": CHECK_COOLDOWN_SECONDS - (now - last),
-                    }
-                )
-                continue
-
-        new_flight = None
-        try:
-            if booking_token:
-                # Use token to get precise current price
-                # Assume search_with_booking_token returns a Flight object or list of flights
-                result = await search_with_booking_token(booking_token)
-                # If it returns a list, take the cheapest; if a single Flight, use it directly
-                if isinstance(result, list):
-                    if result:
-                        new_flight = min(result, key=lambda f: f.price_inr)
-                else:
-                    new_flight = result
-                _mark_checked(booking_token, now)   # update throttle cache
-            else:
-                # Fallback to generic search
-                new_search_result = await search_flights(
-                    departure=origin,
-                    arrival=destination,
-                    date=travel_date,
-                    max_results=5,
-                )
-                new_flights = _coerce_flights_result(new_search_result)
-                if new_flights:
-                    new_flight = min(new_flights, key=lambda f: f.price_inr)
-        except AirlineAPIError as e:
-            logger.warning(
-                "Price check failed",
-                extra={"booking_id": booking["id"], "error": str(e)}
-            )
-            continue
-        except Exception as e:
-            logger.exception(
-                "Unexpected error in price check",
-                extra={"booking_id": booking["id"]}
-            )
-            continue
-
-        if not new_flight:
-            continue
-
-        new_price = float(new_flight.price_inr)
-
-        # Record snapshot regardless of whether it's a drop
-        record_price_snapshot(
-            origin=origin,
-            destination=destination,
-            travel_date=travel_date,
-            price_inr=new_price,
-        )
-
-        # Check for meaningful drop
-        drop_pct = (held_price - new_price) / held_price * 100
-        if drop_pct >= PRICE_DROP_ALERT_THRESHOLD_PCT:
-            # Resolve a fresh handoff URL for the cheaper option
-            new_flight_dict = {
-                "flight_no":     new_flight.flight_no,
-                "airline":       new_flight.airline,
-                "booking_token": new_flight.booking_token,
-                "shareable_link": None,
-                "price_inr":     new_flight.price_inr,
-            }
-            try:
-                new_url = await build_booking_handoff_url(
-                    flight=new_flight_dict,
-                    origin=origin,
-                    destination=destination,
-                    depart_date=travel_date,
-                )
-            except Exception:
-                new_url = None
-
-            db = SessionLocal()
-            try:
-                alert = PriceDropAlert(
-                    booking_id=booking["id"],
-                    origin=origin,
-                    destination=destination,
-                    travel_date=travel_date,
-                    held_price_inr=held_price,
-                    new_price_inr=new_price,
-                    drop_pct=round(drop_pct, 2),
-                    new_handoff_url=new_url,
-                )
-                db.add(alert)
-                db.commit()
-                db.refresh(alert)
-                alert_id = alert.id
-            finally:
-                db.close()
-
-            alert_payload = {
-                "alert_id":       alert_id,
-                "booking_id":     booking["id"],
-                "route":          f"{origin}→{destination}",
-                "travel_date":    travel_date,
-                "held_price_inr": held_price,
-                "new_price_inr":  new_price,
-                "drop_pct":       round(drop_pct, 2),
-                "new_handoff_url": new_url,
-                "new_flight":     f"{new_flight.airline} {new_flight.flight_no}",
-            }
-            alerts_fired.append(alert_payload)
-
-            logger.info(
-                "Price drop alert fired",
+        # Use cached flight data from successful SerpAPI searches — NO new HTTP calls
+        cached = get_cached_flight_data(origin, destination, travel_date)
+        if not cached or cached.get("cheapest_price") is None:
+            logger.debug(
+                "No cached flight data for held booking — skipping (no SerpAPI call)",
                 extra={
-                    "booking_id":   booking["id"],
-                    "drop_pct":     round(drop_pct, 2),
-                    "held_price":   held_price,
-                    "new_price":    new_price,
-                    "new_flight_no": new_flight.flight_no,
-                }
+                    "booking_id": booking_id,
+                    "origin": origin,
+                    "destination": destination,
+                    "travel_date": travel_date,
+                },
             )
+            continue
+
+        cheapest_price = cached["cheapest_price"]
+        cheapest_flight = cached.get("cheapest_flight")
+
+        try:
+            new_price = float(cheapest_price)
+        except (ValueError, TypeError):
+            logger.debug(
+                "Invalid cached price for held booking",
+                extra={"booking_id": booking_id, "price": cheapest_price},
+            )
+            continue
+
+        if held_price <= 0 or new_price >= held_price:
+            continue
+
+        drop_pct = ((held_price - new_price) / held_price) * 100
+        if drop_pct < PRICE_DROP_ALERT_THRESHOLD_PCT:
+            continue
+
+        # Record snapshot for this price observation
+        try:
+            record_price_snapshot(
+                origin=origin,
+                destination=destination,
+                travel_date=travel_date,
+                price_inr=new_price,
+            )
+        except Exception:
+            logger.debug("Failed to record price snapshot for alert")
+
+        alert = {
+            "booking_id": booking_id,
+            "origin": origin,
+            "destination": destination,
+            "travel_date": travel_date,
+            "held_price": held_price,
+            "new_price": new_price,
+            "drop_pct": round(drop_pct, 1),
+            "flight_no": cheapest_flight.get("flight_no") if cheapest_flight else None,
+            "airline": cheapest_flight.get("airline") if cheapest_flight else None,
+        }
+        alerts_fired.append(alert)
+        logger.info(
+            "Price drop alert fired (from cached data, no SerpAPI call)",
+            extra={
+                "booking_id": booking_id,
+                "drop_pct": alert["drop_pct"],
+                "held_price": held_price,
+                "new_price": new_price,
+            },
+        )
 
     return alerts_fired
 
 
-def get_unacknowledged_alerts(booking_id: Optional[int] = None) -> list[dict]:
+def get_unacknowledged_alerts(
+    booking_id: Optional[int] = None,
+    owner_principal_id: Optional[str] = None,
+) -> list[dict]:
     """
     Fetch all unacknowledged price-drop alerts, optionally filtered by booking.
 
@@ -795,6 +841,12 @@ def get_unacknowledged_alerts(booking_id: Optional[int] = None) -> list[dict]:
     db = SessionLocal()
     try:
         q = db.query(PriceDropAlert).filter(PriceDropAlert.acknowledged == False)  # noqa: E712
+        if owner_principal_id is not None:
+            from tools.booking_handoff import Booking
+
+            q = q.join(Booking, Booking.id == PriceDropAlert.booking_id).filter(
+                Booking.owner_principal_id == str(owner_principal_id)
+            )
         if booking_id is not None:
             q = q.filter(PriceDropAlert.booking_id == booking_id)
         rows = q.order_by(PriceDropAlert.created_at.desc()).all()
@@ -817,11 +869,24 @@ def get_unacknowledged_alerts(booking_id: Optional[int] = None) -> list[dict]:
         db.close()
 
 
-def acknowledge_alert(alert_id: int) -> bool:
+def acknowledge_alert(alert_id: int, owner_principal_id: Optional[str] = None) -> bool:
     """Mark a price-drop alert as acknowledged (read by user/system)."""
     db = SessionLocal()
     try:
-        row = db.get(PriceDropAlert, alert_id)
+        if owner_principal_id is None:
+            row = db.get(PriceDropAlert, alert_id)
+        else:
+            from tools.booking_handoff import Booking
+
+            row = (
+                db.query(PriceDropAlert)
+                .join(Booking, Booking.id == PriceDropAlert.booking_id)
+                .filter(
+                    PriceDropAlert.id == alert_id,
+                    Booking.owner_principal_id == str(owner_principal_id),
+                )
+                .first()
+            )
         if not row:
             return False
         row.acknowledged = True

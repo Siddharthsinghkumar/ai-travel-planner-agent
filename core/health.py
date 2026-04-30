@@ -6,12 +6,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Callable, Awaitable
 
-from fastapi import APIRouter, Query, Header, Depends, HTTPException
-
 # Local imports (adjust if needed)
 from core.api_key_manager import key_manager
-from core.env_config import get_env_str
-from agents.cloud_llm import clear_client_cache, is_cloud_admin_enabled, get_usable_providers
+from core.env_config import get_env_float
+from agents.cloud_llm import is_cloud_admin_enabled, get_usable_providers
 from core.llm_mode import get_llm_mode_default, LLM_MODE_OLLAMA_ONLY
 
 logger = logging.getLogger(__name__)
@@ -49,12 +47,32 @@ def _get_health_func(module_path: str) -> Callable[[], Awaitable[str]]:
 
 async def check_database() -> str:
     """
-    Placeholder for database health check.
-    Replace with actual DB connection test.
+    Run a lightweight DB readiness probe.
+    Returns: ok | degraded | unavailable | fail
     """
-    # Example: simulate async check
-    await asyncio.sleep(0.1)
-    return "ok"
+    timeout_seconds = max(0.2, float(get_env_float("HEALTH_DB_TIMEOUT_SECONDS", 1.0)))
+    try:
+        from agents.database import SessionLocal
+        from sqlalchemy import text
+    except Exception:
+        return "unavailable"
+
+    def _ping() -> None:
+        session = SessionLocal()
+        try:
+            session.execute(text("SELECT 1"))
+        finally:
+            session.close()
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=timeout_seconds)
+        return "ok"
+    except asyncio.TimeoutError:
+        logger.warning("health_db_check_timeout", extra={"timeout_seconds": timeout_seconds})
+        return "degraded"
+    except Exception:
+        logger.exception("health_db_check_failed")
+        return "fail"
 
 
 def is_key_active(entry) -> bool:
@@ -408,80 +426,3 @@ async def full_health_check_verbose() -> Dict[str, Any]:
         "keys": format_keys_human_readable(key_status),
         "messages": slim.get("messages", {}),
     }
-
-
-# ------------------------------------------------------------------------------
-# Admin token dependency
-# ------------------------------------------------------------------------------
-
-def require_admin_token(x_admin_token: str = Header(...)):
-    expected = get_env_str("ADMIN_TOKEN")
-    if not expected or x_admin_token != expected:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-# ------------------------------------------------------------------------------
-# FastAPI routes
-# ------------------------------------------------------------------------------
-
-router = APIRouter()
-
-
-@router.get("/debug/keys", dependencies=[Depends(require_admin_token)])
-async def debug_keys():
-    """Raw key status (admin only)."""
-    return await key_manager.get_status()
-
-
-@router.get("/health/keys")
-async def health_keys(detail: bool = Query(False, description="If true, include raw entry under each key")):
-    """Human-friendly key view (public, no auth required)."""
-    try:
-        status = await key_manager.get_status()
-    except Exception:
-        try:
-            status = key_manager.status()
-            if asyncio.iscoroutine(status):
-                status = await status
-        except Exception:
-            logger.exception("Failed to read key status for health/keys")
-            status = {}
-
-    formatted = format_keys_human_readable(status)
-    if not detail:
-        for svc_data in formatted.values():
-            for k in svc_data["keys"]:
-                k.pop("raw", None)
-    return formatted
-
-
-@router.post("/debug/keys/refresh", dependencies=[Depends(require_admin_token)])
-async def force_refresh():
-    """Reload keys from environment (admin only)."""
-    await key_manager.refresh_from_env(sync=False)
-    return {"ok": True}
-
-
-@router.post("/debug/keys/clear-client", dependencies=[Depends(require_admin_token)])
-async def clear_client(provider: str, idx: int):
-    """Evict a cached client (admin only)."""
-    try:
-        await clear_client_cache(provider, idx)
-        return {"ok": True, "provider": provider, "idx": idx}
-    except Exception as e:
-        logger.exception("Client cache clear failed")
-        return {"ok": False, "error": str(e)}
-
-
-@router.get("/health/ready")
-async def health_ready(
-    refresh: bool = Query(False, description="If true, refresh API keys from environment before checking health")
-):
-    """Readiness probe (public) — returns verbose health info including keys."""
-    if refresh:
-        try:
-            await key_manager.refresh_from_env(sync=False)
-            logger.info("Manual key refresh triggered via health_ready endpoint")
-        except Exception:
-            logger.exception("Key refresh in health check failed")
-    return await full_health_check_verbose()

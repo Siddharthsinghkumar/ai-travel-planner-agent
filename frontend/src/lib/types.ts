@@ -6,6 +6,8 @@ export interface BookingHandoffMeta {
   status?: string;
   booking_exit_quality?: string;
   provider?: string;
+  blocked_domain?: string;
+  diagnostics?: Record<string, unknown>;
   selected_flight_rank?: number;
   round_trip?: {
     return_search_outcome?: string;
@@ -37,10 +39,14 @@ export interface Flight {
   baggage_prices?: unknown;
   booking_sellers?: string[];
   booking_handoff?: BookingHandoffMeta;
+  booking_token?: string;
+  airline_logo?: string;
+  price_unavailable?: boolean;
 }
 
 export interface TripDebugInfo {
   all_flights?: Flight[];
+  top_flights?: Flight[];
   agent_reasoning?: unknown;
   reasoning?: unknown;
   intent?: Record<string, unknown>;
@@ -61,6 +67,7 @@ export interface MultiCityLeg {
 export interface TripPlan {
   best_flight?: Flight;
   all_flights?: Flight[];
+  top_flights?: Flight[];
   weather?: Record<string, unknown> | null;
   return_trip?: MultiCityLeg | null;
   warnings?: string[] | null;
@@ -147,6 +154,50 @@ export interface BookingActionResponse {
   best_flight?: Flight | Record<string, unknown>;
   monitoring_active?: boolean;
   booking_id?: number;
+}
+
+export interface BookingResolveHandoffResponse {
+  action: "resolve_booking_handoff";
+  success: boolean;
+  handoff_url?: string | null;
+  booking_handoff?: BookingHandoffMeta | Record<string, unknown> | null;
+  blocked_reason?: string | null;
+  blocked_category?: string | null;
+  retryable?: boolean | null;
+  message?: string;
+  auth_mode?: "authenticated_token" | "local_dev_unauthed" | string;
+  auth_required?: boolean;
+  owner_principal_id?: string | null;
+  best_flight?: Flight | Record<string, unknown>;
+}
+
+export interface BookingResolveState {
+  status: "idle" | "resolving" | "resolved" | "failed";
+  message?: string;
+  handoff_url?: string | null;
+  blocked_reason?: string | null;
+  blocked_category?: string | null;
+  retryable?: boolean;
+  updated_at?: number;
+}
+
+export interface BookingHandoffCapabilities {
+  action: "booking_handoff_capabilities";
+  resolve_available_now: boolean;
+  auth_mode: "authenticated_token" | "local_dev_unauthed" | "auth_required" | string;
+  resolve_auth_mode?: "auto" | "omit" | string;
+  auth_required: boolean;
+  has_valid_token: boolean;
+  token_present?: boolean;
+  auth_rejected?: boolean;
+  auth_error?: string | null;
+  blocked_reason?: string | null;
+  local_dev_unauth_configured: boolean;
+  local_dev_unauth_enabled?: boolean;
+  loopback_request: boolean;
+  loopback_eligible?: boolean;
+  local_dev_unauth_available: boolean;
+  message?: string;
 }
 
 export interface PriceAlert {

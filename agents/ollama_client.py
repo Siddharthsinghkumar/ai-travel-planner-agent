@@ -12,6 +12,7 @@ import logging
 import json
 import time
 import weakref
+from pathlib import Path
 from typing import Optional, Union, AsyncGenerator
 
 import httpx
@@ -33,6 +34,7 @@ from core.retry import RetryConfig, async_retry
 from core.exceptions import LLMError
 from core.metrics import increment_llm_success, increment_llm_failure, increment_llm_cancelled
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str
+from core.ollama_context import RUNTIME_NUM_CTX_DEFAULT, resolve_runtime_num_ctx
 
 # ----------------------------------------------------------------------
 # Environment and defaults
@@ -42,6 +44,8 @@ OLLAMA_MODEL = get_env_str("OLLAMA_MODEL", "openhermes")
 OLLAMA_TIMEOUT = get_env_float("OLLAMA_TIMEOUT", 30.0)   # default timeout in seconds
 OLLAMA_BREAKER_FAILURE_THRESHOLD = max(1, get_env_int("OLLAMA_BREAKER_FAILURE_THRESHOLD", 5))
 OLLAMA_BREAKER_RECOVERY_TIMEOUT = max(5, get_env_int("OLLAMA_BREAKER_RECOVERY_TIMEOUT", 60))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_RUNTIME_DOTENV_CANDIDATES = (_PROJECT_ROOT / ".env",)
 
 def _resolve_ollama_model() -> str:
     model = (get_env_str("OLLAMA_MODEL", OLLAMA_MODEL) or OLLAMA_MODEL).strip()
@@ -53,10 +57,35 @@ def _resolve_ollama_model() -> str:
 def _resolve_ollama_base_url() -> str:
     base_url = (get_env_str("OLLAMA_BASE_URL", OLLAMA_BASE_URL) or OLLAMA_BASE_URL).strip()
     try:
-        httpx.URL(base_url)
+        parsed = httpx.URL(base_url)
     except Exception as e:
         raise RuntimeError(f"Invalid OLLAMA_BASE_URL: {base_url}") from e
-    return base_url
+    host = (parsed.host or "").strip().lower()
+    if host in {"0.0.0.0", "::"}:
+        # 0.0.0.0 is valid for server bind, but invalid as a client destination.
+        # Normalize to loopback so planner/router can reach local Ollama reliably.
+        host = "127.0.0.1"
+
+    normalized = f"{parsed.scheme}://{host}"
+    if parsed.port:
+        normalized += f":{parsed.port}"
+
+    # Preserve an explicit non-root path prefix, but never return a trailing slash
+    # to avoid constructing URLs like "...//api/chat".
+    path = parsed.path
+    if isinstance(path, bytes):
+        path = path.decode(errors="ignore")
+    path = (path or "").strip()
+    if path and path != "/":
+        normalized += path.rstrip("/")
+
+    query = parsed.query
+    if isinstance(query, bytes):
+        query = query.decode(errors="ignore")
+    if query:
+        normalized += f"?{query}"
+
+    return normalized
 
 
 def _resolve_ollama_timeout() -> float:
@@ -75,6 +104,89 @@ def _resolve_ollama_thinking_mode() -> str:
     if raw in {"disable", "force", "auto"}:
         return raw
     return "auto"
+
+
+def _resolve_ollama_num_ctx() -> Optional[int]:
+    """
+    Optional explicit context window for Ollama requests.
+    Returns None when unset/invalid so runtime defaults apply.
+    """
+    resolution = resolve_runtime_num_ctx(
+        process_env=None,
+        dotenv_paths=_RUNTIME_DOTENV_CANDIDATES,
+        minimum_value=1,
+        fallback_default=RUNTIME_NUM_CTX_DEFAULT,
+    )
+    value = resolution.get("effective_num_ctx")
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def _estimate_tokens_from_chars(chars: int) -> int:
+    if chars <= 0:
+        return 0
+    return max(1, (int(chars) + 3) // 4)
+
+
+def _message_char_stats(messages: object) -> dict:
+    system_chars = 0
+    user_chars = 0
+    assistant_chars = 0
+    total_chars = 0
+    if not isinstance(messages, list):
+        return {
+            "system_chars": 0,
+            "user_chars": 0,
+            "assistant_chars": 0,
+            "total_chars": 0,
+            "prompt_est_tokens": 0,
+        }
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        chars = len(content)
+        total_chars += chars
+        role = str(message.get("role") or "").strip().lower()
+        if role == "system":
+            system_chars += chars
+        elif role == "assistant":
+            assistant_chars += chars
+        else:
+            user_chars += chars
+    return {
+        "system_chars": system_chars,
+        "user_chars": user_chars,
+        "assistant_chars": assistant_chars,
+        "total_chars": total_chars,
+        "prompt_est_tokens": _estimate_tokens_from_chars(total_chars),
+    }
+
+
+def get_runtime_inference_config() -> dict:
+    """
+    Return resolved local-runtime config that materially affects memory/latency.
+    """
+    num_ctx_resolution = resolve_runtime_num_ctx(
+        process_env=None,
+        dotenv_paths=_RUNTIME_DOTENV_CANDIDATES,
+        minimum_value=1,
+        fallback_default=RUNTIME_NUM_CTX_DEFAULT,
+    )
+    num_ctx = num_ctx_resolution.get("effective_num_ctx")
+    num_ctx_value = int(num_ctx) if isinstance(num_ctx, int) and num_ctx > 0 else None
+    return {
+        "backend": "ollama",
+        "model": _resolve_ollama_model(),
+        "num_ctx": num_ctx_value,
+        "num_ctx_source": str(num_ctx_resolution.get("source") or "unset"),
+        "num_ctx_process_raw": str(num_ctx_resolution.get("process_raw") or ""),
+        "thinking_mode": _resolve_ollama_thinking_mode(),
+        "timeout_sec": _resolve_ollama_timeout(),
+    }
 
 # ----------------------------------------------------------------------
 # Logging setup
@@ -238,11 +350,20 @@ async def _streaming_call_internal(
     # Granular timeouts
     timeout_obj = httpx.Timeout(connect=5.0, read=timeout, write=10.0, pool=5.0)
 
+    msg_stats = _message_char_stats(payload.get("messages"))
+    request_start_monotonic = time.monotonic()
+    request_start_epoch_ms = int(time.time() * 1000)
+
     # Counter to limit JSON decode error logging
     bad_json_count = 0
     max_bad_json_log = 5
     visible_chunk_count = 0
     thinking_heartbeat_count = 0
+    response_chars = 0
+    first_chunk_latency_sec: Optional[float] = None
+    first_visible_chunk_latency_sec: Optional[float] = None
+    first_chunk_epoch_ms: Optional[int] = None
+    first_visible_chunk_epoch_ms: Optional[int] = None
 
     try:
         async with client.stream(
@@ -310,14 +431,26 @@ async def _streaming_call_internal(
                     continue
                 token, token_kind = _extract_stream_token_or_heartbeat(data)
                 if token_kind == "visible":
+                    if first_chunk_latency_sec is None:
+                        first_chunk_latency_sec = time.monotonic() - request_start_monotonic
+                        first_chunk_epoch_ms = int(time.time() * 1000)
+                    if first_visible_chunk_latency_sec is None:
+                        first_visible_chunk_latency_sec = time.monotonic() - request_start_monotonic
+                        first_visible_chunk_epoch_ms = int(time.time() * 1000)
                     visible_chunk_count += 1
+                    response_chars += len(token or "")
                     yield token  # type: ignore[arg-type]
                 elif token_kind == "thinking_heartbeat":
+                    if first_chunk_latency_sec is None:
+                        first_chunk_latency_sec = time.monotonic() - request_start_monotonic
+                        first_chunk_epoch_ms = int(time.time() * 1000)
                     thinking_heartbeat_count += 1
                     # Yield an empty heartbeat so router/planner can mark the stream as alive
                     # without exposing internal reasoning text.
                     yield ""
                 if data.get("done"):
+                    completion_epoch_ms = int(time.time() * 1000)
+                    completion_latency_sec = time.monotonic() - request_start_monotonic
                     logger.debug(
                         "ollama_stream_chunk_profile",
                         extra={
@@ -325,6 +458,33 @@ async def _streaming_call_internal(
                             "visible_chunks": visible_chunk_count,
                             "thinking_heartbeat_chunks": thinking_heartbeat_count,
                             "model": payload.get("model"),
+                            "request_start_epoch_ms": request_start_epoch_ms,
+                            "first_chunk_epoch_ms": first_chunk_epoch_ms,
+                            "first_visible_chunk_epoch_ms": first_visible_chunk_epoch_ms,
+                            "completion_epoch_ms": completion_epoch_ms,
+                            "first_chunk_latency_sec": (
+                                round(first_chunk_latency_sec, 3)
+                                if first_chunk_latency_sec is not None
+                                else None
+                            ),
+                            "first_visible_chunk_latency_sec": (
+                                round(first_visible_chunk_latency_sec, 3)
+                                if first_visible_chunk_latency_sec is not None
+                                else None
+                            ),
+                            "completion_latency_sec": round(completion_latency_sec, 3),
+                            "prompt_chars": msg_stats.get("total_chars"),
+                            "prompt_est_tokens": msg_stats.get("prompt_est_tokens"),
+                            "response_chars": response_chars,
+                            "response_est_tokens": _estimate_tokens_from_chars(response_chars),
+                            "done": data.get("done"),
+                            "done_reason": data.get("done_reason"),
+                            "total_duration": data.get("total_duration"),
+                            "load_duration": data.get("load_duration"),
+                            "prompt_eval_count": data.get("prompt_eval_count"),
+                            "prompt_eval_duration": data.get("prompt_eval_duration"),
+                            "eval_count": data.get("eval_count"),
+                            "eval_duration": data.get("eval_duration"),
                         },
                     )
                     break
@@ -405,6 +565,9 @@ async def _non_streaming_call_impl(
     so the retry filter will decide: 429 and 5xx will be retried, other 4xx will not.
     """
     client = await get_async_client()
+    request_start_monotonic = time.monotonic()
+    request_start_epoch_ms = int(time.time() * 1000)
+    msg_stats = _message_char_stats(payload.get("messages"))
     headers = {}
     if request_id:
         headers["X-Request-ID"] = request_id
@@ -477,6 +640,36 @@ async def _non_streaming_call_impl(
         except json.JSONDecodeError as e:
             raise OllamaError(f"Invalid JSON from Ollama: {e}") from e
 
+        completion_stats = {
+            "request_id": request_id,
+            "model": payload.get("model"),
+            "request_start_epoch_ms": request_start_epoch_ms,
+            "completion_epoch_ms": int(time.time() * 1000),
+            "completion_latency_sec": round(time.monotonic() - request_start_monotonic, 3),
+            "prompt_chars": msg_stats.get("total_chars"),
+            "prompt_est_tokens": msg_stats.get("prompt_est_tokens"),
+            "done": data.get("done"),
+            "done_reason": data.get("done_reason"),
+            "total_duration": data.get("total_duration"),
+            "load_duration": data.get("load_duration"),
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "prompt_eval_duration": data.get("prompt_eval_duration"),
+            "eval_count": data.get("eval_count"),
+            "eval_duration": data.get("eval_duration"),
+        }
+        if any(
+            completion_stats.get(k) is not None
+            for k in (
+                "total_duration",
+                "load_duration",
+                "prompt_eval_count",
+                "prompt_eval_duration",
+                "eval_count",
+                "eval_duration",
+            )
+        ):
+            logger.debug("ollama_non_stream_completion_stats", extra=completion_stats)
+
         content: Optional[str] = None
         message_obj = data.get("message")
         if isinstance(message_obj, dict):
@@ -489,6 +682,9 @@ async def _non_streaming_call_impl(
                 content = maybe_response
         if content is None:
             raise OllamaError("Malformed response: missing message.content/response")
+        completion_stats["response_chars"] = len(content)
+        completion_stats["response_est_tokens"] = _estimate_tokens_from_chars(len(content))
+        logger.debug("ollama_non_stream_runtime_profile", extra=completion_stats)
         return content
     except httpx.HTTPStatusError as exc:
         # Use body_bytes from above if available, else read again carefully
@@ -565,13 +761,18 @@ async def prewarm(
     """
     warm_model = (model or _resolve_ollama_model()).strip()
     resolved_timeout = _resolve_ollama_timeout() if timeout is None else max(1.0, float(timeout))
+    options = {"temperature": 0.0}
+    num_ctx = _resolve_ollama_num_ctx()
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
+
     payload = {
         "model": warm_model,
         "messages": [
             {"role": "system", "content": "Respond with OK only."},
             {"role": "user", "content": "ok"},
         ],
-        "options": {"temperature": 0.0},
+        "options": options,
         "stream": False,
     }
     try:
@@ -623,6 +824,8 @@ async def generate(
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    msg_stats = _message_char_stats(messages)
+    request_start_epoch_ms = int(time.time() * 1000)
 
     payload = {
         "model": resolved_model,
@@ -630,6 +833,9 @@ async def generate(
         "options": {"temperature": temperature},
         "stream": stream
     }
+    num_ctx = _resolve_ollama_num_ctx()
+    if num_ctx is not None:
+        payload["options"]["num_ctx"] = num_ctx
     thinking_mode = _resolve_ollama_thinking_mode()
     if thinking_mode == "disable":
         payload["options"]["think"] = False
@@ -644,6 +850,10 @@ async def generate(
             "request_id": request_id,
             "temperature": temperature,
             "thinking_mode": thinking_mode,
+            "num_ctx": num_ctx,
+            "request_start_epoch_ms": request_start_epoch_ms,
+            "prompt_chars": msg_stats.get("total_chars"),
+            "prompt_est_tokens": msg_stats.get("prompt_est_tokens"),
         }
     )
 
@@ -654,6 +864,10 @@ async def generate(
         async def token_generator():
             success = False
             cancelled = False
+            first_chunk_latency_sec: Optional[float] = None
+            first_chunk_epoch_ms: Optional[int] = None
+            response_chars = 0
+            chunk_count = 0
             stream_iter = _streaming_call(payload, request_id, resolved_timeout)
             try:
                 # Do not enforce an additional total stream timeout here.
@@ -661,6 +875,11 @@ async def generate(
                 # A duplicate total timeout at this layer can cause avoidable degradation
                 # even while chunks are flowing successfully.
                 async for token in stream_iter:
+                    chunk_count += 1
+                    if first_chunk_latency_sec is None:
+                        first_chunk_latency_sec = time.monotonic() - start_time
+                        first_chunk_epoch_ms = int(time.time() * 1000)
+                    response_chars += len(token or "")
                     yield token
                 success = True
             except asyncio.CancelledError:
@@ -674,7 +893,24 @@ async def generate(
                 latency = time.monotonic() - start_time
                 logger.debug(
                     "Ollama streaming completed",
-                    extra={"request_id": request_id, "latency_sec": latency}
+                    extra={
+                        "request_id": request_id,
+                        "model": resolved_model,
+                        "latency_sec": round(latency, 3),
+                        "request_start_epoch_ms": request_start_epoch_ms,
+                        "first_chunk_epoch_ms": first_chunk_epoch_ms,
+                        "completion_epoch_ms": int(time.time() * 1000),
+                        "first_chunk_latency_sec": (
+                            round(first_chunk_latency_sec, 3)
+                            if first_chunk_latency_sec is not None
+                            else None
+                        ),
+                        "chunks": chunk_count,
+                        "response_chars": response_chars,
+                        "response_est_tokens": _estimate_tokens_from_chars(response_chars),
+                        "prompt_chars": msg_stats.get("total_chars"),
+                        "prompt_est_tokens": msg_stats.get("prompt_est_tokens"),
+                    }
                 )
                 if success:
                     increment_llm_success("ollama")
@@ -699,7 +935,17 @@ async def generate(
             latency = time.monotonic() - start_time
             logger.debug(
                 "Ollama request succeeded",
-                extra={"request_id": request_id, "latency_sec": latency}
+                extra={
+                    "request_id": request_id,
+                    "model": resolved_model,
+                    "latency_sec": round(latency, 3),
+                    "request_start_epoch_ms": request_start_epoch_ms,
+                    "completion_epoch_ms": int(time.time() * 1000),
+                    "prompt_chars": msg_stats.get("total_chars"),
+                    "prompt_est_tokens": msg_stats.get("prompt_est_tokens"),
+                    "response_chars": len(result or ""),
+                    "response_est_tokens": _estimate_tokens_from_chars(len(result or "")),
+                }
             )
             increment_llm_success("ollama")
             return result

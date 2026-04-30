@@ -1,0 +1,263 @@
+{
+  "source": "fastapi_openapi",
+  "endpoints": {
+    "/llm/options": {
+      "method": "GET",
+      "type_name": "LLMOptionsResponse",
+      "schema": {
+        "$ref": "#/components/schemas/LLMOptionsResponseContract"
+      }
+    },
+    "/version": {
+      "method": "GET",
+      "type_name": "ServerVersionMeta",
+      "schema": {
+        "$ref": "#/components/schemas/VersionResponseContract"
+      }
+    }
+  },
+  "components": {
+    "BackendAvailability": {
+      "properties": {
+        "cloud": {
+          "type": "boolean",
+          "title": "Cloud"
+        },
+        "ollama": {
+          "type": "boolean",
+          "title": "Ollama"
+        }
+      },
+      "type": "object",
+      "required": [
+        "cloud",
+        "ollama"
+      ],
+      "title": "BackendAvailability"
+    },
+    "LLMOptionsConfigAuthority": {
+      "properties": {
+        "llm_mode": {
+          "additionalProperties": true,
+          "type": "object",
+          "title": "Llm Mode"
+        },
+        "cloud_provider_chain": {
+          "additionalProperties": true,
+          "type": "object",
+          "title": "Cloud Provider Chain"
+        },
+        "mode_dependency": {
+          "additionalProperties": true,
+          "type": "object",
+          "title": "Mode Dependency"
+        },
+        "effective_timeouts": {
+          "additionalProperties": true,
+          "type": "object",
+          "title": "Effective Timeouts"
+        },
+        "timeout_ownership": {
+          "additionalProperties": true,
+          "type": "object",
+          "title": "Timeout Ownership"
+        },
+        "deprecated_env_active": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "title": "Deprecated Env Active",
+          "default": []
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "required": [
+        "llm_mode",
+        "cloud_provider_chain",
+        "mode_dependency",
+        "effective_timeouts",
+        "timeout_ownership"
+      ],
+      "title": "LLMOptionsConfigAuthority"
+    },
+    "LLMOptionsDefaults": {
+      "properties": {
+        "llm_mode": {
+          "type": "string",
+          "enum": [
+            "ollama_only",
+            "cloud_only",
+            "cloud_first",
+            "ollama_first"
+          ],
+          "title": "Llm Mode"
+        },
+        "cloud_provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cloud Provider"
+        }
+      },
+      "type": "object",
+      "required": [
+        "llm_mode"
+      ],
+      "title": "LLMOptionsDefaults"
+    },
+    "LLMOptionsResponseContract": {
+      "properties": {
+        "llm_modes": {
+          "items": {
+            "type": "string",
+            "enum": [
+              "ollama_only",
+              "cloud_only",
+              "cloud_first",
+              "ollama_first"
+            ]
+          },
+          "type": "array",
+          "title": "Llm Modes"
+        },
+        "cloud_providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "title": "Cloud Providers"
+        },
+        "defaults": {
+          "$ref": "#/components/schemas/LLMOptionsDefaults"
+        },
+        "provider_status": {
+          "additionalProperties": {
+            "$ref": "#/components/schemas/ProviderStatusEntry"
+          },
+          "type": "object",
+          "title": "Provider Status"
+        },
+        "usable_cloud_providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "title": "Usable Cloud Providers"
+        },
+        "cloud_usable": {
+          "type": "boolean",
+          "title": "Cloud Usable"
+        },
+        "cloud_enabled_by_config": {
+          "type": "boolean",
+          "title": "Cloud Enabled By Config"
+        },
+        "provider_switch_enabled": {
+          "type": "boolean",
+          "title": "Provider Switch Enabled"
+        },
+        "effective_default_provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective Default Provider"
+        },
+        "effective_mode": {
+          "type": "string",
+          "enum": [
+            "ollama_only",
+            "cloud_only",
+            "cloud_first",
+            "ollama_first"
+          ],
+          "title": "Effective Mode"
+        },
+        "backend_availability": {
+          "$ref": "#/components/schemas/BackendAvailability"
+        },
+        "config_authority": {
+          "$ref": "#/components/schemas/LLMOptionsConfigAuthority"
+        }
+      },
+      "type": "object",
+      "required": [
+        "llm_modes",
+        "cloud_providers",
+        "defaults",
+        "provider_status",
+        "usable_cloud_providers",
+        "cloud_usable",
+        "cloud_enabled_by_config",
+        "provider_switch_enabled",
+        "effective_mode",
+        "backend_availability",
+        "config_authority"
+      ],
+      "title": "LLMOptionsResponseContract"
+    },
+    "ProviderStatusEntry": {
+      "properties": {
+        "configured": {
+          "type": "boolean",
+          "title": "Configured"
+        },
+        "initialized": {
+          "type": "boolean",
+          "title": "Initialized"
+        },
+        "usable": {
+          "type": "boolean",
+          "title": "Usable"
+        },
+        "init_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Init Reason"
+        }
+      },
+      "type": "object",
+      "required": [
+        "configured",
+        "initialized",
+        "usable"
+      ],
+      "title": "ProviderStatusEntry"
+    },
+    "VersionResponseContract": {
+      "properties": {
+        "git_commit": {
+          "type": "string",
+          "title": "Git Commit"
+        },
+        "file_mtime": {
+          "type": "number",
+          "title": "File Mtime"
+        }
+      },
+      "type": "object",
+      "required": [
+        "git_commit",
+        "file_mtime"
+      ],
+      "title": "VersionResponseContract"
+    }
+  }
+}

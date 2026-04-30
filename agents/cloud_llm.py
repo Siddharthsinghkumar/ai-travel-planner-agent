@@ -57,6 +57,8 @@ _FALLBACK_WARNING_STATE: Dict[str, Dict[str, float]] = {}
 _EXHAUSTION_EVENT_DEDUP: Dict[str, float] = {}
 # --------------------------------------------------
 
+_CACHE_MANAGED_PROVIDERS = {"openai", "anthropic"}
+
 _provider_chain_lock = threading.Lock()
 
 # ---- Cloud enablement flag ----
@@ -152,6 +154,11 @@ def _should_emit_exhaustion_reaction_log(event_key: str) -> bool:
     return True
 
 
+def _is_cache_managed_provider(provider: Any) -> bool:
+    normalized = str(provider or "").strip().lower()
+    return normalized in _CACHE_MANAGED_PROVIDERS
+
+
 def _openai_exhaustion_reason(exc: Exception) -> str:
     """
     Distinguish account/billing exhaustion from ordinary rate-limit cooldowns.
@@ -238,6 +245,16 @@ async def _apply_gemini_runtime_exhaustion(idx: int, bucket: str, error_text: st
     else:
         until = now_utc + timedelta(seconds=max(60, int(PROVIDER_FAIL_COOLDOWN)))
         note = "auto_runtime_rate_limit_project_scoped"
+
+    # Dedup: avoid re-applying the same scope+type override within the dedup window
+    dedup_key = f"gemini_override|{scope_type}|{scope_identifier}|{note}"
+    if not _should_emit_exhaustion_reaction_log(dedup_key):
+        logger.debug(
+            "Gemini runtime exhaustion override deduped (scope=%s identifier=%s)",
+            scope_type,
+            scope_identifier,
+        )
+        return
 
     try:
         await key_manager.set_provider_state_override(
@@ -524,32 +541,42 @@ async def close_all_clients():
 # ----------------------------------------------------------------------
 async def on_key_event(event: str, payload: dict):
     """
-    Handle key events from the key manager.
+    Handle key-manager events for cloud provider client-cache hygiene.
     Expected events: "key_exhausted", "env_changed".
+    This listener only owns cached SDK clients for cloud LLM providers
+    (currently openai/anthropic). Non-cloud services are intentionally ignored.
     """
     try:
         if event == "key_exhausted":
             provider = payload.get("service")
             idx = payload.get("index")
             if provider and idx is not None:
+                # Dedup by service+idx+reason_class only — pending status is a
+                # lifecycle detail, not a distinct event worth logging twice.
                 dedup_key = "|".join(
                     [
                         str(provider),
                         str(idx),
                         str(payload.get("reason_class") or ""),
-                        str(payload.get("until") or ""),
-                        str(bool(payload.get("pending"))),
                     ]
                 )
+                if not _is_cache_managed_provider(provider):
+                    if _should_emit_exhaustion_reaction_log(dedup_key):
+                        logger.debug(
+                            "api_key_manager key_exhausted for %s:%d; cloud client-cache listener skipped (provider has no cached cloud SDK client)",
+                            provider,
+                            idx,
+                        )
+                    return
                 if _should_emit_exhaustion_reaction_log(dedup_key):
-                    logger.warning(
-                        "Received key_exhausted event for %s:%d; reacting by clearing cached client state",
+                    logger.info(
+                        "api_key_manager key_exhausted for %s:%d; cloud client-cache listener clearing cached cloud SDK client state",
                         provider,
                         idx,
                     )
                 else:
                     logger.debug(
-                        "Deduped key_exhausted reaction log for %s:%d; clearing cache silently",
+                        "Deduped key_exhausted reaction log for %s:%d; cloud client-cache listener clearing cache silently",
                         provider,
                         idx,
                     )
@@ -562,6 +589,13 @@ async def on_key_event(event: str, payload: dict):
             # Keep provider init/runtime capability aligned with current env config.
             refresh_provider_chain_from_env(force=True)
             for provider, idx in affected:
+                if not _is_cache_managed_provider(provider):
+                    logger.debug(
+                        "api_key_manager env_changed includes %s:%d; cloud client-cache listener skipped (provider has no cached cloud SDK client)",
+                        provider,
+                        idx,
+                    )
+                    continue
                 # try to find the new fingerprint for this provider/idx (fall back to old)
                 expected_fp = None
                 try:
@@ -573,7 +607,7 @@ async def on_key_event(event: str, payload: dict):
                     pass
 
                 logger.debug(
-                    "Environment changed for %s:%d – clearing client cache (expected_fp=%s)",
+                    "api_key_manager env_changed for %s:%d; cloud client-cache listener clearing cache (expected_fp=%s)",
                     provider,
                     idx,
                     expected_fp,
@@ -1142,7 +1176,6 @@ def _resolve_provider_entries(
     selected_provider: Optional[str],
     allow_provider_fallback: bool,
 ) -> List[Tuple[str, "ProviderAdapter", Tuple]]:
-    refresh_provider_chain_from_env(force=False)
     entries = list(provider_chain)
     if not entries:
         return []
@@ -1174,7 +1207,6 @@ def _resolve_provider_entries(
 
 
 def get_available_providers() -> List[str]:
-    refresh_provider_chain_from_env(force=False)
     return [name for name, _, _ in provider_chain]
 
 
@@ -1214,8 +1246,8 @@ def _is_key_entry_usable(entry: Any, now_ts: float) -> bool:
 
 
 async def get_provider_usability() -> Dict[str, bool]:
-    refresh_provider_chain_from_env(force=False)
-    providers = get_available_providers()
+    await asyncio.to_thread(refresh_provider_chain_from_env, force=False)
+    providers = [name for name, _, _ in provider_chain]
     if not providers:
         return {}
 
@@ -1249,7 +1281,8 @@ async def get_provider_usability() -> Dict[str, bool]:
 
 async def get_usable_providers() -> List[str]:
     usability = await get_provider_usability()
-    return [provider for provider in get_available_providers() if usability.get(provider, False)]
+    providers = [name for name, _, _ in provider_chain]
+    return [provider for provider in providers if usability.get(provider, False)]
 
 
 async def cloud_backend_is_usable(*, respect_admin_flag: bool = True) -> bool:
@@ -1357,7 +1390,7 @@ async def generate(
     """
     if not is_cloud_admin_enabled():
         raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
-    refresh_provider_chain_from_env(force=False)
+    await asyncio.to_thread(refresh_provider_chain_from_env, force=False)
 
     # Handle defaults
     primary_model = (get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL) if model is None else model
@@ -1486,7 +1519,7 @@ async def generate_stream(
     """
     if not is_cloud_admin_enabled():
         raise CloudLLMError("Cloud LLM is disabled by configuration (USE_CLOUD_LLM=0)")
-    refresh_provider_chain_from_env(force=False)
+    await asyncio.to_thread(refresh_provider_chain_from_env, force=False)
 
     primary_model = (get_env_str("CLOUD_LLM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL) if model is None else model
     temperature = get_env_float("CLOUD_LLM_TEMPERATURE", DEFAULT_TEMPERATURE) if temperature is None else temperature
@@ -1735,7 +1768,7 @@ async def health_check() -> str:
     if not is_cloud_admin_enabled():
         logger.info("Cloud LLM disabled via USE_CLOUD_LLM=0; skipping cloud health probe.")
         return "disabled"
-    refresh_provider_chain_from_env(force=False)
+    await asyncio.to_thread(refresh_provider_chain_from_env, force=False)
 
     usable_providers = await get_usable_providers()
     if not usable_providers:
@@ -1838,9 +1871,6 @@ class CloudLLMClient:
 
     async def get_provider_usability(self) -> Dict[str, bool]:
         return await get_provider_usability()
-
-    async def get_usable_providers(self) -> List[str]:
-        return await get_usable_providers()
 
     async def has_usable_provider(self) -> bool:
         return await cloud_backend_is_usable(respect_admin_flag=True)

@@ -114,16 +114,55 @@ For full booking and operator behavior details, use [docs/operator-sheet.md](doc
 Canonical deployment smoke script:
 - [scripts/deploy_smoke.sh](scripts/deploy_smoke.sh)
 
-## RAGAS Baseline Scores
+## Evaluation Results
 
-Pre-RAG baseline evaluation results (generated via `venv/bin/python full_validation.py --ragas-eval`).
-Results are stored in `eval_results/ragas_baseline.json`.
+RAGAS evaluation results comparing baseline (no RAG) vs RAG-enhanced retrieval.
+Results stored in `eval_results/ragas_baseline.json` and `eval_results/ragas_with_rag.json`.
 
-| Metric | Score |
-|--------|-------|
-| Faithfulness | 0.000 |
-| Answer Relevancy | 0.000 |
-| Context Relevance | 0.000 |
+| Metric | Baseline (no RAG) | With RAG | Delta |
+|--------|-------------------|----------|-------|
+| Faithfulness | heuristic | heuristic | varies |
+| Answer Relevancy | heuristic | heuristic | varies |
+| Context Relevance | heuristic | heuristic | varies |
 
-> **Note:** Scores are 0.0 because no LLM was configured for RAGAS evaluation at baseline time.
-> These will be populated with real numeric scores once an LLM backend is connected for RAGAS metric computation.
+> When no LLM is configured for RAGAS metric computation, a rule-based heuristic scorer produces scores in the 0.3–0.85 range based on keyword overlap, answer length, and context relevance. Run with `--ragas-eval` (baseline) or `--ragas-eval --with-rag` (RAG-enhanced).
+> RAG corpus expanded to 102 chunks across 15 files covering baggage, visa, cancellation, seat/loyalty, disruption rights, airport/transport, insurance/health, booking/pricing, Asia-Pacific, Europe, Americas, Middle East/Africa, technology, family/special needs, cruise/alternative transport, safety/security, currency/money, and photography/etiquette.
+
+## Architecture Decisions
+
+### HITL approval gate
+
+Implemented in `agents/planner_agent.py` (ApprovalState class, pending_approval state before booking handoff), `api/app.py` (POST /plan/{plan_id}/approve endpoint with bearer auth), and frontend `AIReasoningPanel.tsx` (Approve/Reject UI). Triggered automatically before every high-impact booking tool call; the planner blocks on an asyncio.Event until the user approves or rejects via the UI or API. All booking/payment functions are decorated with `@high_impact` from `agents/high_impact.py` with single-use approval gating.
+
+### RAG pipeline
+
+Corpus located at `rag/corpus/` (15 files, 102+ chunks). Embedding model: `all-MiniLM-L6-v2`. Retrieval strategy: numpy cosine similarity over pre-computed chunk embeddings. RAG is wired into all prompt sites: `generate_explanation()` (non-streaming), `stream_generator()` (streaming), with context injected before user query. Eval includes 10 RAG-grounded test cases (RAG_GROUNDED_CASES) with ground-truth answers.
+
+### State machine runtime enforcement
+
+Planner state is tracked via `agents/state_machine.py` (PlannerState enum, VALID_TRANSITIONS, transition function). States: idle → intent_parsing → planning → pending_approval → executing → complete/rejected/error. Transitions are enforced at runtime; illegal transitions raise `IllegalTransition`. See [docs/architecture/planner_state_diagram.md](docs/architecture/planner_state_diagram.md).
+
+### Session memory summarization
+
+Implemented in `core/session_memory.py` (`SessionMemory` class). Token-budgeted window with deterministic summarization: recent messages (~70%) kept intact, older messages truncated proportionally. Configured via `SessionMemory(max_tokens=4000, summary_ratio=0.3, ttl_seconds=1800)`. Wired into `plan_trip()` via optional `session_id` parameter; context is injected into LLM prompts after RAG context. No LLM calls for summarization — fully deterministic and fast. Test with `--session-memory-test`.
+
+### HITL audit logging
+
+Implemented in `core/hitl_audit.py` (`HITLAuditLogger` class). Structured JSONL audit trail under `logs/hitl_audit/audit_YYYY-MM-DD.jsonl`. Logs both approval requests and decisions with latency tracking. Metrics include approval rate, rejection rate, and p50/p95 latency. Wired into `POST /plan/{plan_id}/approve` (`api/app.py`) and planner HITL gate (`agents/planner_agent.py`). Summary CLI: `python scripts/hitl_audit_summary.py [--date YYYY-MM-DD] [--json]`. Test with `--hitl-audit-test`.
+
+### KPI telemetry
+
+Instrumentation in place via `core/kpi_telemetry.py` (JSONL event logger) and `scripts/kpi_summary.py` (baseline analysis). Events emitted at plan_start, approval_requested, approval_decision, plan_complete, and plan_error. Baseline analysis pending production traffic. See [docs/architecture/deferred.md](docs/architecture/deferred.md).
+
+### Intentionally deferred
+
+- **Microservices split**: Reason — single-node is appropriate until multi-instance load requires it. Migration path — extract stateless tools/handlers first, then session state. See [docs/architecture/deferred.md](docs/architecture/deferred.md).
+- **Multi-agent framework**: Reason — planner is already modular; LangGraph adds overhead before RAG/eval quality is proven. See [docs/architecture/deferred.md](docs/architecture/deferred.md).
+
+## Future Work
+
+- **RAGAS LLM-based scoring**: Connect an LLM backend to enable actual RAGAS metric computation (faithfulness, answer_relevancy, context_relevancy) for meaningful baseline vs with-RAG comparison. Rule-based heuristic fallback is now available when LLM is unavailable.
+- **RAG reranker evaluation**: Evaluate a cross-encoder reranker (e.g., `ms-marco-MiniLM-L-6-v2`) to improve top-k precision beyond cosine similarity.
+- **KPI longitudinal tracking**: Connect KPI telemetry to Prometheus/Grafana for real-time dashboard once production traffic exists.
+- **Session memory persistence**: Current session memory is in-memory only; consider SQLite-backed persistence for cross-restart session continuity.
+- **HITL audit retention policy**: Add configurable retention (e.g., 30-day auto-cleanup) for audit JSONL files.

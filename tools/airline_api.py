@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
@@ -119,10 +119,13 @@ _TESTING_LOGGED = False
 SERPAPI_HTTP_TIMEOUT = get_env_float("SERPAPI_HTTP_TIMEOUT", 10.0)
 SERPAPI_MAX_RETRIES = max(1, get_env_int("SERPAPI_MAX_RETRIES", 3))
 SERPAPI_RETRY_BASE_DELAY = max(0.1, get_env_float("SERPAPI_RETRY_BASE_DELAY", 1.0))
+# With 250 searches/month/key, keep budget tight: 2 attempts per request max
 SERPAPI_TOTAL_ATTEMPT_BUDGET = max(
-    SERPAPI_MAX_RETRIES,
-    get_env_int("SERPAPI_TOTAL_ATTEMPT_BUDGET", SERPAPI_MAX_RETRIES * 2),
+    2,
+    min(2, get_env_int("SERPAPI_TOTAL_ATTEMPT_BUDGET", 2)),
 )
+SERPAPI_AUTH_TRANSPORT = "query_param_only"
+_last_400_log: Dict[str, float] = {}
 
 
 def _health_check_non_destructive_mode() -> bool:
@@ -146,6 +149,29 @@ def _redact_request_params(params: dict) -> dict:
         else:
             redacted[key] = value
     return redacted
+
+
+def _redact_sensitive_url(value: str) -> str:
+    text = str(value or "")
+    if "api_key=" not in text and "apikey=" not in text:
+        return text
+    try:
+        parsed = urlparse(text)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        redacted = []
+        for key, raw in query_items:
+            key_l = str(key).lower()
+            if key_l in {"api_key", "apikey", "appid", "key", "token"}:
+                redacted.append((key, "***REDACTED***"))
+            else:
+                redacted.append((key, raw))
+        return urlunparse(parsed._replace(query=urlencode(redacted, doseq=True)))
+    except Exception:
+        return re.sub(r"(?i)(api[_-]?key|appid|token|key)=([^&\\s]+)", r"\1=***REDACTED***", text)
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    return _redact_sensitive_url(str(exc or ""))
 
 # ----------------------------------------------------------------------
 # Custom exceptions
@@ -555,86 +581,9 @@ def _estimate_reset_from_account(account_data: dict) -> Optional[datetime]:
 # Track last account check per key to avoid spamming
 # ----------------------------------------------------------------------
 _last_account_check: dict = {}  # key index -> monotonic timestamp
-SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED = get_env_bool(
-    "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED",
-    default=False,
-)
-SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_INTERVAL_SECONDS = max(
-    300,
-    get_env_int("SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_INTERVAL_SECONDS", 1800),
-)
-
-async def _maybe_check_account(key: str, key_idx: int) -> None:
-    """
-    Periodically check the SerpApi account endpoint to update quota status.
-    If quota exhausted, mark the key exhausted with appropriate reset time.
-    """
-    if not SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED:
-        return
-
-    now = time.monotonic()
-    last = _last_account_check.get(key_idx, 0)
-    # Check on a long throttle to avoid adding pressure to hot successful search paths.
-    if now - last < SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_INTERVAL_SECONDS:
-        return
-
-    _last_account_check[key_idx] = now
-    try:
-        client = get_client()
-        resp = await client.get(
-            "https://serpapi.com/account.json",
-            params={"api_key": key}
-        )
-        if resp.status_code != 200:
-            logger.debug(
-                "Post-success account check skipped (non-blocking)",
-                extra={"status": resp.status_code, "key_idx": key_idx},
-            )
-            return
-        data = resp.json()
-        searches_left = data.get("plan_searches_left")
-        if searches_left is None:
-            return
-
-        if searches_left <= 0:
-            reset_at = _estimate_reset_from_account(data)
-            reset_timestamp = reset_at.timestamp() if reset_at else None
-            details = f"plan_searches_left=0, account_data={str(data)[:200]}"
-            await api_key_manager.mark_exhausted(
-                "serpapi",
-                key_idx,
-                until=reset_timestamp,
-                reason=f"quota | {details}"
-            )
-            # Listener will handle cache eviction – no direct call needed
-            logger.warning("Key exhausted via account check", extra={
-                "key_idx": key_idx,
-                "reset_at": reset_at.isoformat() if reset_at else None
-            })
-    except Exception as e:
-        logger.debug(
-            "Post-success account check exception (non-blocking)",
-            extra={"error": str(e), "key_idx": key_idx},
-        )
-
-
-def _schedule_post_success_account_check(key: str, key_idx: int) -> None:
-    """
-    Run post-success account checks off the hot request path.
-    """
-    async def _runner() -> None:
-        try:
-            await _maybe_check_account(key, key_idx)
-        except Exception:
-            # _maybe_check_account already swallows expected failures, but keep
-            # a final guard here so scheduling never interrupts the success path.
-            logger.debug("post_success_account_check_runner_failed", exc_info=True)
-
-    try:
-        asyncio.create_task(_runner())
-    except Exception:
-        # Extremely defensive: if task scheduling fails, keep request success intact.
-        logger.debug("post_success_account_check_schedule_failed", exc_info=True)
+# Post-success account check REMOVED — was burning 1 extra SerpAPI search per
+# successful request just to check quota. With 250 searches/month/key this is
+# unacceptable waste. If you need to check account status, use /health/deep manually.
 
 # ----------------------------------------------------------------------
 # Main search function
@@ -784,8 +733,7 @@ async def search_flights(
             logger.debug("Returning cached flight results", extra={"cache_key": cache_key})
             cached = _flight_cache[cache_key]
             # cached is a tuple (flights, price_insights)
-            # Ensure we don't return more than max_results
-            return cached[0][:max_results], cached[1]
+            return cached[0], cached[1]
 
         # Structured log: request start
         logger.debug("SerpAPI request started", extra={
@@ -855,17 +803,17 @@ async def search_flights(
                                 # Treat 403 the same as 401 to avoid repeatedly selecting a denied key.
                                 if status in (401, 403):
                                     until = (datetime.now(timezone.utc) + timedelta(days=30)).timestamp()
-                                    details = (response.text or "")[:1000]
-                                    await api_key_manager.mark_exhausted(
+                                    newly_exhausted = await api_key_manager.mark_exhausted(
                                         "serpapi",
                                         idx,
                                         until=until,
-                                        reason=f"unauthorized_http_{status} | {details}"
+                                        reason=f"unauthorized_http_{status}"
                                     )
-                                    logger.warning(
-                                        "Key unauthorized, marked exhausted",
-                                        extra={"key_idx": idx, "status_code": status},
-                                    )
+                                    if newly_exhausted:
+                                        logger.warning(
+                                            "Key unauthorized, marked exhausted",
+                                            extra={"key_idx": idx, "status_code": status},
+                                        )
                                     break  # try next key
 
                                 # 2) Rate limit or payment required – attempt to get reset time
@@ -873,6 +821,7 @@ async def search_flights(
                                     try:
                                         acct_resp = await client.get(
                                             "https://serpapi.com/account.json",
+                                            # SerpAPI auth transport: query api_key (no header equivalent).
                                             params={"api_key": key}
                                         )
                                         if acct_resp.status_code == 200:
@@ -881,31 +830,30 @@ async def search_flights(
                                             if searches_left == 0:
                                                 reset_at = _estimate_reset_from_account(acct_data)
                                                 reset_timestamp = reset_at.timestamp() if reset_at else None
-                                                details = f"plan_searches_left=0, account_data={str(acct_data)[:200]}"
-                                                await api_key_manager.mark_exhausted(
+                                                newly_exhausted = await api_key_manager.mark_exhausted(
                                                     "serpapi",
                                                     idx,
                                                     until=reset_timestamp,
-                                                    reason=f"quota | {details}"
+                                                    reason="quota"
                                                 )
-                                                logger.warning("Key quota exhausted", extra={
-                                                    "key_idx": idx,
-                                                    "reset_at": reset_at.isoformat() if reset_at else None
-                                                })
+                                                if newly_exhausted:
+                                                    logger.info("Key quota exhausted", extra={
+                                                        "key_idx": idx,
+                                                        "reset_at": reset_at.isoformat() if reset_at else None
+                                                    })
                                                 break
                                     except Exception as e:
                                         logger.debug(
                                             "Account check skipped during 429/402 handling",
-                                            extra={"error": str(e)},
+                                            extra={"error": _safe_exception_text(e)},
                                         )
                                     # Fallback: mark exhausted with default reset (24h)
                                     until = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
-                                    details = (response.text or "")[:1000]
                                     await api_key_manager.mark_exhausted(
                                         "serpapi",
                                         idx,
                                         until=until,
-                                        reason=f"rate_limit | {details}"
+                                        reason="rate_limit"
                                     )
                                     break
 
@@ -926,12 +874,11 @@ async def search_flights(
                                 if any(re.search(p, lower_text) for p in quota_patterns):
                                     # Assume quota exhausted, mark for 24h
                                     until = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
-                                    details = text[:1000]
                                     await api_key_manager.mark_exhausted(
                                         "serpapi",
                                         idx,
                                         until=until,
-                                        reason=f"quota_text | {details}"
+                                        reason="quota_text"
                                     )
                                     break
 
@@ -970,8 +917,9 @@ async def search_flights(
                                     AIRLINE_RETRIES.labels(reason="non_json").inc()
                                     if attempt == MAX_RETRIES - 1:
                                         break
-                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
-                                    logger.debug("Retry scheduled", extra={"sleep_sec": sleep_time, "reason": "non_json"})
+                                    jitter = SERPAPI_RETRY_BASE_DELAY * 0.25 * (1 + (hash(str(time.monotonic())) % 100) / 100)
+                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt) + jitter
+                                    logger.debug("Retry scheduled", extra={"sleep_sec": round(sleep_time, 3), "reason": "non_json"})
                                     await asyncio.sleep(sleep_time)
                                     continue
 
@@ -980,15 +928,13 @@ async def search_flights(
                                     error_msg = data["error"]
                                     # Robust: convert to string before lowercasing
                                     error_lower = str(error_msg).lower()
-                                    logger.warning("SerpAPI returned error payload", extra={"error": error_msg})
                                     if any(re.search(p, error_lower) for p in quota_patterns):
                                         until = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
-                                        details = error_msg[:1000]
                                         await api_key_manager.mark_exhausted(
                                             "serpapi",
                                             idx,
                                             until=until,
-                                            reason=f"quota | {details}"
+                                            reason="quota"
                                         )
                                         break
                                     else:
@@ -1030,9 +976,10 @@ async def search_flights(
                                 flights = flights_combined
                                 parsed_results = []
                                 raw_candidate_count = len(flights)
-                                parse_window = max_results * (3 if return_date else 2)
+                                parse_window = max(max_results * (3 if return_date else 2), len(flights))
                                 missing_price_count = 0
                                 non_numeric_price_count = 0
+                                zero_price_count = 0
                                 kept_unavailable_price_count = 0
                                 for raw in flights[:parse_window]:  # fetch extra for possible layover filtering
                                     try:
@@ -1102,6 +1049,12 @@ async def search_flights(
                                             price_value: Union[int, str] = "Price unavailable"
                                         else:
                                             price_value = int(price_int)
+                                            # Treat ₹0 as unavailable — it means the provider
+                                            # did not return a usable price, not a free flight.
+                                            if price_value <= 0:
+                                                price_unavailable = True
+                                                price_value = "Price unavailable"
+                                                zero_price_count += 1
 
                                         if price_unavailable:
                                             kept_unavailable_price_count += 1
@@ -1337,15 +1290,15 @@ async def search_flights(
 
                                     except Exception as e:
                                         logger.warning("Flight parsing skipped", extra={
-                                            "error": str(e),
+                                            "error": _safe_exception_text(e),
                                             "departure": departure,
                                             "arrival": arrival,
                                             "date": date,
                                         })
                                         continue
 
-                                if missing_price_count or non_numeric_price_count:
-                                    logger.warning(
+                                if missing_price_count or non_numeric_price_count or zero_price_count:
+                                    logger.info(
                                         "Flights contained unusable pricing fields; retained with price_unavailable markers",
                                         extra={
                                             "raw_candidate_count": raw_candidate_count,
@@ -1354,6 +1307,7 @@ async def search_flights(
                                             "parse_window": parse_window,
                                             "missing_price_count": missing_price_count,
                                             "non_numeric_price_count": non_numeric_price_count,
+                                            "zero_price_count": zero_price_count,
                                             "kept_unavailable_price_count": kept_unavailable_price_count,
                                             "route": f"{departure}->{arrival}",
                                             "date": date,
@@ -1398,9 +1352,19 @@ async def search_flights(
                                     "client_mode": "shared_get_client",
                                 })
 
-                                # ---- After success, optionally check account usage ----
-                                # Keep this out of the critical first-response path.
-                                _schedule_post_success_account_check(key, idx)
+                                # Post-success account check removed — was burning quota
+                                # Capture flight data for price tracker (avoids future SerpAPI calls)
+                                try:
+                                    from tools.tool_gateway import record_flight_data
+                                    await record_flight_data(
+                                        origin=departure_ids,
+                                        destination=arrival_ids,
+                                        travel_date=date,
+                                        flights=parsed_results,
+                                        price_insights=price_insights_raw,
+                                    )
+                                except Exception:
+                                    logger.debug("record_flight_data failed (non-blocking)")
 
                                 # Record usage and return
                                 await api_key_manager.record_usage("serpapi", idx)
@@ -1408,6 +1372,7 @@ async def search_flights(
 
                             except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
                                 latency = time.monotonic() - attempt_start
+                                is_connect = isinstance(e, httpx.ConnectError)
                                 logger.warning("SerpAPI network error", extra={
                                     "error_type": type(e).__name__,
                                     "attempt": attempt + 1,
@@ -1419,51 +1384,69 @@ async def search_flights(
                                 })
                                 AIRLINE_RETRIES.labels(reason="network").inc()
                                 if attempt == MAX_RETRIES - 1:
-                                    # Exhausted retries for this key → try next key
+                                    if is_connect:
+                                        break
+                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt) * 1.5
+                                    logger.debug("Final retry with extended backoff", extra={"sleep_sec": sleep_time})
+                                    await asyncio.sleep(sleep_time)
                                     break
-                                sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
-                                logger.debug("Retry scheduled", extra={"sleep_sec": sleep_time})
+                                jitter = SERPAPI_RETRY_BASE_DELAY * 0.25 * (1 + (hash(str(time.monotonic())) % 100) / 100)
+                                sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt) + jitter
+                                logger.debug("Retry scheduled", extra={"sleep_sec": round(sleep_time, 3), "reason": "network"})
                                 await asyncio.sleep(sleep_time)
 
                             except httpx.HTTPStatusError as e:
                                 latency = time.monotonic() - attempt_start
                                 status = e.response.status_code
-                                logger.warning("SerpAPI HTTP error", extra={
-                                    "status_code": status,
-                                    "attempt": attempt + 1,
-                                    "latency_sec": round(latency, 2),
-                                    "key_source": "api_key_manager.reserve_key:serpapi",
-                                    "key_idx": idx,
-                                    "key_fp": key_fp,
-                                    "client_mode": "shared_get_client",
-                                })
 
                                 # Already handled 401,429,402 above, but catch others
                                 if status == 429:
+                                    logger.warning("SerpAPI HTTP error", extra={
+                                        "status_code": status,
+                                        "attempt": attempt + 1,
+                                        "latency_sec": round(latency, 2),
+                                        "key_source": "api_key_manager.reserve_key:serpapi",
+                                        "key_idx": idx,
+                                        "key_fp": key_fp,
+                                        "client_mode": "shared_get_client",
+                                    })
                                     AIRLINE_RETRIES.labels(reason="http_429").inc()
                                     until = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
-                                    details = (e.response.text or "")[:1000]
                                     await api_key_manager.mark_exhausted(
                                         "serpapi",
                                         idx,
                                         until=until,
-                                        reason=f"rate_limit | {details}"
+                                        reason="rate_limit"
                                     )
                                     break
+                                elif status == 400:
+                                    # HTTP 400 is a request-level bad-request / malformed-query issue.
+                                    # NOT a key problem — all keys will get the same 400.
+                                    # Stop rotating keys immediately to avoid burning quota.
+                                    # No log — the error propagates to the client response.
+                                    AIRLINE_RETRIES.labels(reason="http_400").inc()
+                                    raise AirlineAPIError(
+                                        f"SerpAPI returned HTTP 400 for {departure}->{arrival} on {date} — request-level issue, not key problem"
+                                    )
                                 elif 500 <= status < 600:
                                     AIRLINE_RETRIES.labels(reason="http_5xx").inc()
                                     if attempt == MAX_RETRIES - 1:
+                                        jitter = SERPAPI_RETRY_BASE_DELAY * 0.2 * (1 + (hash(str(time.monotonic())) % 100) / 100)
+                                        sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt) + jitter
+                                        logger.debug("Final 5xx retry with jitter", extra={"sleep_sec": round(sleep_time, 3)})
+                                        await asyncio.sleep(sleep_time)
                                         break
-                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt)
-                                    logger.debug("Server error, retry scheduled", extra={"sleep_sec": sleep_time})
+                                    jitter = SERPAPI_RETRY_BASE_DELAY * 0.25 * (1 + (hash(str(time.monotonic())) % 100) / 100)
+                                    sleep_time = SERPAPI_RETRY_BASE_DELAY * (2 ** attempt) + jitter
+                                    logger.debug("Server error, retry scheduled", extra={"sleep_sec": round(sleep_time, 3)})
                                     await asyncio.sleep(sleep_time)
                                 else:
-                                    # Client error (4xx except 401/429/402) – fatal
+                                    # Client error (4xx except 400/401/402/429) – fatal
                                     raise AirlineAPIError(f"HTTP {status} for {departure}->{arrival} on {date}") from e
 
                             except Exception as e:
                                 # Unexpected error – log and re-raise
-                                logger.error("Unexpected error in airline API", extra={"error": str(e)})
+                                logger.error("Unexpected error in airline API", extra={"error": _safe_exception_text(e)})
                                 raise
 
                         # If we exit the per‑key loop without success, continue to next key
@@ -1471,7 +1454,20 @@ async def search_flights(
                         continue  # while loop will try next key
 
                 except RuntimeError as e:
-                    # No keys available from manager (all exhausted)
+                    error_text = str(e).lower()
+                    is_exhausted = (
+                        "no available keys" in error_text
+                        or "no keys" in error_text
+                        or "all.*exhausted" in error_text
+                    )
+                    if is_exhausted:
+                        logger.error(
+                            "All SerpAPI keys exhausted — failing fast to avoid wasted retries",
+                            extra={"error": str(e)},
+                        )
+                        raise AirlineAPIError(
+                            "All SerpAPI keys are currently exhausted. Wait for cooldown or add more SERPAPI_KEY_n entries."
+                        ) from e
                     logger.error("No SerpAPI keys available")
                     raise AirlineAPIError("All SerpAPI keys exhausted or failed") from e
 
@@ -1500,8 +1496,8 @@ async def search_flights(
         if use_cache:
             _flight_cache[cache_key] = (parsed_results, price_insights_raw)
 
-        # Return flights list + route-level price_insights dict (may be None)
-        return parsed_results[:max_results], price_insights_raw
+        # Return full parsed inventory — display limits are applied by the planner.
+        return parsed_results, price_insights_raw
 
     except Exception:
         # Increment error counter for any exception (including AirlineAPIError)
@@ -1531,13 +1527,14 @@ async def search_with_booking_token(token: str) -> List[Flight]:
     departure, arrival, date, airline_code, flight_no = _extract_route_from_booking_token(token)
 
     # Re-query the route/date and filter to token-referenced carrier/flight when possible.
+    # No deep_search — booking token resolution only needs basic flight data, not expanded results.
     flights, _ = await search_flights(
         departure=departure,
         arrival=arrival,
         date=date,
         max_results=20,
         use_cache=False,
-        deep_search=True,
+        deep_search=False,
     )
 
     if not flights:
@@ -1602,7 +1599,7 @@ async def health_check() -> str:
                 "hl": "en",
                 "gl": "in",
                 "currency": "INR",
-                "deep_search": "true",
+                # No deep_search — health check only needs to verify connectivity, not full results
                 "api_key": key,
             }
             response = await client.get(
@@ -1621,6 +1618,7 @@ async def health_check() -> str:
                 try:
                     acct_resp = await client.get(
                         "https://serpapi.com/account.json",
+                        # SerpAPI auth transport: query api_key (no header equivalent).
                         params={"api_key": key},
                     )
                     if acct_resp.status_code == 200:
@@ -1631,27 +1629,27 @@ async def health_check() -> str:
                 except Exception as e:
                     logger.debug(
                         "Health account check skipped during quota handling",
-                        extra={"error": str(e)},
+                        extra={"error": _safe_exception_text(e)},
                     )
 
                 until = reset_timestamp or (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
-                details = (response.text or "")[:400]
                 if non_destructive:
                     logger.warning(
                         "Health check detected exhausted SerpAPI key but skipped quarantine (non-destructive mode)",
                         extra={"key_idx": idx, "status_code": response.status_code},
                     )
                 else:
-                    await api_key_manager.mark_exhausted(
+                    newly_exhausted = await api_key_manager.mark_exhausted(
                         "serpapi",
                         idx,
                         until=until,
-                        reason=f"health_quota_http_{response.status_code} | {details}",
+                        reason=f"health_quota_http_{response.status_code}",
                     )
-                    logger.warning(
-                        "Health check quarantined exhausted SerpAPI key",
-                        extra={"key_idx": idx, "status_code": response.status_code},
-                    )
+                    if newly_exhausted:
+                        logger.warning(
+                            "Health check quarantined exhausted SerpAPI key",
+                            extra={"key_idx": idx, "status_code": response.status_code},
+                        )
                 return "degraded"
 
             if 500 <= response.status_code < 600:
@@ -1681,16 +1679,17 @@ async def health_check() -> str:
                             extra={"key_idx": idx},
                         )
                     else:
-                        await api_key_manager.mark_exhausted(
+                        newly_exhausted = await api_key_manager.mark_exhausted(
                             "serpapi",
                             idx,
                             until=until,
-                            reason=f"health_quota_error | {error_text[:400]}",
+                            reason="health_quota_error",
                         )
-                        logger.warning(
-                            "Health check quarantined SerpAPI key based on quota error payload",
-                            extra={"key_idx": idx},
-                        )
+                        if newly_exhausted:
+                            logger.warning(
+                                "Health check quarantined SerpAPI key based on quota error payload",
+                                extra={"key_idx": idx},
+                            )
                     return "degraded"
                 transient_patterns = [
                     "temporarily unavailable",
@@ -1717,7 +1716,7 @@ async def health_check() -> str:
     except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
         logger.warning(
             "Health check degraded by transient network issue",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={"error": _safe_exception_text(e), "error_type": type(e).__name__},
         )
         return "degraded"
     except httpx.HTTPStatusError as e:
@@ -1725,11 +1724,11 @@ async def health_check() -> str:
         if status is not None and status >= 500:
             logger.warning("Health check degraded by HTTP 5xx", extra={"status_code": status})
             return "degraded"
-        logger.error("Health check failed by HTTP error", extra={"status_code": status, "error": str(e)})
+        logger.error("Health check failed by HTTP error", extra={"status_code": status, "error": _safe_exception_text(e)})
         return "fail"
     except Exception as e:
         logger.warning(
             "Health check degraded by unexpected exception",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={"error": _safe_exception_text(e), "error_type": type(e).__name__},
         )
         return "degraded"

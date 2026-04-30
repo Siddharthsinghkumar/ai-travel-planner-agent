@@ -227,6 +227,36 @@ KEY_STATE_EVENTS = Counter(
     ["service", "event", "reason_class"]
 )
 
+KEY_RESERVATIONS = Counter(
+    "key_reservations_total",
+    "Key reservation outcomes by service",
+    ["service", "outcome"]
+)
+
+KEY_EXHAUSTION_RECOVERIES = Counter(
+    "key_exhaustion_recoveries_total",
+    "Keys recovered from exhaustion by service and reason",
+    ["service", "previous_reason_class"]
+)
+
+QUOTA_WASTED = Counter(
+    "quota_wasted_total",
+    "API calls that consumed quota but did not contribute to user-visible results",
+    ["service", "reason"]
+)
+
+STALE_CACHE_USES = Counter(
+    "stale_cache_uses_total",
+    "Requests served with stale cached SDK clients after key exhaustion",
+    ["provider"]
+)
+
+RECONCILE_EFFECTS = Counter(
+    "reconcile_effects_total",
+    "Reconcile loop outcomes by service and effect",
+    ["service", "effect"]
+)
+
 PROVIDER_HEALTH_FAILURES = Counter(
     "provider_health_failures_total",
     "Cloud provider health-check failures by class",
@@ -237,6 +267,18 @@ PROVIDER_HEALTH_COOLDOWN_SKIPS = Counter(
     "provider_health_cooldown_skips_total",
     "Cloud provider health-check probes skipped due to active cooldown",
     ["provider"]
+)
+
+KEYS_EXHAUSTED = Gauge(
+    "api_keys_exhausted",
+    "Number of currently exhausted API keys by service",
+    ["service"]
+)
+
+ACTIVE_FALLBACKS = Gauge(
+    "active_fallbacks",
+    "Number of requests currently running on fallback/degraded paths",
+    ["component"]
 )
 
 # ----------------------------

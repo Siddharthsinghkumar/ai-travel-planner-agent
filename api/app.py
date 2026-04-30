@@ -1271,6 +1271,14 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # Initialize the job queue (SQLite persistence)
+    try:
+        await job_queue.initialize_job_queue()
+    except Exception:
+        logger.exception("job_queue_init_failed")
+        # For durability, we might want to fail startup if we can't init the queue
+        raise
+
     # Start the background job worker loop (always needed)
     app.state.job_worker = asyncio.create_task(job_queue.worker_loop())
 
@@ -2207,11 +2215,18 @@ async def ask(
 
             if "error" in result:
                 detail = str(result.get("error") or "").strip() or "Planner failed to produce a complete response."
-                response_status_code = 400
+                # Use 502 for provider failures, 500 for other internal planner errors. 
+                # 400 is for client-side bad requests.
+                failure_reason = result.get("failure_reason") or "planner_error"
+                if failure_reason in {"provider_failure", "upstream_timeout", "upstream_unavailable"}:
+                    response_status_code = 502
+                else:
+                    response_status_code = 500
+                    
                 response_payload = {
                     "detail": detail,
-                    "failure_reason": result.get("failure_reason") or "planner_error",
-                    "failure_domain": _failure_domain_for_reason(result.get("failure_reason") or "planner_error"),
+                    "failure_reason": failure_reason,
+                    "failure_domain": _failure_domain_for_reason(failure_reason),
                     "no_flights_reason": result.get("no_flights_reason"),
                     "flight_counts": result.get("flight_counts"),
                     "search_date": result.get("search_date"),
@@ -2221,7 +2236,8 @@ async def ask(
                     response_payload.update(contract_payload)
             elif result.get("fallback") and "warning" in result:
                 detail = str(result.get("warning") or "").strip() or "No live flights found."
-                response_status_code = 400
+                # Fallback warnings (no flights) are successful responses (200) with a specific status.
+                response_status_code = 200
                 response_payload = {
                     "detail": detail,
                     "failure_reason": result.get("failure_reason") or "no_flights",
@@ -2229,7 +2245,7 @@ async def ask(
                     "no_flights_reason": result.get("no_flights_reason") or "unknown",
                     "flight_counts": result.get("flight_counts"),
                     "search_date": result.get("search_date"),
-                    "result_status": result.get("result_status") or "error",
+                    "result_status": result.get("result_status") or "success",
                 }
                 if contract_payload:
                     response_payload.update(contract_payload)
@@ -2468,10 +2484,33 @@ async def approve_plan(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     """HITL approval gate — approve or reject a pending booking plan."""
+    import time as _time
     from agents.planner_agent import _approval_store
+    from core.hitl_audit import HITLAuditLogger
+
+    _audit = HITLAuditLogger()
+    _start = _time.monotonic()
+
     ok = await _approval_store.set_decision(plan_id, req.approved)
+    latency_ms = (_time.monotonic() - _start) * 1000
+
     if not ok:
+        _audit.log_decision(
+            plan_id=plan_id,
+            user_id=principal.principal_id,
+            approved=req.approved,
+            latency_ms=latency_ms,
+            details={"status": "not_found"},
+        )
         raise HTTPException(status_code=404, detail="No pending approval found for this plan_id.")
+
+    _audit.log_decision(
+        plan_id=plan_id,
+        user_id=principal.principal_id,
+        approved=req.approved,
+        latency_ms=latency_ms,
+        details={"action": "booking_handoff"},
+    )
     return {"plan_id": plan_id, "approved": req.approved, "principal_id": principal.principal_id}
 
 

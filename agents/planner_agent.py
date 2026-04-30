@@ -79,6 +79,10 @@ from core.iata_resolver import (
     resolve_location_with_trace,
 )
 from core.api_key_manager import key_manager as api_key_manager
+from core.kpi_telemetry import log_event
+from core.session_memory import SessionMemory
+
+_session_memory = SessionMemory()
 
 # Wrappers (unit‑test seam)
 def search_flights(*args, **kwargs):
@@ -117,6 +121,19 @@ load_dotenv()
 # ----------------------------------------------------------------------
 logger = logging.getLogger("planner_agent")
 _FLIGHT_GET_WARNING_LOGGED = False
+
+# ----------------------------------------------------------------------
+# Planner State Machine
+# ----------------------------------------------------------------------
+from agents.state_machine import PlannerState, transition, IllegalTransition
+
+_planner_state: PlannerState = PlannerState.IDLE
+
+
+def _set_state(target: PlannerState) -> PlannerState:
+    global _planner_state
+    _planner_state = transition(_planner_state, target)
+    return _planner_state
 
 # ----------------------------------------------------------------------
 # HITL Approval Gate infrastructure
@@ -167,7 +184,7 @@ def _sse_event(event_name: str, payload: Dict[str, Any]) -> str:
 # ----------------------------------------------------------------------
 USE_CLOUD_FALLBACK = get_env_bool("USE_CLOUD_LLM", default=True)
 PLANNER_LLM_MODEL = get_env_str("PLANNER_LLM_MODEL", "gpt-4o-mini")
-PLANNER_LLM_TIMEOUT = get_env_float("PLANNER_LLM_TIMEOUT", 45.0)  # seconds
+PLANNER_LLM_TIMEOUT = get_env_float("PLANNER_LLM_TIMEOUT", 90.0)  # seconds
 PLANNER_LLM_PROMPT_SOFT_LIMIT = max(2000, get_env_int("PLANNER_LLM_PROMPT_SOFT_LIMIT", 9500))
 PLANNER_LLM_PROMPT_HARD_LIMIT = max(2500, get_env_int("PLANNER_LLM_PROMPT_HARD_LIMIT", 7800))
 PLANNER_LLM_TRIP_DESCRIPTION_MAX_CHARS = max(
@@ -2281,6 +2298,73 @@ def _enforce_narrative_consistency(
     return text
 
 
+def _validate_flight_grounding(
+    llm_text: str,
+    all_flights: List[Flight],
+) -> Tuple[str, bool]:
+    """
+    Post-process LLM text to detect and correct hallucinated flight numbers,
+    airline names, and placeholder text.
+    Returns (corrected_text, had_hallucination).
+    """
+    if not llm_text or not all_flights:
+        return llm_text, False
+
+    valid_flight_nos = {f.flight_no for f in all_flights if getattr(f, "flight_no", None)}
+    valid_airlines = {f.airline for f in all_flights if getattr(f, "airline", None)}
+    best_flight = all_flights[0]
+    had_hallucination = False
+    text = llm_text
+
+    # 1) Fix hallucinated flight numbers — match airline code patterns:
+    #    - 2-3 alphanumeric chars (at least one letter) + optional space + 3-4 digits
+    #    - Examples: AI123, 6E 1234, G82468, MAA111, TA123
+    #    - Excludes pure numbers like dates (2026)
+    flight_no_pattern = re.compile(r"\b((?=[A-Z0-9]*[A-Z])[A-Z0-9]{2,3}\s*\d{3,4})\b")
+    for match in flight_no_pattern.finditer(llm_text):
+        mentioned_no = match.group(1).replace(" ", "")
+        if mentioned_no not in valid_flight_nos:
+            had_hallucination = True
+            text = text.replace(match.group(1), best_flight.flight_no, 1)
+
+    # 2) Replace placeholder bracketed text with actual values
+    placeholder_replacements = [
+        (r"\[FLIGHT NUMBER\]", best_flight.flight_no),
+        (r"\[DEPARTURE TIME\]", best_flight.departure_time),
+        (r"\[ARRIVAL TIME\]", best_flight.arrival_time),
+        (r"\[AIRLINE NAME\]", best_flight.airline),
+        (r"\[MINIMUM TEMPERATURE\]", "N/A"),
+        (r"\[MAXIMUM TEMPERATURE\]", "N/A"),
+        (r"\(Delhi Airport Code\)", "(DEL)"),
+        (r"\(Mumbai Airport Code\)", "(BOM)"),
+    ]
+    for pattern, replacement in placeholder_replacements:
+        if re.search(pattern, text, re.IGNORECASE):
+            had_hallucination = True
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # 3) Fix hallucinated airline names — if LLM mentions an airline not in
+    # the valid set, replace the first occurrence with the actual airline.
+    # Common hallucinated airline names for Indian domestic routes:
+    known_airline_names = [
+        "IndiGo", "Indigo", "indigo", "INDIGO", "6E",
+        "Air India", "air india", "AIR INDIA", "AI",
+        "SpiceJet", "Spicejet", "spicejet", "SPICEJET", "SG",
+        "Vistara", "vistara", "VISTARA", "UK",
+        "GoAir", "Go First", "goair", "G8",
+        "Akasa Air", "akasa", "QP",
+    ]
+    for airline_name in known_airline_names:
+        if airline_name.lower() not in {a.lower() for a in valid_airlines}:
+            # Check if this airline name appears in the text
+            pattern = re.compile(rf"\b{re.escape(airline_name)}\b", re.IGNORECASE)
+            if pattern.search(text):
+                had_hallucination = True
+                text = pattern.sub(best_flight.airline, text, count=1)
+
+    return text, had_hallucination
+
+
 def _ensure_route_grounding(
     llm_text: str,
     origin_iata: Optional[str],
@@ -2501,10 +2585,11 @@ async def generate_explanation(
     filters_applied: str,
     trip_description: str,
     warnings: Optional[List[str]] = None,
-    price_insights_str: str = "",   # pre-formatted price intelligence sentence
-    price_analysis_str: str = "",   # NEW: structured price trend info
-    price_prediction_str: str = "", # NEW: price prediction advice
-    booking_url: Optional[str] = None,  # NEW: optional booking link
+    price_insights_str: str = "",
+    price_analysis_str: str = "",
+    price_prediction_str: str = "",
+    booking_url: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
     """Call LLM to produce a natural language response, with timeout and circuit breaker."""
     try:
@@ -2726,6 +2811,10 @@ async def generate_explanation(
         "stating or implying its value. "
         "GROUNDING RULE: Only reference flights from the exact list provided under 'Flight options'. "
         "Do NOT mention flights, airlines, or prices that are not in that list. "
+        "If the user asks about a flight not in the list, explicitly say it is not available "
+        "in the current results rather than suggesting it. "
+        "NEVER use placeholder text like [FLIGHT NUMBER], [DEPARTURE TIME], [MINIMUM TEMPERATURE], "
+        "or similar bracketed templates. Only use actual values from the provided data. "
         "IATA RULE: Whenever you mention a city's weather, always include its IATA code in "
         "parentheses, e.g. 'Weather for Bangalore (BLR)' or 'Mumbai (BOM)'. "
         "CITY NAME RULE: When writing about the flight destination, use ONLY the correct city name "
@@ -2796,8 +2885,15 @@ Please recommend the best flight, explain why it matches their preferences, ment
             logger.debug(f"RAG retrieval failed: {e}")
 
     # Combine facts block and prompt with an instruction to echo the facts
+    session_context_text = ""
+    if session_id:
+        session_context_text, _token_count = _session_memory.get_context(session_id)
+        if session_context_text:
+            session_context_text = f"Conversation history:\n{session_context_text}\n\n"
+
     full_prompt = (
         rag_context_block
+        + session_context_text
         + facts_block
         + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n"
         + prompt
@@ -2828,7 +2924,9 @@ Please recommend the best flight, explain why it matches their preferences, ment
             flights_block=trimmed_flights_str,
         )
         full_prompt = (
-            facts_block
+            rag_context_block
+            + session_context_text
+            + facts_block
             + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n"
             + prompt
         )
@@ -2994,6 +3092,7 @@ Please recommend the best flight, explain why it matches their preferences, ment
                     runtime=llm_metadata,
                 )
         llm_text = _enforce_narrative_consistency(llm_text, best_flight, weather)
+        llm_text, _had_hallucination = _validate_flight_grounding(llm_text, all_flights)
         await record_llm_success()
         return llm_text, None, _llm_execution_payload(
             source="router_completion",
@@ -3341,6 +3440,7 @@ async def _plan_trip_internal(
     fetch_weather: bool = True,
     plan_id: Optional[str] = None,
     hitl_approval_timeout: float = 120.0,
+    session_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict]:
     """Internal implementation without top-level timeout. Used for non‑streaming mode."""
     # Prevent excessive recursion
@@ -3442,6 +3542,13 @@ async def _plan_trip_internal(
     # 1. Parse intent (overrides explicit params)
     # ------------------------------------------------------------------
     start = time.monotonic()
+    plan_start_ts = time.monotonic()
+    effective_plan_id = plan_id or f"plan-{origin}-{destination}-{date}"
+    try:
+        _set_state(PlannerState.INTENT_PARSING)
+        log_event("plan_start", effective_plan_id, intent_type=trip_type or "unknown")
+    except IllegalTransition:
+        pass
     # Only parse if there is meaningful user input; otherwise start with empty intent.
     if user_query:
         intent = parse_intent(user_query)
@@ -3599,6 +3706,11 @@ async def _plan_trip_internal(
             booking_handoff_info,
             is_round_trip=bool(intent.return_date),
         )
+        try:
+            _set_state(PlannerState.ERROR)
+            log_event("plan_error", effective_plan_id, error_type="invalid_route")
+        except IllegalTransition:
+            pass
         return {
             "error": "Could not determine origin or destination airport after AI correction.",
             "failure_reason": "invalid_route",
@@ -3956,6 +4068,10 @@ async def _plan_trip_internal(
             raise
 
     # Outbound flight task
+    try:
+        _set_state(PlannerState.PLANNING)
+    except IllegalTransition:
+        pass
     flight_task = asyncio.create_task(
         _call_flight_tool_safe(
             departure=intent.origin_iata,
@@ -4526,6 +4642,11 @@ async def _plan_trip_internal(
             booking_handoff_info,
             is_round_trip=bool(intent.return_date),
         )
+        try:
+            _set_state(PlannerState.ERROR)
+            log_event("plan_error", effective_plan_id, error_type="no_flights")
+        except IllegalTransition:
+            pass
         return {
             "error": "Sorry, I couldn't find any flights matching your preferences.",
             "failure_reason": "no_flights",
@@ -4575,7 +4696,20 @@ async def _plan_trip_internal(
     handoff_seed_ranked = ranked[:PER_FLIGHT_HANDOFF_LIMIT]
     hitl_approved = True
     if resolve_booking_handoff:
-        effective_plan_id = plan_id or f"plan-{intent.origin_iata}-{intent.destination_iata}-{search_date}"
+        try:
+            _set_state(PlannerState.PENDING_APPROVAL)
+            log_event("approval_requested", effective_plan_id, action_type="booking_handoff")
+        except IllegalTransition:
+            pass
+
+        from core.hitl_audit import HITLAuditLogger
+        _hitl_audit = HITLAuditLogger()
+        _hitl_audit.log_request(
+            plan_id=effective_plan_id,
+            user_id="planner",
+            action="booking_handoff",
+            details={"timeout_sec": hitl_approval_timeout},
+        )
 
         approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout)
         _approval_store.clear(effective_plan_id)
@@ -4584,8 +4718,32 @@ async def _plan_trip_internal(
             hitl_approved = False
             booking_handoff_info = _deferred_booking_handoff_meta("hitl_approval_pending_or_rejected")
             logger.info("hitl_approval_gate: booking handoff deferred for plan_id=%s (approved=%s)", effective_plan_id, approval_decision)
+            try:
+                _set_state(PlannerState.REJECTED)
+                log_event("approval_decision", effective_plan_id, approved=False, latency_ms=0)
+            except IllegalTransition:
+                pass
+            _hitl_audit.log_decision(
+                plan_id=effective_plan_id,
+                user_id="planner",
+                approved=False,
+                latency_ms=0.0,
+                details={"action": "booking_handoff", "reason": "rejected_or_timeout"},
+            )
         else:
             logger.info("hitl_approval_gate: booking handoff approved for plan_id=%s", effective_plan_id)
+            try:
+                _set_state(PlannerState.EXECUTING)
+                log_event("approval_decision", effective_plan_id, approved=True, latency_ms=0)
+            except IllegalTransition:
+                pass
+            _hitl_audit.log_decision(
+                plan_id=effective_plan_id,
+                user_id="planner",
+                approved=True,
+                latency_ms=0.0,
+                details={"action": "booking_handoff"},
+            )
 
         if hitl_approved:
             top_signal_max = max((_booking_handoff_candidate_signal(f) for f in handoff_seed_ranked), default=0)
@@ -5266,7 +5424,8 @@ async def _plan_trip_internal(
             price_insights_str=price_insights_str,
             price_analysis_str=price_analysis_str,
             price_prediction_str=price_prediction_str,
-            booking_url=booking_url,  # NEW: pass booking URL if available
+            booking_url=booking_url,
+            session_id=session_id,
         )
         phases['llm_generation'] = time.monotonic() - start
         debug_info["phases"] = phases.copy()
@@ -5410,6 +5569,13 @@ async def _plan_trip_internal(
     if not skip_llm and not result.llm_response:
         result.llm_response = "I found a flight matching your criteria, but the detailed explanation is currently unavailable."
 
+    total_duration_ms = int((time.monotonic() - plan_start_ts) * 1000)
+    try:
+        _set_state(PlannerState.COMPLETE)
+        log_event("plan_complete", effective_plan_id, total_duration_ms=total_duration_ms, action_count=len(phases))
+    except IllegalTransition:
+        pass
+
     return result
 
 # ----------------------------------------------------------------------
@@ -5428,6 +5594,7 @@ async def plan_trip(
     flight_tool: Callable = default_flight_tool,
     weather_tool: Callable = default_weather_tool,
     plan_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict, AsyncGenerator[str, None]]:
     """
     Public entry point for planning a trip.
@@ -5460,6 +5627,9 @@ async def plan_trip(
         llm_mode_hint, _ = await get_llm_mode_and_priority()
     except Exception:
         llm_mode_hint = "unknown"
+
+    if session_id:
+        _session_memory.add_message(session_id, "user", user_query)
 
     action = _detect_booking_or_tracking_action(user_query)
 
@@ -5660,6 +5830,7 @@ async def plan_trip(
             skip_llm=False,
             resolve_booking_handoff=False,
             plan_id=plan_id,
+            session_id=session_id,
         )
 
     # --- Streaming branch ---
@@ -5779,6 +5950,7 @@ async def plan_trip(
                 skip_llm=True,
                 resolve_booking_handoff=False,
                 plan_id=plan_id,
+                session_id=session_id,
             )
 
             # Any dict payload at this stage is non-success for streaming.
@@ -6203,6 +6375,24 @@ Please recommend the best flight, explain why it matches their preferences, ment
 """
 
             full_prompt = facts_block + "\nPlease include the above origin and destination clearly at the start of your summary.\n\n" + prompt
+
+            # RAG context injection for streaming path (feature-flagged)
+            stream_rag_context_block = ""
+            if get_env_str("RAG_ENABLED", "true").lower() != "false":
+                try:
+                    stream_retriever = _get_rag_retriever()
+                    if stream_retriever is not None:
+                        stream_rag_results = stream_retriever.retrieve(user_query, top_k=4)
+                        if stream_rag_results:
+                            stream_rag_lines = ["Relevant context from knowledge base:"]
+                            for r in stream_rag_results:
+                                stream_rag_lines.append(f"{r['source']}: {r['text']}")
+                                stream_rag_lines.append("---")
+                            stream_rag_context_block = "\n".join(stream_rag_lines) + "\n\n"
+                except Exception as e:
+                    logger.debug(f"Streaming RAG retrieval failed: {e}")
+
+            full_prompt = stream_rag_context_block + full_prompt
             full_prompt, stream_prompt_hard_trimmed = _apply_prompt_hard_limit(
                 full_prompt,
                 hard_limit=PLANNER_LLM_PROMPT_HARD_LIMIT,

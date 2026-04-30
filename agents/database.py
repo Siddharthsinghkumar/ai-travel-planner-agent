@@ -19,11 +19,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from dotenv import load_dotenv
 from pathlib import Path
+import logging
 import os
 from datetime import datetime
 from typing import Optional
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
 # Do NOT rely on import-time environment being fully configured.
 # We'll attempt to load a .env file if present, but prefer real environment variables.
@@ -142,23 +144,29 @@ def _ensure_provider_key_state_columns(engine) -> None:
         if not inspector.has_table("provider_key_states"):
             return
         existing = {str(col.get("name") or "") for col in inspector.get_columns("provider_key_states")}
+        dialect_name = str(getattr(getattr(engine, "dialect", None), "name", "") or "").strip().lower()
+        datetime_sql = "TIMESTAMP"
+        json_sql = "JSON"
+        if dialect_name in {"postgres", "postgresql"}:
+            datetime_sql = "TIMESTAMP WITHOUT TIME ZONE"
+            json_sql = "JSONB"
         alters = []
         if "exhausted_until" not in existing:
-            alters.append("ALTER TABLE provider_key_states ADD COLUMN exhausted_until DATETIME")
+            alters.append(f"ALTER TABLE provider_key_states ADD COLUMN exhausted_until {datetime_sql}")
         if "retry_after" not in existing:
-            alters.append("ALTER TABLE provider_key_states ADD COLUMN retry_after DATETIME")
+            alters.append(f"ALTER TABLE provider_key_states ADD COLUMN retry_after {datetime_sql}")
         if "last_used_at" not in existing:
-            alters.append("ALTER TABLE provider_key_states ADD COLUMN last_used_at DATETIME")
+            alters.append(f"ALTER TABLE provider_key_states ADD COLUMN last_used_at {datetime_sql}")
         if "state_meta" not in existing:
-            alters.append("ALTER TABLE provider_key_states ADD COLUMN state_meta JSON")
+            alters.append(f"ALTER TABLE provider_key_states ADD COLUMN state_meta {json_sql}")
         if not alters:
             return
         with engine.begin() as conn:
             for stmt in alters:
                 conn.execute(text(stmt))
     except Exception:
-        # Keep startup resilient; callers already log DB init failures upstream.
-        pass
+        logger.exception("provider_key_state_schema_ensure_failed")
+        raise
 
 
 def _ensure_provider_override_columns(engine) -> None:
@@ -178,8 +186,8 @@ def _ensure_provider_override_columns(engine) -> None:
             for stmt in alters:
                 conn.execute(text(stmt))
     except Exception:
-        # Keep startup resilient; callers already log DB init failures upstream.
-        pass
+        logger.exception("provider_override_schema_ensure_failed")
+        raise
 
 def init_db():
     engine = get_engine()

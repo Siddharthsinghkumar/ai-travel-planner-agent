@@ -3,19 +3,24 @@ import type { Flight } from "./types";
 export function formatPriceINR(value: string | number | null | undefined): string {
   if (value === null || value === undefined) return "N/A";
 
-  if (typeof value === "number" && Number.isFinite(value)) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
     return `₹${value.toLocaleString("en-IN")}`;
   }
 
   const raw = String(value).trim();
   if (!raw) return "N/A";
 
+  const lowered = raw.toLowerCase();
+  if (lowered === "price unavailable" || lowered === "n/a" || lowered === "na" || lowered === "unknown") {
+    return "N/A";
+  }
+
   if (raw.includes("₹")) {
     return raw.replace(/₹+/g, "₹");
   }
 
   const numeric = Number(raw.replace(/[^\d.-]/g, ""));
-  if (Number.isFinite(numeric)) {
+  if (Number.isFinite(numeric) && numeric > 0) {
     return `₹${numeric.toLocaleString("en-IN")}`;
   }
 

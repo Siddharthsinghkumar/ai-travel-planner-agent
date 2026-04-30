@@ -68,7 +68,7 @@ For production topology and secret-handling ownership, use:
 
 `OLLAMA_MODEL`
 - Purpose: default local model name.
-- Default: `openhermes`.
+- Default: `qwen2.5:3b`.
 - Used in: `agents/ollama_client.py`.
 - Required: optional.
 
@@ -318,7 +318,7 @@ Ollama only:
 LLM_MODE=ollama_only
 USE_CLOUD_LLM=0
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=openhermes
+OLLAMA_MODEL=qwen2.5:3b
 ```
 
 Cloud only (Gemini):
@@ -335,7 +335,7 @@ Ollama + cloud fallback (Ollama first):
 LLM_MODE=ollama_first
 USE_CLOUD_LLM=1
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=openhermes
+OLLAMA_MODEL=qwen2.5:3b
 CLOUD_PROVIDER_CHAIN=gemini,openai
 CLOUD_PROVIDER=gemini
 GEMINI_KEY_1=your_gemini_key
@@ -376,7 +376,7 @@ Ollama + cloud hybrid fallback:
 ```env
 LLM_MODE=ollama_first
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=openhermes
+OLLAMA_MODEL=qwen2.5:3b
 USE_CLOUD_LLM=1
 CLOUD_PROVIDER_CHAIN=gemini,openai
 GEMINI_KEY_1=your_gemini_key

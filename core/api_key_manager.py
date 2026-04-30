@@ -20,6 +20,7 @@ from dotenv import dotenv_values, find_dotenv
 from typing import Dict, List, Optional, Tuple, Any, Callable, Awaitable, Union
 from core.env_config import get_env_int, get_env_str, get_env_float
 import core.metrics as app_metrics
+from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +322,12 @@ class APIKeyManager:
             "last_forced": 0,
         }
         self._provider_state_schema_ready: bool = False
-        self._provider_override_cache: Dict[str, Dict[str, Any]] = {}
+        PROVIDER_OVERRIDE_CACHE_MAXSIZE = 100  # max providers to cache
+        self._provider_override_cache: TTLCache = TTLCache(
+            maxsize=PROVIDER_OVERRIDE_CACHE_MAXSIZE,
+            ttl=PROVIDER_OVERRIDE_CACHE_SECONDS,
+        )
+        self._exhaustion_dedup: Dict[str, float] = {}  # dedup key -> last timestamp
 
         # ensure state directory exists
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -615,6 +621,29 @@ class APIKeyManager:
             for service, items in records.items()
         }
 
+    def _exhaustion_dedup_key(self, service: str, idx: int, reason_class: str) -> str:
+        return f"{service}:{idx}:{reason_class}"
+
+    def _should_log_exhaustion(self, dedup_key: str, now_ts: float) -> bool:
+        ttl = max(30.0, get_env_float("KEY_EXHAUST_LOG_DEDUP_SECONDS", 300.0))
+        previous = self._exhaustion_dedup.get(dedup_key)
+        if previous is not None and (now_ts - previous) < ttl:
+            return False
+        self._exhaustion_dedup[dedup_key] = now_ts
+        if len(self._exhaustion_dedup) > 512:
+            stale_before = now_ts - (ttl * 2.0)
+            for key in list(self._exhaustion_dedup.keys()):
+                if self._exhaustion_dedup.get(key, now_ts) < stale_before:
+                    self._exhaustion_dedup.pop(key, None)
+        return True
+
+    @staticmethod
+    def _sanitize_reason_for_log(reason: str) -> str:
+        text = str(reason or "")
+        if len(text) > 200:
+            text = text[:200] + "..."
+        return text
+
     @contextlib.contextmanager
     def _provider_state_session(self):
         session = None
@@ -737,19 +766,12 @@ class APIKeyManager:
         normalized_provider = str(provider or "").strip().lower()
         if not normalized_provider:
             return []
-        now_ts = _now_ts()
+        # TTLCache handles expiration and eviction automatically
         cached = self._provider_override_cache.get(normalized_provider)
-        if cached:
-            loaded_at = float(cached.get("loaded_at") or 0.0)
-            if (now_ts - loaded_at) <= float(PROVIDER_OVERRIDE_CACHE_SECONDS):
-                rows = cached.get("rows")
-                if isinstance(rows, list):
-                    return rows
+        if cached is not None:
+            return cached
         rows = self._load_active_provider_overrides(normalized_provider)
-        self._provider_override_cache[normalized_provider] = {
-            "loaded_at": now_ts,
-            "rows": rows,
-        }
+        self._provider_override_cache[normalized_provider] = rows
         return rows
 
     def _override_binding_matches_current_key(self, row: Dict[str, Any]) -> bool:
@@ -1581,6 +1603,14 @@ class APIKeyManager:
                 ke.exhausted_until = exhausted_ts
                 ke.retry_after = retry_ts if retry_ts is not None else exhausted_ts
 
+                # CRITICAL: restore last_exhausted_reason_class from DB so the
+                # already-exhausted guard in mark_exhausted works after restart.
+                # Without this, every caller re-announces the key as a fresh incident.
+                if exhausted_ts is not None:
+                    fc = row.get("failure_classification")
+                    if fc:
+                        ke.last_exhausted_reason_class = _normalize_reason_class(str(fc))
+
         self._sweep_key_invariants_locked()
 
     async def _hydrate_all_provider_state_from_db(self) -> None:
@@ -1998,10 +2028,21 @@ class APIKeyManager:
                     break
 
             if (time.monotonic() - started_wait) >= wait_timeout:
+                app_metrics.record_key_state_event(
+                    service=service,
+                    event="reservation_timeout",
+                    reason_class="all_exhausted",
+                )
                 raise RuntimeError(f"No available keys for service: {service}")
             await asyncio.sleep(float(KEY_RESERVATION_POLL_SECONDS))
 
         assert ke is not None and idx is not None
+
+        app_metrics.record_key_state_event(
+            service=service,
+            event="reserved",
+            reason_class="ok",
+        )
 
         # Step 2: acquire the key's lock and increment in_use
         async with ke.lock:
@@ -2082,13 +2123,17 @@ class APIKeyManager:
     # ---------- exhaustion marking ----------
     async def mark_exhausted(self, service: str, idx: int, reason: str = "",
                              reset_at: Optional[Union[datetime, float]] = None,
-                             until: Optional[float] = None):
+                             until: Optional[float] = None) -> bool:
         """Mark a key as exhausted until a specific time (reset_at) or until a policy-based default.
            If the key is currently in use, the exhaustion is recorded as pending and will be applied
            after all users release the key.
            reset_at can be a datetime (aware) or a float epoch timestamp.
            until is an alias for reset_at used by airline_api.
            The state is persisted when exhaustion actually takes effect.
+
+           Returns True if the exhaustion was newly applied or was a meaningful state change.
+           Returns False if the key was already exhausted with the same reason_class within
+           the active window (caller should not log or emit events).
         """
         # 'until' is an alias for reset_at
         if until is not None and reset_at is None:
@@ -2102,7 +2147,7 @@ class APIKeyManager:
                 ke = self._keys[service][idx]
             except (KeyError, IndexError):
                 logger.warning("mark_exhausted: invalid service/index")
-                return
+                return False
 
             # Determine exhaustion timestamp
             if reset_at is not None:
@@ -2129,6 +2174,20 @@ class APIKeyManager:
                         )
                         ke.expected_reset_at = float(until_ts)
 
+            # --- Guard: key already exhausted within active window, same reason_class ---
+            existing_until = _future_ts_or_none(ke.exhausted_until, now_ts)
+            if existing_until is not None and reason_class == ke.last_exhausted_reason_class:
+                ke.last_checked_at = now_ts
+                self._persist_entry_state_locked(service, idx, ke, checked_now=True)
+                return False
+
+            # Cap exhaustion horizon: never extend beyond 2x the requested TTL for the same reason_class.
+            if existing_until is not None:
+                requested_ttl = until_ts - now_ts
+                max_allowed = existing_until + requested_ttl
+                if until_ts > max_allowed:
+                    until_ts = max_allowed
+
             merged_until = _merge_exhaustion_until(ke.exhausted_until, until_ts, now_ts)
             pending_merged_until = _merge_exhaustion_until(ke._pending_exhaust_until, until_ts, now_ts)
             requested_until_iso = datetime.fromtimestamp(until_ts, tz=UTC).isoformat()
@@ -2143,8 +2202,12 @@ class APIKeyManager:
                 ke.failure_classification = reason_class or "unknown"
             ke.last_checked_at = now_ts
 
+            dedup_key = self._exhaustion_dedup_key(service, idx, reason_class)
+            should_log = self._should_log_exhaustion(dedup_key, now_ts)
+            sanitized_reason = self._sanitize_reason_for_log(reason)
+            was_already_exhausted = existing_until is not None
+
             if ke.in_use > 0:
-                # Defer exhaustion until key is released
                 ke._pending_exhaust = pending_merged_until is not None
                 ke._pending_exhaust_until = pending_merged_until
                 app_metrics.record_key_state_event(
@@ -2157,19 +2220,27 @@ class APIKeyManager:
                     if pending_merged_until is not None
                     else requested_until_iso
                 )
-                logger.warning("Key marked exhausted (pending)", extra={
-                    "service": service, "index": idx, "until": pending_until_iso, "reason": reason, "reason_class": reason_class
-                })
+                if should_log:
+                    log_fn = logger.warning if reason_class == "auth" else logger.info
+                    log_fn(
+                        "Key exhaustion deferred (pending release)",
+                        extra={
+                            "service": service,
+                            "index": idx,
+                            "until": pending_until_iso,
+                            "reason_class": reason_class,
+                            "pending": True,
+                        },
+                    )
                 asyncio.create_task(self._notify_listeners("key_exhausted", {
                     "service": service,
                     "index": idx,
-                    "reason": reason,
+                    "reason": sanitized_reason,
                     "reason_class": reason_class,
                     "until": pending_until_iso,
                     "pending": True
                 }))
             else:
-                # Apply immediately
                 ke.exhausted_until = merged_until
                 ke.retry_after = merged_until
                 app_metrics.record_key_state_event(
@@ -2183,25 +2254,27 @@ class APIKeyManager:
                     else requested_until_iso
                 )
 
-                logger.warning(
-                    "Key marked exhausted",
-                    extra={
-                        "service": service,
-                        "index": idx,
-                        "until": effective_until_iso,
-                        "reason": reason,
-                        "reason_class": reason_class,
-                        "existing_extended": bool(
-                            _future_ts_or_none(ke.exhausted_until, now_ts)
-                            and _future_ts_or_none(until_ts, now_ts)
-                            and ke.exhausted_until != until_ts
-                        ),
-                    },
-                )
+                if should_log:
+                    if reason_class == "auth":
+                        log_fn = logger.warning
+                    elif was_already_exhausted:
+                        log_fn = logger.debug
+                    else:
+                        log_fn = logger.info
+                    log_fn(
+                        "Key exhaustion applied",
+                        extra={
+                            "service": service,
+                            "index": idx,
+                            "until": effective_until_iso,
+                            "reason_class": reason_class,
+                            "was_already_exhausted": was_already_exhausted,
+                        },
+                    )
                 asyncio.create_task(self._notify_listeners("key_exhausted", {
                     "service": service,
                     "index": idx,
-                    "reason": reason,
+                    "reason": sanitized_reason,
                     "reason_class": reason_class,
                     "until": effective_until_iso,
                     "pending": False
@@ -2217,6 +2290,7 @@ class APIKeyManager:
 
             self._sweep_key_invariants_locked()
             self._persist_entry_state_locked(service, idx, ke, checked_now=True)
+            return True
 
     # ---------- clear exhaustion / pending clear ----------
     async def clear_exhausted(self, service: str, idx: int):
@@ -2471,13 +2545,27 @@ class APIKeyManager:
             reset_ts: Optional[float] = reset_at.timestamp() if isinstance(reset_at, datetime) else None
 
             if searches_left is not None and searches_left <= 0:
-                await self.mark_exhausted(
-                    "serpapi",
-                    idx,
-                    reason="account_reconcile_quota_exhausted",
-                    until=reset_ts,
-                )
-                exhausted += 1
+                # Only call mark_exhausted if key is NOT already exhausted.
+                # mark_exhausted has its own guard, but skip the call entirely
+                # to avoid unnecessary DB writes and event noise.
+                if not was_exhausted:
+                    await self.mark_exhausted(
+                        "serpapi",
+                        idx,
+                        reason="account_reconcile_quota_exhausted",
+                        until=reset_ts,
+                    )
+                    exhausted += 1
+                else:
+                    # Quietly confirm — already exhausted, just persist state bump.
+                    async with self._lock:
+                        try:
+                            ke = self._keys["serpapi"][idx]
+                            ke.last_checked_at = now_utc.timestamp()
+                            ke.searches_left = searches_left
+                            self._persist_entry_state_locked("serpapi", idx, ke, checked_now=True)
+                        except Exception:
+                            pass
             elif searches_left is not None and searches_left > 0:
                 await self.clear_exhausted("serpapi", idx)
                 if was_exhausted:

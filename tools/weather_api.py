@@ -14,6 +14,7 @@ from enum import IntEnum
 from datetime import datetime, timedelta
 
 import httpx
+from cachetools import TTLCache
 
 # Shared HTTP client
 from core.http_client import get_client
@@ -83,6 +84,16 @@ def _redact_request_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
+def _redact_response_text(text: str) -> str:
+    """Best-effort redaction of sensitive data from weather API response text."""
+    if not text:
+        return text
+    # Mask any apikey/appid patterns in response body
+    import re
+    text = re.sub(r'(?i)(apikey|appid|api_key|token)\s*[:=]\s*"?[A-Za-z0-9._~+\-/]+=*"', r'\1=***REDACTED***', text)
+    return text[:500]  # Cap length
+
+
 def _empty_weather_response(location: Optional[str] = None) -> Dict[str, Any]:
     """Graceful fallback payload for weather-unavailable scenarios."""
     return {
@@ -112,28 +123,13 @@ def _forecast_date_from_unix(ts: Optional[int], timezone_offset_sec: int = 0) ->
     except Exception:
         return None
 
-# Geocoding cache with TTL (city.lower() -> (lat, lon, timestamp))
-# Using a dict that maintains insertion order (Python 3.7+)
-_geocode_cache: Dict[str, Tuple[float, float, float]] = {}
-_geocode_lock = asyncio.Lock()
-_geocode_inflight: Dict[str, asyncio.Future] = {}
+# Geocoding cache with TTL (city.lower() -> (lat, lon))
+# TTLCache handles expiration and bounded size automatically
 GEOCODE_CACHE_TTL = 86400  # 24 hours
 GEOCODE_MAX_SIZE = 10000   # Upper bound to prevent memory leak
-
-def _cleanup_geocode_cache():
-    """
-    Remove oldest entries if cache exceeds max size.
-    Simple LRU‑style: remove 20% of the oldest keys.
-    """
-    if len(_geocode_cache) <= GEOCODE_MAX_SIZE:
-        return
-    # Determine how many to remove (e.g., 20% of max size)
-    to_remove = max(1, int(GEOCODE_MAX_SIZE * 0.2))
-    # Since dict maintains insertion order, the first keys are oldest.
-    keys = list(_geocode_cache.keys())[:to_remove]
-    for k in keys:
-        del _geocode_cache[k]
-    logger.debug("Geocode cache cleaned", extra={"removed": to_remove, "remaining": len(_geocode_cache)})
+_geocode_cache: TTLCache = TTLCache(maxsize=GEOCODE_MAX_SIZE, ttl=GEOCODE_CACHE_TTL)
+_geocode_lock = asyncio.Lock()
+_geocode_inflight: Dict[str, asyncio.Future] = {}
 
 # ----------------------------------------------------------------------
 # Custom exceptions
@@ -301,12 +297,11 @@ async def _make_request_raw(
                                 unauthorized_seen += 1
                                 WEATHER_RETRIES.labels(reason="unauthorized").inc()
                                 until_ts = int(datetime.now().timestamp()) + max(60, WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS)
-                                details = (data.get("message") or "unauthorized")[:1000]
                                 await key_manager.mark_exhausted(
                                     "weather",
                                     idx,
                                     until=until_ts,
-                                    reason=f"unauthorized | {details}",
+                                    reason="unauthorized",
                                 )
                                 logger.warning(
                                     "Weather key unauthorized (likely invalid or pending activation) — cooldown applied",
@@ -317,8 +312,7 @@ async def _make_request_raw(
                                 # Product-plan limits vary across OpenWeather products; use a short
                                 # operator-tunable hold unless upstream provides a precise reset hint.
                                 reset_ts = int(datetime.now().timestamp()) + max(300, WEATHER_QUOTA_DEFAULT_COOLDOWN_SECONDS)
-                                details = (data.get("message") or "")[:1000]
-                                await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason=f"quota | {details}")
+                                await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason="quota")
                                 logger.warning("Weather key quota exceeded (text) — marked exhausted", extra={"key_idx": idx})
                                 continue
 
@@ -342,12 +336,11 @@ async def _make_request_raw(
                         unauthorized_seen += 1
                         WEATHER_RETRIES.labels(reason="unauthorized").inc()
                         until_ts = int(datetime.now().timestamp()) + max(60, WEATHER_UNAUTHORIZED_COOLDOWN_SECONDS)
-                        details = (resp.text or "unauthorized")[:1000]
                         await key_manager.mark_exhausted(
                             "weather",
                             idx,
                             until=until_ts,
-                            reason=f"unauthorized_http_{resp.status_code} | {details}",
+                            reason=f"unauthorized_http_{resp.status_code}",
                         )
                         logger.warning(
                             "Weather key unauthorized (likely invalid or pending activation) — cooldown applied",
@@ -373,8 +366,7 @@ async def _make_request_raw(
 
                         reset_ts = int(datetime.now().timestamp()) + cooldown_seconds
 
-                        details = (resp.text or "")[:1000]
-                        await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason=f"http_429 | {details}")
+                        await key_manager.mark_exhausted("weather", idx, until=reset_ts, reason="http_429")
                         WEATHER_RETRIES.labels(reason="http_429").inc()
                         logger.warning("Weather key rate-limited — marked exhausted", extra={"key_idx": idx})
                         await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -491,25 +483,18 @@ async def _get_coordinates(city: str) -> tuple[float, float]:
         raise ValueError("Location must be a non‑empty string")
 
     city_lower = city.lower()
-    now = time.time()
 
-    # Fast-path cache check
+    # Fast-path cache check (TTLCache handles expiration automatically)
     if city_lower in _geocode_cache:
-        lat, lon, ts = _geocode_cache[city_lower]
-        if now - ts < GEOCODE_CACHE_TTL:
-            logger.debug("Geocoding cache hit", extra={"city": city})
-            return lat, lon
-        logger.debug("Geocoding cache expired", extra={"city": city})
+        logger.debug("Geocoding cache hit", extra={"city": city})
+        return _geocode_cache[city_lower]
 
     # Dedupe concurrent requests for the same location
     created_future = False
     async with _geocode_lock:
-        # Re-check cache while lock held
-        cached = _geocode_cache.get(city_lower)
-        if cached:
-            lat, lon, ts = cached
-            if time.time() - ts < GEOCODE_CACHE_TTL:
-                return lat, lon
+        # Re-check cache while lock held (TTLCache may have evicted expired entry)
+        if city_lower in _geocode_cache:
+            return _geocode_cache[city_lower]
 
         inflight = _geocode_inflight.get(city_lower)
         if inflight is None:
@@ -549,9 +534,9 @@ async def _get_coordinates(city: str) -> tuple[float, float]:
             raise WeatherAPIError(f"Unexpected geocoding response: {e}") from e
 
         # Write to cache and resolve waiting callers
+        # TTLCache handles TTL expiration and max size eviction automatically
         async with _geocode_lock:
-            _geocode_cache[city_lower] = (lat, lon, time.time())
-            _cleanup_geocode_cache()
+            _geocode_cache[city_lower] = (lat, lon)
             fut = _geocode_inflight.pop(city_lower, None)
             if fut and not fut.done():
                 fut.set_result((lat, lon))

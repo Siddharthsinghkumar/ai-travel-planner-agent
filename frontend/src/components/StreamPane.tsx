@@ -67,7 +67,7 @@ export default function StreamPane({
       {isStreaming && (
         <div className="stream-pane__controls">
           <div role="status" className="min-w-0 break-words stream-pane__status">
-            {statusText || (hasTokenText ? "Building your trip summary..." : "Checking flights and destination weather...")}
+            {statusText || (hasTokenText ? "Building your trip summary..." : "Searching flights — results appear below as they arrive.")}
           </div>
 
           {canCancel && (

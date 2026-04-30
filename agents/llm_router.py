@@ -6,7 +6,12 @@ import inspect
 from typing import Optional, Union, AsyncGenerator, Dict, Any, List
 
 # Import async clients (assumed to be fully async, with health checks and streaming)
-from agents.ollama_client import OLLAMA_TIMEOUT, OllamaClient, OllamaError
+from agents.ollama_client import (
+    OLLAMA_TIMEOUT,
+    OllamaClient,
+    OllamaError,
+    get_runtime_inference_config,
+)
 from agents.cloud_llm import CloudLLMClient, CloudLLMError
 # Import dynamic mode/priority from orchestrator
 from core.llm_mode import (
@@ -70,11 +75,21 @@ def _resolve_cloud_timeout() -> float:
 
 
 def _resolve_router_timeout() -> float:
-    return get_env_float("ROUTER_TIMEOUT", 90.0)
+    configured = get_env_float("ROUTER_TIMEOUT", 90.0)
+    # Prevent a self-defeating timeout stack where router cancels before
+    # local backend timeout ownership can complete.
+    local_floor = _resolve_local_timeout() + 5.0
+    return max(configured, local_floor)
 
 
 def _resolve_probe_timeout(env_name: str, default: float) -> float:
     return max(0.2, get_env_float(env_name, default))
+
+
+def _estimate_tokens_from_chars(chars: int) -> int:
+    if chars <= 0:
+        return 0
+    return max(1, (int(chars) + 3) // 4)
 
 
 # Module logger
@@ -192,8 +207,10 @@ class LLMRouter:
             TimeoutError: if the global router timeout is exceeded.
             RuntimeError: if mode requires a backend that is not configured.
 
-        Note: For streaming, once the generator starts yielding, no fallback is possible.
-              Per‑chunk timeouts are enforced using the backend-specific timeout value.
+        Note: For streaming, once the generator starts yielding in llm_router,
+              no fallback is possible at the router level. However, the planner
+              agent implements graceful degradation by yielding structured fallback
+              data when streaming is interrupted mid-stream.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -234,6 +251,10 @@ class LLMRouter:
         local_timeout = _resolve_local_timeout()
         cloud_timeout = _resolve_cloud_timeout()
         router_timeout = _resolve_router_timeout()
+        prompt_chars = len(prompt or "")
+        system_chars = len(system or "")
+        prompt_payload_chars = prompt_chars + system_chars
+        prompt_est_tokens = _estimate_tokens_from_chars(prompt_payload_chars)
 
         cloud_available, ollama_available = await asyncio.gather(
             self._is_cloud_available(),
@@ -308,6 +329,15 @@ class LLMRouter:
                 backend_label = "ollama"
                 # For local (Ollama), we pass None to let the client use its default model (OLLAMA_MODEL)
                 backend_model = None
+                local_runtime_cfg = get_runtime_inference_config()
+                backend_model_name = str(local_runtime_cfg.get("model") or "").strip() or None
+                backend_num_ctx = local_runtime_cfg.get("num_ctx")
+                backend_num_ctx_source = (
+                    str(local_runtime_cfg.get("num_ctx_source") or "").strip() or None
+                )
+                backend_thinking_mode = (
+                    str(local_runtime_cfg.get("thinking_mode") or "").strip().lower() or None
+                )
             else:  # cloud
                 if self.cloud is None:
                     continue
@@ -316,12 +346,17 @@ class LLMRouter:
                 backend_label = "cloud"
                 # For cloud, we pass the requested model (which may be None, letting client use its default)
                 backend_model = model
+                backend_model_name = str(backend_model or "").strip() or None
+                backend_num_ctx = None
+                backend_num_ctx_source = None
+                backend_thinking_mode = None
 
             # No explicit health check; rely on client's circuit breaker and retries
 
                 # Attempt the call with timeout
             try:
                 start = time.monotonic()
+                request_start_epoch_ms = int(time.time() * 1000)
                 # The client's generate method should already be wrapped with circuit breaker and retries
                 if stream:
                     # Get the async generator from client
@@ -377,6 +412,8 @@ class LLMRouter:
                     # gen should now be an async generator. Try to get the first chunk.
                     try:
                         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+                        first_chunk_latency_sec = time.monotonic() - start
+                        first_chunk_epoch_ms = int(time.time() * 1000)
                     except StopAsyncIteration:
                         empty_stream_error = RuntimeError(f"{backend_label} stream ended before first chunk")
                         log_fn = logger.warning if attempt_is_last else logger.info
@@ -432,7 +469,14 @@ class LLMRouter:
 
                     logger.debug("LLM streaming started", extra={
                         "backend": backend_label,
-                        "request_id": request_id
+                        "request_id": request_id,
+                        "model": backend_model_name,
+                        "num_ctx": backend_num_ctx,
+                        "num_ctx_source": backend_num_ctx_source,
+                        "thinking_mode": backend_thinking_mode,
+                        "first_chunk_latency_sec": round(first_chunk_latency_sec, 3),
+                        "prompt_chars": prompt_payload_chars,
+                        "prompt_est_tokens": prompt_est_tokens,
                     })
                     # Route usage should reflect the backend that actually served this request,
                     # not the configured/requested cloud provider.
@@ -452,7 +496,26 @@ class LLMRouter:
                     agen_instance = stream_with_first()
 
                     # wrap in ProviderAsyncGen to guarantee provider attribute and aclose forwarding
-                    return ProviderAsyncGen(agen_instance, backend_label)
+                    wrapped_stream = ProviderAsyncGen(agen_instance, backend_label)
+                    wrapped_stream.llm_metadata = {
+                        "backend": backend_label,
+                        "model": backend_model_name,
+                        "num_ctx": backend_num_ctx,
+                        "num_ctx_source": backend_num_ctx_source,
+                        "thinking_mode": backend_thinking_mode,
+                        "mode": requested_mode,
+                        "effective_mode": mode,
+                        "cloud_provider": selected_cloud_provider if backend_label == "cloud" else None,
+                        "escalated": (idx > 0),
+                        "request_id": request_id,
+                        "request_start_epoch_ms": request_start_epoch_ms,
+                        "first_chunk_epoch_ms": first_chunk_epoch_ms,
+                        "first_chunk_latency_sec": round(first_chunk_latency_sec, 3),
+                        "prompt_chars": prompt_payload_chars,
+                        "prompt_est_tokens": prompt_est_tokens,
+                        "system_chars": system_chars,
+                    }
+                    return wrapped_stream
 
                 else:
                     # Non-streaming: wait for full response with timeout
@@ -477,9 +540,18 @@ class LLMRouter:
                         )
                     result = await asyncio.wait_for(generate_call, timeout=timeout)
                     latency = time.monotonic() - start
+                    completion_epoch_ms = int(time.time() * 1000)
+                    response_chars = len(result or "") if isinstance(result, str) else len(str(result or ""))
                     logger.debug("LLM backend success", extra={
                         "backend": backend_label,
+                        "model": backend_model_name,
+                        "num_ctx": backend_num_ctx,
+                        "num_ctx_source": backend_num_ctx_source,
+                        "thinking_mode": backend_thinking_mode,
                         "latency_sec": round(latency, 3),
+                        "prompt_chars": prompt_payload_chars,
+                        "prompt_est_tokens": prompt_est_tokens,
+                        "response_chars": response_chars,
                         "request_id": request_id
                     })
                     # Route usage should reflect the backend that actually served this request,
@@ -497,11 +569,22 @@ class LLMRouter:
                         return {
                             "response": result,
                             "backend": backend_label,
+                            "model": backend_model_name,
+                            "num_ctx": backend_num_ctx,
+                            "num_ctx_source": backend_num_ctx_source,
+                            "thinking_mode": backend_thinking_mode,
                             "mode": requested_mode,
                             "effective_mode": mode,
                             "cloud_provider": selected_cloud_provider if backend_label == "cloud" else None,
                             "escalated": (idx > 0),  # True if not first attempted backend
-                            "request_id": request_id
+                            "request_id": request_id,
+                            "request_start_epoch_ms": request_start_epoch_ms,
+                            "completion_epoch_ms": completion_epoch_ms,
+                            "latency_sec": round(latency, 3),
+                            "prompt_chars": prompt_payload_chars,
+                            "prompt_est_tokens": prompt_est_tokens,
+                            "system_chars": system_chars,
+                            "response_chars": response_chars,
                         }
                     return result
 

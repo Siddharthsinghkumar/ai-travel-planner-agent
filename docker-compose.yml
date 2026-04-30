@@ -4,9 +4,11 @@ services:
     container_name: llm-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: llm_user
-      POSTGRES_PASSWORD: strongpassword
-      POSTGRES_DB: llm_travel
+      POSTGRES_USER: ${POSTGRES_USER:-llm_user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:-llm_travel}
+    secrets:
+      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -19,7 +21,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg2://llm_user:strongpassword@postgres:5432/llm_travel
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL with real credentials}
+      ENFORCE_SECRET_ENV_VALIDATION: "1"
       OLLAMA_BASE_URL: http://192.168.0.17:11434
     ports:
       - "8000:8000"
@@ -50,8 +53,11 @@ services:
     depends_on:
       - prometheus
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER__FILE: /run/secrets/grafana_admin_user
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets:
+      - grafana_admin_user
+      - grafana_admin_password
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -63,3 +69,11 @@ volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?Set POSTGRES_PASSWORD_FILE to a local secret file}
+  grafana_admin_user:
+    file: ${GRAFANA_ADMIN_USER_FILE:?Set GRAFANA_ADMIN_USER_FILE to a local secret file}
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:?Set GRAFANA_ADMIN_PASSWORD_FILE to a local secret file}

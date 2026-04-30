@@ -1,10 +1,14 @@
 import FlightCard from "./FlightCard";
-import type { Flight } from "../lib/types";
+import type { BookingResolveState, Flight } from "../lib/types";
 
 type FlightsListProps = {
   flights?: Flight[];
   bestFlight?: Flight;
   isLoading?: boolean;
+  onBook?: (flight: Flight) => Promise<{ handoff_url?: string | null; message?: string } | null | void>;
+  bookBlockedReason?: string;
+  flightKeyFor?: (flight: Flight) => string;
+  bookingResolveStateByKey?: Record<string, BookingResolveState>;
   onHold?: (flight: Flight) => void;
   onTrack?: (flight: Flight) => void;
   actionDisabled?: boolean;
@@ -61,6 +65,10 @@ export default function FlightsList({
   flights,
   bestFlight,
   isLoading = false,
+  onBook,
+  bookBlockedReason,
+  flightKeyFor,
+  bookingResolveStateByKey,
   onHold,
   onTrack,
   actionDisabled = false,
@@ -113,26 +121,35 @@ export default function FlightsList({
 
   const orderedFlights = orderFlightsWithBestFirst(flights, bestFlight);
   const totalFlights = orderedFlights.length;
+  const rowKeyCounts = new Map<string, number>();
 
   return (
     <div className="space-y-2 flights-stack" data-testid="flights-list">
-      {orderedFlights.map((f, i) => (
+      {orderedFlights.map((f, i) => {
+        const baseKey = String((flightKeyFor ? flightKeyFor(f) : flightIdentity(f)) || "");
+        const collisionCount = rowKeyCounts.get(baseKey) || 0;
+        rowKeyCounts.set(baseKey, collisionCount + 1);
+        const rowKey = collisionCount === 0 ? baseKey : `${baseKey}#${collisionCount}`;
+        return (
         <div
-          key={i}
+          key={rowKey}
           className="flights-stack__item"
           style={{ animationDelay: `${Math.min(i, 6) * 45}ms` }}
         >
           <FlightCard
             flight={f}
+            bookingResolveState={bookingResolveStateByKey?.[baseKey]}
             isBest={isBestFlight(f, bestFlight)}
             rank={i + 1}
             total={totalFlights}
+            onBook={onBook}
+            bookBlockedReason={bookBlockedReason}
             onHold={onHold}
             onTrack={onTrack}
             actionDisabled={actionDisabled}
           />
         </div>
-      ))}
+      )})}
     </div>
   );
 }

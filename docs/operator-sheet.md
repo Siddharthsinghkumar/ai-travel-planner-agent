@@ -200,6 +200,7 @@ When supported:
 - Primary handoff assignment is booking-ready-only:
   - `best_flight.handoff_url` is set only when `booking_handoff.status == booking_ready`.
   - No Google Flights search-assist fallback URL is emitted in booking flow responses.
+  - This is a strict product boundary: booking flows must stay booking-token/provider-resolution only.
   - If provider resolution fails, booking handoff stays explicit and unavailable (`status=unavailable`, `url=null`).
 - SerpApi-first resolver path (book button backend contract):
   - use itinerary-level `booking_token` from selected flight (`best_flights[]` / `other_flights[]`), not root fallback.
@@ -287,7 +288,7 @@ Common `lookup_result` values include:
 - Local explanation generation behavior and latency
 
 ### Intentionally Unsupported / Deferred
-- Correct distributed async-job semantics in true multi-worker topology with process-local queues/state
+- Distributed async-job semantics for true multi-worker/shared-state topology (explicitly deferred)
 - Guaranteed booking-ready artifacts for every provider/route case
 - Zero-noise deep health in presence of unstable external providers
 
@@ -303,7 +304,7 @@ Common `lookup_result` values include:
 
 ## 14) Unified Provider Key-State Persistence
 
-- Key state for all managed providers (`serpapi`, `weather`, `openai`, `gemini`, `anthropic`) is durably persisted in Postgres (`provider_key_states`) using:
+- Key state for all managed providers (`serpapi`, `weather`, `openai`, `gemini`, `anthropic`) is durably persisted in SQL storage (`provider_key_states`) using:
   - `provider`
   - `key_name_fingerprint`
   - `key_value_fingerprint`
@@ -319,6 +320,8 @@ Common `lookup_result` values include:
   - `last_reason`
   - `failure_classification`
   - `state_meta`
+- Canonical single-node deployment baseline uses SQLite (`DATABASE_URL=sqlite:////var/lib/llm-travel-agent/local.db`).
+- PostgreSQL is optional/non-canonical and must be treated as an explicit alternative deployment choice.
 - Startup (refresh-owner worker):
   1. key load from env
   2. DB hydration for provider key state (bounded startup wait; overflow continues in background)
