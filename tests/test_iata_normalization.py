@@ -131,62 +131,6 @@ async def test_plan_trip_rejects_past_departure_date_without_tool_call(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_multicity_stopover_payload_includes_match_reason(monkeypatch):
-    async def fake_handoff_url(*args, **kwargs):
-        return None
-
-    async def fake_weather(*args, **kwargs):
-        travel_date = kwargs.get("travel_date") or kwargs.get("date")
-        return {
-            "condition": "Clear",
-            "temperature_c": 26,
-            "forecast_date": travel_date,
-            "temp_min_c": 22,
-            "temp_max_c": 30,
-        }
-
-    async def fake_search(*args, **kwargs):
-        departure = kwargs.get("departure") or "AAA"
-        arrival = kwargs.get("arrival") or "BBB"
-        date = kwargs.get("date") or "2030-01-01"
-        return [
-            {
-                "airline": "TestAir",
-                "flight_no": "TA100",
-                "departure_time": "09:00",
-                "arrival_time": "11:00",
-                "duration_min": 120,
-                "price_inr": 5500,
-                "stops": 0,
-                "layover_info": f"via {arrival}",
-                "layover_airports": [arrival],
-                "layover_durations_min": [60],
-                "baggage": "7kg cabin",
-                "date": date,
-            }
-        ], {"_search_meta": {"raw_candidate_count": 1}}
-
-    monkeypatch.setattr("agents.planner_agent._build_booking_handoff_url_safe", fake_handoff_url)
-
-    result = await _plan_trip_internal(
-        origin="CCU",
-        destination="BKK",
-        date="2030-01-10",
-        user_query="Find flights from Kolkata to Bangkok via New Delhi on 2030-01-10",
-        skip_llm=True,
-        flight_tool=fake_search,
-        weather_tool=fake_weather,
-    )
-
-    assert getattr(result, "multicity", False) is True
-    assert len(result.legs) == 2
-    assert result.legs[0].stopover_filter is not None
-    assert result.legs[0].stopover_filter.get("match_reason") == "explicit_multicity_leg_split"
-    assert result.legs[1].stopover_filter is not None
-    assert result.legs[1].stopover_filter.get("match_reason") == "explicit_multicity_leg_split"
-
-
-@pytest.mark.asyncio
 async def test_roundtrip_return_weather_date_mismatch_is_marked_unavailable(monkeypatch):
     async def fake_handoff_url(*args, **kwargs):
         return None

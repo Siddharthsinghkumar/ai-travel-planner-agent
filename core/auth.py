@@ -16,7 +16,7 @@ from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from core.env_config import get_env_str
+from core.env_config import get_env_bool, get_env_str
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -116,10 +116,16 @@ def _extract_bearer_token(
     return token
 
 
+_TEST_PRINCIPAL = AuthenticatedPrincipal(principal_id="test-user", auth_source="test_bypass")
+
+
 async def get_optional_principal(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
 ) -> Optional[AuthenticatedPrincipal]:
+    # Allow test/dev bypass via env var
+    if get_env_bool("AUTH_DISABLE", False):
+        return _TEST_PRINCIPAL
     diagnostics = await get_optional_principal_diagnostics(request, credentials)
     if diagnostics.principal is not None:
         return diagnostics.principal

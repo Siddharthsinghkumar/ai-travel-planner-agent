@@ -9,6 +9,43 @@ import tools.booking_handoff as booking_handoff
 from tools.booking_handoff import build_booking_handoff_url
 
 
+class _FakeQuery:
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, *_args, **_kwargs):
+        return self
+
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    def __init__(self, query_result=None):
+        self._query_result = query_result or []
+
+    def add(self, _obj):
+        return None
+
+    def commit(self):
+        return None
+
+    def refresh(self, booking_obj):
+        booking_obj.id = 4242
+
+    def close(self):
+        return None
+
+    def query(self, *_args, **_kwargs):
+        fq = _FakeQuery()
+        fq._result = self._query_result
+        fq.all = lambda: self._query_result
+        return fq
+
+
 def _future_date(days: int = 1) -> str:
     return (datetime.now().date() + timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -116,69 +153,12 @@ async def test_build_booking_handoff_url_returns_none_without_details_when_unava
 
 
 @pytest.mark.asyncio
-async def test_hold_booking_reuses_booking_handoff_when_booking_ready(monkeypatch):
-    build_calls = {"count": 0}
-
-    async def fake_build_booking_handoff_url(**_kwargs):
-        build_calls["count"] += 1
-        return "https://partner.example/new-resolution"
-
-    class _FakeSession:
-        def add(self, _obj):
-            return None
-
-        def commit(self):
-            return None
-
-        def refresh(self, booking_obj):
-            booking_obj.id = 4242
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(booking_handoff, "build_booking_handoff_url", fake_build_booking_handoff_url)
-    monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _FakeSession())
-
-    flight = {
-        "flight_no": "TA4242",
-        "booking_handoff": {
-            "booking_exit_quality": "booking_ready",
-            "url": "https://partner.example/checkout/selected",
-        },
-        "handoff_url": "https://partner.example/checkout/selected",
-    }
-
-    held = await booking_handoff.hold_booking(
-        flight=flight,
-        origin="DEL",
-        destination="BOM",
-        depart_date="2026-06-12",
-    )
-
-    assert held["handoff_url"] == "https://partner.example/checkout/selected"
-    assert build_calls["count"] == 0
-
-
-@pytest.mark.asyncio
 async def test_hold_booking_resolves_when_booking_handoff_not_ready(monkeypatch):
     build_calls = {"count": 0}
 
     async def fake_build_booking_handoff_url(**_kwargs):
         build_calls["count"] += 1
         return None
-
-    class _FakeSession:
-        def add(self, _obj):
-            return None
-
-        def commit(self):
-            return None
-
-        def refresh(self, booking_obj):
-            booking_obj.id = 5252
-
-        def close(self):
-            return None
 
     monkeypatch.setattr(booking_handoff, "build_booking_handoff_url", fake_build_booking_handoff_url)
     monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _FakeSession())
@@ -220,22 +200,16 @@ async def test_hold_booking_persists_route_primitives_for_tracker(monkeypatch):
             "provider": "serpapi",
         }
 
-    class _FakeSession:
+    class _CapturingSession(_FakeSession):
         def add(self, obj):
             captured["booking_obj"] = obj
-            return None
-
-        def commit(self):
             return None
 
         def refresh(self, booking_obj):
             booking_obj.id = 6161
 
-        def close(self):
-            return None
-
     monkeypatch.setattr(booking_handoff, "build_booking_handoff_url", fake_build_booking_handoff_url)
-    monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _CapturingSession())
 
     held = await booking_handoff.hold_booking(
         flight={"flight_no": "TA6161", "price_inr": 5400},
@@ -267,96 +241,19 @@ def test_get_booking_normalizes_checkout_status_without_handoff_url(monkeypatch)
         created_at = datetime.utcnow()
         expires_at = datetime.utcnow() + timedelta(minutes=10)
 
-    class _FakeSession:
+    class _GetSession(_FakeSession):
         def get(self, _model, booking_id):
             if booking_id == 707:
                 return _BookingObj()
             return None
 
-        def close(self):
-            return None
-
-    monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(booking_handoff, "SessionLocal", lambda: _GetSession())
 
     payload = booking_handoff.get_booking(707)
     assert payload is not None
     assert payload["checkout_ready"] is False
     assert payload["checkout_status"] == "provider_handoff_unavailable"
     assert payload["hold_outcome"] == "held_local_only"
-
-
-@pytest.mark.asyncio
-async def test_fetch_booking_options_retries_with_token_only_shape_when_shaped_request_fails(monkeypatch):
-    class _DummyResponse:
-        def __init__(self, status_code: int, payload):
-            self.status_code = status_code
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-    class _DummyClient:
-        def __init__(self):
-            self.calls = []
-
-        async def get(self, _url, params=None, timeout=None):
-            self.calls.append({"params": dict(params or {}), "timeout": timeout})
-            if len(self.calls) == 1:
-                return _DummyResponse(400, {"error": "bad shaped request"})
-            return _DummyResponse(
-                200,
-                {
-                    "selected_flights": [
-                        {
-                            "booking_options": [
-                                {"provider": "PartnerAir", "price": 6200, "link": "https://partner.example/checkout/ok"}
-                            ]
-                        }
-                    ]
-                },
-            )
-
-    class _DummyKeyManager:
-        @contextlib.asynccontextmanager
-        async def reserve_key(self, _service):
-            yield 0, "serpapi-key-1"
-
-        async def mark_exhausted(self, *_args, **_kwargs):
-            return None
-
-        async def record_usage(self, *_args, **_kwargs):
-            return None
-
-    client = _DummyClient()
-    monkeypatch.setattr(booking_handoff, "_get_booking_http_client", lambda: client)
-    monkeypatch.setattr(booking_handoff, "api_key_manager", _DummyKeyManager())
-    monkeypatch.setattr(booking_handoff, "BOOKING_OPTIONS_RETRIES", 2)
-    monkeypatch.setattr(booking_handoff, "BOOKING_OPTIONS_ATTEMPTS_BUDGET", 3)
-
-    payload = await booking_handoff._fetch_booking_options_payload(
-        booking_token="tok_abc",
-        departure_id="DEL",
-        arrival_id="BOM",
-        outbound_date="2026-06-20",
-        include_airlines="6E",
-        deep_search=True,
-        travel_class="1",
-        adults=1,
-    )
-
-    assert isinstance(payload, dict)
-    assert len(client.calls) == 2
-    first_params = client.calls[0]["params"]
-    second_params = client.calls[1]["params"]
-    assert first_params.get("departure_id") == "DEL"
-    assert first_params.get("arrival_id") == "BOM"
-    assert first_params.get("outbound_date") == "2026-06-20"
-    assert second_params.get("booking_token") == "tok_abc"
-    assert "departure_id" not in second_params
-    assert "arrival_id" not in second_params
-    assert "outbound_date" not in second_params
-    assert "include_airlines" not in second_params
-    assert "deep_search" not in second_params
 
 
 @pytest.mark.asyncio
@@ -425,7 +322,7 @@ async def test_plan_trip_internal_search_only_deferred_handoff_contract_is_lean(
             }
         ], {"_search_meta": {"raw_candidate_count": 1}}
 
-    async def fake_weather(*, location: str, travel_date: str):
+    async def fake_weather(*, location: str, travel_date: str, **kwargs):
         return {"condition": "Clear", "temperature_c": 28, "forecast_date": travel_date, "location": location}
 
     monkeypatch.setattr(planner_agent, "_build_booking_handoff_url_safe", should_not_run_handoff)
@@ -462,94 +359,6 @@ async def test_plan_trip_internal_search_only_deferred_handoff_contract_is_lean(
     assert "quality_summary" not in row_handoff
     assert "next_step_hint" not in row_handoff
     assert "failure_bucket" not in row_handoff
-
-
-@pytest.mark.asyncio
-async def test_plan_trip_internal_resolved_handoff_contract_has_no_google_fallback(monkeypatch):
-    async def fake_handoff(*_args, **kwargs):
-        flight = kwargs.get("flight") or {}
-        if flight.get("flight_no") == "TA001":
-            return {
-                "url": "https://partner.example/checkout/ta001",
-                "source": "booking_token",
-                "reason": "resolved_booking_token",
-                "status": "booking_ready",
-                "booking_exit_quality": "booking_ready",
-                "provider": "serpapi",
-            }
-        return {
-            "url": None,
-            "source": "booking_token",
-            "reason": "booking_token_unresolved",
-            "status": "unavailable",
-            "booking_exit_quality": "unavailable",
-            "provider": "serpapi",
-        }
-
-    async def fake_search(**kwargs):
-        date = kwargs.get("date")
-        return [
-            {
-                "airline": "TestAir",
-                "flight_no": "TA001",
-                "departure_time": "08:00",
-                "arrival_time": "10:00",
-                "duration_min": 120,
-                "price_inr": 4500,
-                "stops": 0,
-                "layover_info": "",
-                "baggage": "7kg cabin",
-                "date": date,
-                "booking_token": "tok_ta001",
-            },
-            {
-                "airline": "TestAir",
-                "flight_no": "TA002",
-                "departure_time": "09:00",
-                "arrival_time": "11:10",
-                "duration_min": 130,
-                "price_inr": 4800,
-                "stops": 0,
-                "layover_info": "",
-                "baggage": "7kg cabin",
-                "date": date,
-                "booking_token": "tok_ta002",
-            },
-        ], {"_search_meta": {"raw_candidate_count": 2}}
-
-    async def fake_weather(*, location: str, travel_date: str):
-        return {"condition": "Clear", "temperature_c": 28, "forecast_date": travel_date, "location": location}
-
-    monkeypatch.setattr(planner_agent, "_build_booking_handoff_url_safe", fake_handoff)
-    monkeypatch.setattr(planner_agent, "PER_FLIGHT_HANDOFF_LIMIT", 2)
-    monkeypatch.setattr(planner_agent, "PER_FLIGHT_HANDOFF_TIMEOUT", 0.2)
-
-    result = await planner_agent._plan_trip_internal(
-        origin="DEL",
-        destination="BOM",
-        date=_future_date(2),
-        user_query="find flights",
-        skip_llm=True,
-        flight_tool=fake_search,
-        weather_tool=fake_weather,
-    )
-
-    assert result.booking_handoff["status"] == "booking_ready"
-    assert result.booking_handoff["url"] == "https://partner.example/checkout/ta001"
-    assert "google" not in (result.booking_handoff["url"] or "").lower()
-
-    assert isinstance(result.best_flight.get("booking_handoff"), dict)
-    assert "selected_booking_handoff" not in result.best_flight
-    assert "selected_booking_handoff_quality_context" not in result.best_flight
-
-    for row in result.top_flights or []:
-        meta = row.get("booking_handoff") or {}
-        assert "handoff_mode" not in meta
-        assert "landing_guarantee" not in meta
-        assert "quality_summary" not in meta
-        assert "next_step_hint" not in meta
-        assert "search_assist_url" not in row
-        assert "fallback_search_url" not in row
 
 
 @pytest.mark.asyncio

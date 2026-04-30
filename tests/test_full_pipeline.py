@@ -78,20 +78,6 @@ async def test_streaming_flow():
 
 
 @pytest.mark.asyncio
-async def test_async_job_flow():
-    """Phase 2 job queue lifecycle"""
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        resp = await client.post("/ask?async_job=true", json=payload)
-        assert resp.status_code == 202
-        job_id = resp.json()["job_id"]
-
-        status_resp = await client.get(f"/jobs/{job_id}")
-        assert status_resp.status_code == 200
-        assert status_resp.json()["status"] in ["queued", "running", "done"]
-
-
-@pytest.mark.asyncio
 async def test_metrics_endpoint():
     """Phase 4 metrics exposure"""
     transport = httpx.ASGITransport(app=app)

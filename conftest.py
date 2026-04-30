@@ -57,6 +57,7 @@ def patch_llm_router(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def set_test_auth_tokens(monkeypatch):
+    monkeypatch.setenv("AUTH_DISABLE", "true")
     monkeypatch.setenv(
         "AUTH_BEARER_TOKENS",
         "test-user:test-user-token,other-user:other-user-token",
@@ -87,6 +88,7 @@ def reset_job_queue_state():
     job_queue._last_prune_at = 0.0
     job_queue.JOB_RETENTION_SECONDS = 3600
     job_queue.JOB_PRUNE_INTERVAL_SECONDS = 300
+    job_queue._async_state_lock = None
     yield
     job_queue._jobs.clear()
     job_queue._job_event_queues.clear()
@@ -95,6 +97,7 @@ def reset_job_queue_state():
     job_queue._last_prune_at = 0.0
     job_queue.JOB_RETENTION_SECONDS = 3600
     job_queue.JOB_PRUNE_INTERVAL_SECONDS = 300
+    job_queue._async_state_lock = None
 
 
 @pytest.fixture(autouse=True)

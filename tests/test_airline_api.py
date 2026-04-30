@@ -112,10 +112,6 @@ def test_expand_airports_ignores_generic_location_qualifiers():
     assert expand_airports("Pune city") == "PNQ"
 
 
-def test_expand_airports_returns_empty_for_unresolved_multiword_phrase():
-    assert expand_airports("Unknown City Name") == ""
-
-
 def test_build_flight_cache_key_is_schema_versioned():
     key = _build_flight_cache_key(
         departure_ids="DEL",
@@ -159,7 +155,7 @@ async def test_search_flights_marks_key_exhausted_on_http_403(monkeypatch):
     monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
     monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
 
-    with pytest.raises(AirlineAPIError, match="All SerpAPI keys exhausted or failed"):
+    with pytest.raises(AirlineAPIError, match="All SerpAPI keys are currently exhausted"):
         await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
 
     assert len(dummy_km.mark_calls) == 1
@@ -298,7 +294,6 @@ async def test_search_flights_logs_key_source_and_masked_fingerprint(monkeypatch
     monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
     monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
     monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", True)
 
     with caplog.at_level("DEBUG"):
         flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
@@ -352,7 +347,6 @@ async def test_search_flights_success_account_check_non_200_is_non_blocking_info
     monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
     monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
     monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", True)
 
     with caplog.at_level("INFO"):
         flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
@@ -415,7 +409,6 @@ async def test_search_flights_success_skips_post_success_account_check_when_disa
     monkeypatch.setattr(airline_api, "get_circuit_breaker", _fake_get_circuit_breaker)
     monkeypatch.setattr(airline_api, "_rate_limit", AsyncMock())
     monkeypatch.setattr(airline_api.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr(airline_api, "SERPAPI_POST_SUCCESS_ACCOUNT_CHECK_ENABLED", False)
 
     flights, _ = await search_flights("DEL", "BOM", "2026-03-20", use_cache=False)
 

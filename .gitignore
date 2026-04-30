@@ -38,3 +38,40 @@ build/
 # OS files
 .DS_Store
 Thumbs.db
+
+# AI tool artifacts
+.claude-flow/
+.claude/
+.swarm/
+.codex/
+AGENTS.md
+CLAUDE.md
+COMMIT
+agentdb.rvf
+agentdb.rvf.lock
+claude-flow.config.json
+session-*.md
+
+# Local databases
+*.db
+!requirements*.txt
+
+# Eval and validation outputs
+eval_results/
+validation_logs/
+graphify-out/
+
+# Playwright
+.playwright-browsers/
+
+# Frontend AI tool artifacts
+frontend/.agents/
+frontend/.claude-flow/
+frontend/.claude/
+frontend/.swarm/
+frontend/CLAUDE.md
+frontend/agentdb.rvf
+frontend/agentdb.rvf.lock
+
+# Virtual environment
+venv/

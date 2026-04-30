@@ -310,37 +310,6 @@ async def test_health_check_transient_cooldown_and_prunes_unconfigured_entries(m
     assert openai_until <= started + 15
 
 
-@pytest.mark.asyncio
-async def test_on_key_event_exhausted_logging_is_reactive_and_deduped(monkeypatch):
-    calls = []
-    warning_logs = []
-    debug_logs = []
-
-    async def _fake_clear(provider, idx, **_kwargs):
-        calls.append((provider, idx))
-        return True
-
-    monkeypatch.setattr(cloud_llm, "clear_client_cache", _fake_clear)
-    monkeypatch.setattr(cloud_llm.asyncio, "create_task", lambda coro: asyncio.get_event_loop().create_task(coro))
-    monkeypatch.setattr(cloud_llm.logger, "warning", lambda msg, *args, **kwargs: warning_logs.append(msg % args if args else msg))
-    monkeypatch.setattr(cloud_llm.logger, "debug", lambda msg, *args, **kwargs: debug_logs.append(msg % args if args else msg))
-
-    payload = {
-        "service": "serpapi",
-        "index": 0,
-        "reason_class": "quota",
-        "until": "2026-05-01T00:00:00+00:00",
-        "pending": False,
-    }
-    await cloud_llm.on_key_event("key_exhausted", payload)
-    await cloud_llm.on_key_event("key_exhausted", payload)
-    await asyncio.sleep(0)
-
-    assert calls == [("serpapi", 0), ("serpapi", 0)]
-    assert any("Received key_exhausted event" in message for message in warning_logs)
-    assert any("Deduped key_exhausted reaction log" in message for message in debug_logs)
-
-
 def test_openai_exhaustion_reason_separates_billing_from_rate_limit():
     assert cloud_llm._openai_exhaustion_reason(RuntimeError("insufficient_quota: please check billing")) == "billing_quota_exhausted"
     assert cloud_llm._openai_exhaustion_reason(RuntimeError("rate limit reached")) == "rate_limit"

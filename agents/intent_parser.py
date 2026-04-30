@@ -144,6 +144,13 @@ def normalize_trip(user_query: str, include_trace: bool = False) -> Dict[str, An
         if via_iata:
             route_trace["via_resolved_from"] = parts["via_text"]
 
+    if include_trace:
+        route_trace["raw_fragments"] = {
+            "origin_text": parts["origin_text"],
+            "destination_text": parts["destination_text"],
+            "via_text": parts["via_text"],
+        }
+
     return {
         "origin_iata": origin_iata,
         "destination_iata": dest_iata,

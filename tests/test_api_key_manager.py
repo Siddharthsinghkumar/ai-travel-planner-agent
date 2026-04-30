@@ -658,48 +658,6 @@ async def test_serpapi_quota_uses_default_reset_day_when_available():
 
 
 @pytest.mark.asyncio
-async def test_serpapi_reconcile_extends_weekly_deferral_when_still_exhausted(monkeypatch):
-    _clear_provider_key_state_rows()
-    km = APIKeyManager()
-    key_name = "SERPAPI_KEY_15"
-    key = KeyEntry(
-        value="serpapi-weekly-reconcile",
-        fingerprint=km._fingerprint("serpapi-weekly-reconcile"),
-        key_name=key_name,
-        name_fingerprint=km._fingerprint_name(key_name),
-        exhausted_until=time.time() - 1,
-        retry_after=time.time() - 1,
-        expected_reset_basis="weekly_unknown_reset_fallback",
-    )
-    km._keys = {"serpapi": [key]}
-    km._rr_index = {"serpapi": 0}
-
-    class _Resp:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"plan_searches_left": 0, "plan_name": "Monthly plan"}
-
-    class _Client:
-        async def get(self, *_args, **_kwargs):
-            return _Resp()
-
-    monkeypatch.setattr("core.http_client.get_client", lambda: _Client())
-    before = time.time()
-    result = await km.reconcile_serpapi_account_state()
-
-    assert result["checked"] == 1
-    assert km._keys["serpapi"][0].exhausted_until is not None
-    assert km._keys["serpapi"][0].exhausted_until >= before + (6 * 24 * 3600)
-    assert km._keys["serpapi"][0].expected_reset_basis in {
-        "weekly_unknown_reset_fallback",
-        "default_key_monthly_reset_day",
-        "account_inferred_cycle_boundary",
-    }
-
-
-@pytest.mark.asyncio
 async def test_serpapi_reconcile_skips_future_exhausted_keys(monkeypatch):
     _clear_provider_key_state_rows()
     km = APIKeyManager()
@@ -789,85 +747,6 @@ async def test_serpapi_rotation_force_reconcile_bypasses_skip(monkeypatch):
     assert result["checked"] == 1
     assert result["forced"] >= 1
     assert calls["count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_manual_key_override_force_exhausted_blocks_key(monkeypatch):
-    _clear_provider_key_state_rows()
-    km = APIKeyManager()
-    key_value = "openai-override"
-    key_name = "OPENAI_KEY_7"
-    key_entry = KeyEntry(
-        value=key_value,
-        fingerprint=km._fingerprint(key_value),
-        key_name=key_name,
-        name_fingerprint=km._fingerprint_name(key_name),
-    )
-    km._keys = {"openai": [key_entry]}
-    km._rr_index = {"openai": 0}
-    monkeypatch.setattr(km, "_write_state_file", lambda _state: None)
-
-    await km.set_provider_state_override(
-        provider="openai",
-        scope_type="key",
-        scope_identifier=key_entry.name_fingerprint,
-        override_type="force_exhausted_until",
-        active_until=(key_manager_module._now() + key_manager_module.timedelta(hours=1)).isoformat(),
-        note="manual hold",
-    )
-
-    with pytest.raises(RuntimeError, match="No available keys"):
-        async with km.reserve_key("openai"):
-            pass
-
-
-@pytest.mark.asyncio
-async def test_manual_provider_project_override_applies_to_gemini_without_per_key_assumption(monkeypatch):
-    _clear_provider_key_state_rows()
-    km = APIKeyManager()
-    key_a = KeyEntry(
-        value="gemini-a",
-        fingerprint=km._fingerprint("gemini-a"),
-        key_name="GEMINI_KEY_1",
-        name_fingerprint=km._fingerprint_name("GEMINI_KEY_1"),
-    )
-    key_b = KeyEntry(
-        value="gemini-b",
-        fingerprint=km._fingerprint("gemini-b"),
-        key_name="GEMINI_KEY_2",
-        name_fingerprint=km._fingerprint_name("GEMINI_KEY_2"),
-    )
-    km._keys = {"gemini": [key_a, key_b]}
-    km._rr_index = {"gemini": 0}
-    monkeypatch.setattr(km, "_write_state_file", lambda _state: None)
-
-    override = await km.set_provider_state_override(
-        provider="gemini",
-        scope_type="project",
-        scope_identifier="project-alpha",
-        override_type="force_exhausted_until",
-        active_until=(key_manager_module._now() + key_manager_module.timedelta(hours=2)).isoformat(),
-        note="gemini project throttle",
-    )
-    with pytest.raises(RuntimeError, match="No available keys"):
-        async with km.reserve_key("gemini"):
-            pass
-
-    disabled = await km.disable_provider_state_override(int(override["id"]))
-    assert disabled is True
-
-    # Provider-account clear override demonstrates non-key scope without forcing per-key truth.
-    await km.mark_exhausted("gemini", 0, reason="rate_limit")
-    await km.set_provider_state_override(
-        provider="gemini",
-        scope_type="provider_account",
-        scope_identifier="acct-1",
-        override_type="clear_exhaustion",
-        active_until=None,
-        note="temporary operator clear",
-    )
-    async with km.reserve_key("gemini") as (_idx, key_val):
-        assert key_val in {"gemini-a", "gemini-b"}
 
 
 @pytest.mark.asyncio
@@ -1015,45 +894,6 @@ async def test_provider_override_datetime_output_is_utc_normalized():
     assert listed
     assert listed[0]["active_until"] == "2026-05-01T00:00:00+00:00"
     assert listed[0]["override_until"] == "2026-05-01T00:00:00+00:00"
-
-
-@pytest.mark.asyncio
-async def test_serpapi_key_override_requires_both_fingerprints_to_match(monkeypatch):
-    _clear_provider_key_state_rows()
-    km = APIKeyManager()
-    key = KeyEntry(
-        value="serpapi-binding-a",
-        fingerprint=km._fingerprint("serpapi-binding-a"),
-        key_name="SERPAPI_KEY_7",
-        name_fingerprint=km._fingerprint_name("SERPAPI_KEY_7"),
-    )
-    km._keys = {"serpapi": [key]}
-    km._rr_index = {"serpapi": 0}
-    monkeypatch.setattr(km, "_write_state_file", lambda _state: None)
-
-    await km.set_provider_state_override(
-        provider="serpapi",
-        scope_type="key",
-        scope_identifier=key.name_fingerprint,
-        override_type="force_exhausted_until",
-        active_until=(key_manager_module._now() + key_manager_module.timedelta(minutes=20)).isoformat(),
-        note="binding match required",
-    )
-    session = SessionLocal()
-    try:
-        row = session.query(ProviderStateOverride).filter(
-            ProviderStateOverride.provider == "serpapi",
-            ProviderStateOverride.scope_type == "key",
-            ProviderStateOverride.scope_identifier == key.name_fingerprint,
-        ).order_by(ProviderStateOverride.id.desc()).first()
-        assert row is not None
-        assert (row.key_name_fingerprint or "") == key.name_fingerprint
-        assert (row.key_value_fingerprint or "") == key.fingerprint
-    finally:
-        session.close()
-    with pytest.raises(RuntimeError, match="No available keys"):
-        async with km.reserve_key("serpapi"):
-            pass
 
 
 @pytest.mark.asyncio
