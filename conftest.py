@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -6,6 +7,7 @@ from api.app import app
 from api import routes_booking_tracking
 from core import job_queue
 from core.rate_limiter import SlidingWindowRateLimiter
+
 
 @pytest.fixture
 def client():
@@ -81,6 +83,10 @@ def reset_admin_rate_limiter_state():
 
 @pytest.fixture(autouse=True)
 def reset_job_queue_state():
+    # Ensure the shared DB tables exist (in-memory SQLite for tests)
+    from agents.database import init_db
+    init_db()
+
     job_queue._jobs.clear()
     job_queue._job_event_queues.clear()
     job_queue._job_tasks.clear()

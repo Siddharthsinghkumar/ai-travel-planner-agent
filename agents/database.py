@@ -138,6 +138,27 @@ class ProviderStateOverride(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+
+class BackgroundJob(Base):
+    """
+    Durable async job records for the background job queue.
+    Shared DB with all other models — no separate aiosqlite connection needed.
+    """
+    __tablename__ = "background_jobs"
+
+    job_id = Column(String(64), primary_key=True)
+    owner_principal_id = Column(String(128), nullable=True)
+    status = Column(String(32), nullable=False, default="queued")
+    result = Column(JSON, nullable=True)
+    error = Column(JSON, nullable=True)
+    message = Column(Text, nullable=True)
+    created_at = Column(String(32), nullable=False)
+    updated_at = Column(String(32), nullable=False)
+    completed_at = Column(String(32), nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, default=False)
+    event_seq = Column(Integer, nullable=False, default=0)
+    payload = Column(JSON, nullable=True)
+
 def _ensure_provider_key_state_columns(engine) -> None:
     try:
         inspector = inspect(engine)

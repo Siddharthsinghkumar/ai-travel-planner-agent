@@ -18,8 +18,6 @@ import logging
 import os
 import time
 import uuid
-import aiosqlite
-import asyncpg
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Union
 
@@ -43,189 +41,123 @@ _queue: asyncio.Queue = asyncio.Queue(maxsize=JOB_QUEUE_MAXSIZE)
 TERMINAL_STATUSES = {"done", "error", "cancelled"}
 _async_state_lock: asyncio.Lock | None = None
 
-# Unified DB configuration
-RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-def _get_db_config():
-    url = RAW_DATABASE_URL
-    if url.startswith("postgresql+psycopg2://"):
-        url = url.replace("postgresql+psycopg2://", "postgresql://", 1)
-    elif url.startswith("postgresql+asyncpg://"):
-        url = url.replace("postgresql+asyncpg://", "postgresql://", 1)
-    
-    is_postgres = url.startswith("postgresql://") or url.startswith("postgres://")
-    
-    if not is_postgres:
-        # Assume SQLite
-        path = url
-        if path.startswith("sqlite:///"):
-            path = path[len("sqlite:///"):]
-        return {"type": "sqlite", "path": path}
-    else:
-        return {"type": "postgres", "url": url}
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-DB_CONFIG = _get_db_config()
 
-class AsyncDB:
-    def __init__(self, config):
-        self.config = config
-        self.conn = None
+def _db_session():
+    from agents.database import SessionLocal
+    return SessionLocal()
 
-    async def __aenter__(self):
-        if self.config["type"] == "sqlite":
-            self.conn = await aiosqlite.connect(self.config["path"])
-            self.conn.row_factory = aiosqlite.Row
-        else:
-            self.conn = await asyncpg.connect(self.config["url"])
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            await self.conn.close()
-
-    async def execute(self, sql: str, params: tuple = ()):
-        if self.config["type"] == "sqlite":
-            return await self.conn.execute(sql, params)
-        else:
-            # Convert ? to $1, $2, ...
-            pg_sql = sql
-            for i in range(1, sql.count("?") + 1):
-                pg_sql = pg_sql.replace("?", f"${i}", 1)
-            
-            # postgres uses BOOLEAN type, sqlite uses 0/1. 
-            # asyncpg handles this if we pass bools.
-            return await self.conn.execute(pg_sql, *params)
-
-    async def fetch_all(self, sql: str, params: tuple = ()):
-        if self.config["type"] == "sqlite":
-            async with self.conn.execute(sql, params) as cursor:
-                return await cursor.fetchall()
-        else:
-            pg_sql = sql
-            for i in range(1, sql.count("?") + 1):
-                pg_sql = pg_sql.replace("?", f"${i}", 1)
-            return await self.conn.fetch(pg_sql, *params)
-
-    async def commit(self):
-        if self.config["type"] == "sqlite":
-            await self.conn.commit()
-        # asyncpg doesn't need explicit commit for single statements unless in transaction
-
-async def _ensure_db():
-    async with AsyncDB(DB_CONFIG) as db:
-        dialect = DB_CONFIG["type"]
-        json_type = "TEXT" if dialect == "sqlite" else "JSONB"
-        bool_type = "BOOLEAN"
-        
-        await db.execute(f"""
-            CREATE TABLE IF NOT EXISTS background_jobs (
-                job_id TEXT PRIMARY KEY,
-                owner_principal_id TEXT,
-                status TEXT,
-                result {json_type},
-                error {json_type},
-                message TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                completed_at TEXT,
-                cancel_requested {bool_type},
-                event_seq INTEGER,
-                payload {json_type}
-            )
-        """)
-        await db.commit()
 
 async def _db_upsert_job(job_id: str, job: Dict[str, Any], payload: Optional[Dict[str, Any]] = None):
-    async with AsyncDB(DB_CONFIG) as db:
-        if payload is not None:
-            await db.execute("""
-                INSERT INTO background_jobs 
-                (job_id, owner_principal_id, status, result, error, message, created_at, updated_at, completed_at, cancel_requested, event_seq, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (job_id) DO UPDATE SET
-                status = EXCLUDED.status, result = EXCLUDED.result, error = EXCLUDED.error, 
-                message = EXCLUDED.message, updated_at = EXCLUDED.updated_at, 
-                completed_at = EXCLUDED.completed_at, cancel_requested = EXCLUDED.cancel_requested, 
-                event_seq = EXCLUDED.event_seq, payload = EXCLUDED.payload
-            """ if DB_CONFIG["type"] == "postgres" else """
-                INSERT OR REPLACE INTO background_jobs 
-                (job_id, owner_principal_id, status, result, error, message, created_at, updated_at, completed_at, cancel_requested, event_seq, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job_id, job['owner_principal_id'], job['status'],
-                json.dumps(job['result']) if job.get('result') is not None else None,
-                json.dumps(job['error']) if job.get('error') is not None else None,
-                job['message'], job['created_at'], job['updated_at'], job['completed_at'],
-                job.get('cancel_requested', False), job['event_seq'],
-                json.dumps(payload)
-            ))
-        else:
-            await db.execute("""
-                UPDATE background_jobs SET
-                status = ?, result = ?, error = ?, message = ?, updated_at = ?, completed_at = ?, cancel_requested = ?, event_seq = ?
-                WHERE job_id = ?
-            """, (
-                job['status'],
-                json.dumps(job.get('result')) if job.get('result') is not None else None,
-                json.dumps(job.get('error')) if job.get('error') is not None else None,
-                job['message'], job['updated_at'], job['completed_at'],
-                job.get('cancel_requested', False), job['event_seq'],
-                job_id
-            ))
-        await db.commit()
+    def _upsert():
+        session = _db_session()
+        try:
+            from agents.database import BackgroundJob
+            existing = session.query(BackgroundJob).filter(BackgroundJob.job_id == job_id).first()
+            if existing:
+                existing.status = job['status']
+                existing.result = job.get('result')
+                existing.error = job.get('error')
+                existing.message = job['message']
+                existing.updated_at = job['updated_at']
+                existing.completed_at = job.get('completed_at')
+                existing.cancel_requested = job.get('cancel_requested', False)
+                existing.event_seq = job['event_seq']
+                if payload is not None:
+                    existing.payload = payload
+            else:
+                new_job = BackgroundJob(
+                    job_id=job_id,
+                    owner_principal_id=job['owner_principal_id'],
+                    status=job['status'],
+                    result=job.get('result'),
+                    error=job.get('error'),
+                    message=job['message'],
+                    created_at=job['created_at'],
+                    updated_at=job['updated_at'],
+                    completed_at=job.get('completed_at'),
+                    cancel_requested=job.get('cancel_requested', False),
+                    event_seq=job['event_seq'],
+                    payload=payload,
+                )
+                session.add(new_job)
+            session.commit()
+        finally:
+            session.close()
+
+    await asyncio.to_thread(_upsert)
+
 
 async def _db_delete_jobs(job_ids: list[str]):
     if not job_ids:
         return
-    async with AsyncDB(DB_CONFIG) as db:
-        placeholders = ",".join("?" for _ in job_ids)
-        await db.execute(f"DELETE FROM background_jobs WHERE job_id IN ({placeholders})", tuple(job_ids))
-        await db.commit()
+    def _delete():
+        session = _db_session()
+        try:
+            from agents.database import BackgroundJob
+            session.query(BackgroundJob).filter(BackgroundJob.job_id.in_(job_ids)).delete(synchronize_session=False)
+            session.commit()
+        finally:
+            session.close()
+
+    await asyncio.to_thread(_delete)
+
 
 async def _load_jobs_on_startup():
-    async with AsyncDB(DB_CONFIG) as db:
-        rows = await db.fetch_all("SELECT * FROM background_jobs")
-        for row in rows:
-            job_id = row['job_id']
-            # handle both asyncpg Record and aiosqlite Row
-            res_raw = row['result']
-            err_raw = row['error']
-            pay_raw = row['payload']
-            
-            job = {
-                "job_id": job_id,
-                "owner_principal_id": row['owner_principal_id'],
-                "status": row['status'],
-                "result": json.loads(res_raw) if res_raw and isinstance(res_raw, str) else res_raw,
-                "error": json.loads(err_raw) if err_raw and isinstance(err_raw, str) else err_raw,
-                "message": row['message'],
-                "created_at": row['created_at'],
-                "updated_at": row['updated_at'],
-                "completed_at": row['completed_at'],
-                "cancel_requested": bool(row['cancel_requested']),
-                "event_seq": row['event_seq'],
-            }
-            _jobs[job_id] = job
-            
-            if job["status"] in ("queued", "running"):
-                payload = json.loads(pay_raw) if pay_raw and isinstance(pay_raw, str) else pay_raw or {}
-                if job["status"] == "running":
-                    job["status"] = "queued"
-                    job["message"] = "re-queued after server restart"
-                    job["updated_at"] = _utc_now_iso()
-                    await _db_upsert_job(job_id, job)
-                
-                _queue.put_nowait((job_id, payload))
+    def _load():
+        session = _db_session()
+        try:
+            from agents.database import BackgroundJob
+            rows = session.query(BackgroundJob).all()
+            results = []
+            for row in rows:
+                job = {
+                    "job_id": row.job_id,
+                    "owner_principal_id": row.owner_principal_id,
+                    "status": row.status,
+                    "result": row.result,
+                    "error": row.error,
+                    "message": row.message,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                    "completed_at": row.completed_at,
+                    "cancel_requested": bool(row.cancel_requested),
+                    "event_seq": row.event_seq,
+                }
+                results.append((job, row.payload))
+            return results
+        finally:
+            session.close()
+
+    results = await asyncio.to_thread(_load)
+    for job, pay_raw in results:
+        job_id = job["job_id"]
+        _jobs[job_id] = job
+
+        if job["status"] in ("queued", "running"):
+            payload = pay_raw if isinstance(pay_raw, dict) else {}
+            if job["status"] == "running":
+                job["status"] = "queued"
+                job["message"] = "re-queued after server restart"
+                job["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await _db_upsert_job(job_id, job)
+
+            _queue.put_nowait((job_id, payload))
+
 
 async def initialize_job_queue():
     """Initialize the database and load pending jobs."""
-    await _ensure_db()
+    from agents.database import init_db
+    init_db()
     await _load_jobs_on_startup()
 
 
 JOB_RUNTIME_WARNING_MESSAGE = (
-    f"Async jobs and job-tracking state are persistent in this runtime. "
-    f"They are saved to {DB_CONFIG['type']} and restored on process restart."
+    "Async jobs and job-tracking state are persistent in this runtime. "
+    "They are saved to the shared database and restored on process restart."
 )
 
 
