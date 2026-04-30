@@ -9,7 +9,6 @@ sqlalchemy==2.0.41
 httpx==0.28.1
 python-dotenv==1.2.2
 psycopg2-binary==2.9.11
-asyncpg==0.31.0
 redis==7.2.0
 airportsdata==20250523
 dateparser==1.4.0
@@ -20,4 +19,3 @@ orjson==3.11.6
 pillow==12.2.0
 protobuf==6.33.5
 tornado==6.5.5
-aiosqlite==0.20.0
