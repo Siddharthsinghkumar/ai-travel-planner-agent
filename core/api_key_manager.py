@@ -1807,18 +1807,17 @@ class APIKeyManager:
             try:
                 if asyncio.iscoroutinefunction(listener):
                     # run async listener in its own task and catch/log exceptions
-                    async def _run_async_listener(l=listener):
+                    async def _run_async_listener(fn=listener):  # noqa: E741 — 'fn' captures bound listener
                         try:
-                            await l(event_name, payload)
+                            await fn(event_name, payload)
                         except Exception:
                             logger.exception("Async key event listener raised an exception",
                                              extra={"event": event_name})
                     asyncio.create_task(_run_async_listener())
                 else:
-                    # wrap sync listener in a callable that logs exceptions, then run in executor
-                    def _run_sync_listener(l=listener):
+                    def _run_sync_listener(fn=listener):  # noqa: E741 — 'fn' captures bound listener
                         try:
-                            l(event_name, payload)
+                            fn(event_name, payload)
                         except Exception:
                             logger.exception("Sync key event listener raised an exception",
                                              extra={"event": event_name})

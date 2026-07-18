@@ -719,7 +719,6 @@ async def check_held_booking_prices() -> list[dict]:
         return []
 
     alerts_fired = []
-    now = time.time()
 
     for booking in held:
         context = tracking_context_from_booking(booking)
@@ -728,7 +727,6 @@ async def check_held_booking_prices() -> list[dict]:
         destination = context.destination
         travel_date = context.travel_date
         held_price = context.held_price
-        booking_token = context.booking_token
 
         missing_fields = []
         if not origin:

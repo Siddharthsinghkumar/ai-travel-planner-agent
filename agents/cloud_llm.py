@@ -694,7 +694,6 @@ class ProviderAdapter:
             async with _reserve_provider_key("anthropic") as (idx, key):
                 async with get_client(provider, idx, key) as client:
                     # Convert messages to Anthropic prompt format (simplified)
-                    system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
                     user_msgs = [m["content"] for m in messages if m["role"] == "user"]
                     prompt = "\n\n".join(user_msgs)
 
@@ -822,7 +821,6 @@ class ProviderAdapter:
             async def _stream_generator():
                 async with _reserve_provider_key("anthropic") as (idx, key):
                     async with get_client(provider, idx, key) as client:
-                        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
                         user_msgs = [m["content"] for m in messages if m["role"] == "user"]
                         prompt = "\n\n".join(user_msgs)
                         try:

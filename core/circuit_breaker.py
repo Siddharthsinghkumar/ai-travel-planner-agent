@@ -403,8 +403,9 @@ class AsyncCircuitBreaker:
 
         if inspect.isasyncgenfunction(func):
             def gen_wrapper(*args, **kwargs):
-                agen_factory = lambda: func(*args, **kwargs)
-                return self.run_generator_protected(agen_factory)
+                def _gen_factory():
+                    return func(*args, **kwargs)
+                return self.run_generator_protected(_gen_factory)
             return gen_wrapper
 
         # For synchronous functions, return the original (or optionally raise)

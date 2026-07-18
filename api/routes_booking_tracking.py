@@ -149,7 +149,6 @@ def _booking_handoff_capability_payload(
 ) -> Dict[str, Any]:
     principal = auth_diagnostics.principal
     token_present = bool(auth_diagnostics.token_present)
-    token_valid = bool(auth_diagnostics.token_valid)
     auth_rejected = bool(auth_diagnostics.auth_rejected)
     auth_error = str(auth_diagnostics.auth_error or "").strip() or None
     loopback_request = _request_is_loopback(request)

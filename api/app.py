@@ -2990,7 +2990,6 @@ async def health():
 
     llm_mode = get_llm_mode_default()
     primary_llm_backend = "ollama"
-    fallback_llm_backend = None
     required_dependencies: list[str] = []
     fallback_dependencies: list[str] = []
     required_unavailable: list[str] = []
@@ -3010,7 +3009,6 @@ async def health():
         dependencies["ollama"] = "not_relevant"
     elif llm_mode == LLM_MODE_CLOUD_FIRST:
         primary_llm_backend = "cloud"
-        fallback_llm_backend = "ollama"
         required_dependencies = ["cloud"]
         fallback_dependencies = ["ollama"]
         dependencies["cloud"] = cloud_dep_status
@@ -3018,7 +3016,6 @@ async def health():
     else:
         # ollama_first default
         primary_llm_backend = "ollama"
-        fallback_llm_backend = "cloud"
         required_dependencies = ["ollama"]
         fallback_dependencies = ["cloud"]
         dependencies["ollama"] = ollama_status

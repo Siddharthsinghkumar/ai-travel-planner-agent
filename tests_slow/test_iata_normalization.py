@@ -94,7 +94,6 @@ async def test_origin_override(monkeypatch):
         carbon_emissions_g=50000
     )
     fake_parsed_results = [fake_flight]
-    fake_attempts = 1
 
     # Create a mock search function that returns the fake data.
     fake_search = AsyncMock(return_value=fake_parsed_results)
@@ -145,7 +144,7 @@ async def test_multicity_stopover_payload_includes_match_reason(monkeypatch):
         }
 
     async def fake_search(*args, **kwargs):
-        departure = kwargs.get("departure") or "AAA"
+        _ = kwargs.get("departure") or "AAA"
         arrival = kwargs.get("arrival") or "BBB"
         date = kwargs.get("date") or "2030-01-01"
         return [
@@ -214,7 +213,7 @@ async def test_roundtrip_return_weather_date_mismatch_is_marked_unavailable(monk
         }
 
     async def fake_search(*args, **kwargs):
-        departure = kwargs.get("departure") or "AAA"
+        _ = kwargs.get("departure") or "AAA"
         arrival = kwargs.get("arrival") or "BBB"
         date = kwargs.get("date") or outbound_date
         return [

@@ -68,7 +68,7 @@ def booking_resolution_cache_stats() -> dict:
     return impl()
 
 
-from agents.high_impact import high_impact
+from agents.high_impact import high_impact  # noqa: E402 — deferred import to break circular dependency
 
 
 @high_impact("booking")
