@@ -43,7 +43,7 @@ Multi-agent orchestration with circuit breakers, retry logic, and API key rotati
    - Enriches with OpenWeather forecast data
    - Applies user preference scoring from session memory
 3. **LLM Router** generates explanation:
-   - Routes to Ollama (local) or cloud (currently OpenAI; Gemini adapter being rebuilt in next milestone)
+   - Routes to Ollama (local) or cloud (OpenAI, Gemini, Anthropic, NIM, Groq via circuit-breaker + key rotation)
    - Circuit breaker protects against degraded providers
    - Retry with exponential backoff handles transient failures
 4. **Human-in-the-Loop** approval gate before booking handoff

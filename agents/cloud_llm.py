@@ -16,13 +16,14 @@
 import time
 import asyncio
 import logging
-import importlib
 import hashlib
 import threading
 from datetime import datetime, UTC, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, Any, List, Tuple, Dict
 from zoneinfo import ZoneInfo
+
+import httpx
 
 # Core infrastructure
 from core.retry import retry_async, RetryConfig
@@ -37,7 +38,6 @@ import core.metrics as app_metrics
 logger = logging.getLogger(__name__)
 
 # Environment configuration defaults (dynamic reads happen at runtime where required)
-ENABLE_GEMINI_HELPER = get_env_bool("ENABLE_GEMINI_HELPER", default=False)
 DEFAULT_MODEL = get_env_str("CLOUD_LLM_MODEL", "gpt-4o-mini")
 DEFAULT_TIMEOUT = get_env_float("CLOUD_LLM_TIMEOUT", 30.0)
 DEFAULT_TEMPERATURE = get_env_float("CLOUD_LLM_TEMPERATURE", 0.7)
@@ -650,11 +650,8 @@ async def _aiter_with_timeout(aiter, per_item_timeout: float):
 # Provider Adapter – normalizes API responses to a consistent shape
 # ----------------------------------------------------------------------
 class ProviderAdapter:
-    def __init__(self, provider: str, gemini_module=None, gemini_instance=None):
+    def __init__(self, provider: str):
         self.provider = provider
-        # For Gemini we keep the module and instance (if any) for reuse, but keys come from key_manager
-        self.gemini_module = gemini_module
-        self.gemini_instance = gemini_instance
 
     async def ping(self, model: str) -> None:
         """Perform a minimal health check call. Raises exception on failure."""
@@ -791,52 +788,67 @@ class ProviderAdapter:
                         raise
 
         elif provider == "gemini":
-            # Use the Gemini helper module stored during init
-            if self.gemini_module is None:
-                raise CloudLLMError("Gemini helper not available")
             async with _reserve_provider_key("gemini") as (idx, key):
-                # Build a prompt from messages
-                system_part = ""
-                user_part = ""
+                gemini_model = get_env_str("GEMINI_MODEL", "gemini-1.5-flash")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+                contents = []
                 for msg in messages:
-                    if msg["role"] == "system":
-                        system_part = msg["content"]
-                    elif msg["role"] == "user":
-                        user_part = msg["content"]
-                prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
-
-                # Define a sync function that calls the helper with the key
-                def sync_call() -> str:
-                    # Try client method first if we have an instance that can accept a key
-                    if self.gemini_instance is not None and hasattr(self.gemini_instance, "generate"):
-                        return self.gemini_instance.generate(prompt, model=model, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                    # Then module-level generate() with api_key param
-                    if hasattr(self.gemini_module, "generate"):
-                        return self.gemini_module.generate(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                    # Finally generate_single()
-                    if hasattr(self.gemini_module, "generate_single"):
-                        return self.gemini_module.generate_single(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                    raise RuntimeError("No usable Gemini entrypoint found")
-
+                    role = "user" if msg["role"] != "system" else "user"
+                    contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+                payload = {"contents": contents}
+                if temperature is not None:
+                    payload["generationConfig"] = {"temperature": temperature, "maxOutputTokens": max_tokens}
                 try:
-                    content = await asyncio.to_thread(sync_call)
-                    await key_manager.record_usage("gemini", idx)
-                    # Build a fake response
-                    class FakeChoice:
-                        def __init__(self, text):
-                            self.message = type("Message", (), {"content": text})
-                    class FakeResponse:
-                        def __init__(self, text):
-                            self.choices = [FakeChoice(text)]
-                            self.usage = None
-                    return FakeResponse(content)
-                except Exception as e:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            url,
+                            headers={"x-goog-api-key": key},
+                            json=payload,
+                            timeout=timeout,
+                        )
+                        resp.raise_for_status()
+                        body = resp.json()
+                except httpx.HTTPStatusError as e:
                     bucket = _gemini_exhaustion_bucket(e)
                     if bucket in {"quota", "rate_limit"}:
                         await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
                     elif bucket == "auth":
                         await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
                     raise
+                except (httpx.TimeoutException, asyncio.TimeoutError):
+                    raise
+                except Exception as e:
+                    bucket = _gemini_exhaustion_bucket(e)
+                    if bucket in {"quota", "rate_limit"}:
+                        await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
+                    raise
+
+                await key_manager.record_usage("gemini", idx)
+                candidate = body.get("candidates", [{}])[0]
+                content = candidate.get("content", {})
+                parts = content.get("parts", [{}])
+                text = parts[0].get("text", "") if parts else ""
+                usage_data = body.get("usageMetadata", {})
+                class FakeChoice:
+                    def __init__(self, text):
+                        self.message = type("Message", (), {"content": text})
+                class FakeUsage:
+                    def __init__(self, prompt_tokens, completion_tokens, total_tokens):
+                        self.prompt_tokens = prompt_tokens
+                        self.completion_tokens = completion_tokens
+                        self.total_tokens = total_tokens
+                class FakeResponse:
+                    def __init__(self, text, usage):
+                        self.choices = [FakeChoice(text)]
+                        self.usage = usage
+                return FakeResponse(
+                    text,
+                    FakeUsage(
+                        prompt_tokens=usage_data.get("promptTokenCount", 0),
+                        completion_tokens=usage_data.get("candidatesTokenCount", 0),
+                        total_tokens=usage_data.get("totalTokenCount", 0),
+                    ),
+                )
 
         else:
             raise RuntimeError(f"Unsupported provider: {provider}")
@@ -986,46 +998,54 @@ class ProviderAdapter:
             return _stream_generator()
 
         elif provider == "gemini":
-            # Gemini streaming not natively supported; fallback to non-streaming
             async def _stream_generator():
                 async with _reserve_provider_key("gemini") as (idx, key):
-                    # Build prompt
-                    system_part = ""
-                    user_part = ""
+                    gemini_model = get_env_str("GEMINI_MODEL", "gemini-1.5-flash")
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+                    contents = []
                     for msg in messages:
-                        if msg["role"] == "system":
-                            system_part = msg["content"]
-                        elif msg["role"] == "user":
-                            user_part = msg["content"]
-                    prompt = f"{system_part}\n\n{user_part}" if system_part else user_part
-
-                    def sync_call() -> str:
-                        if self.gemini_instance is not None and hasattr(self.gemini_instance, "generate"):
-                            return self.gemini_instance.generate(prompt, model=model, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                        if hasattr(self.gemini_module, "generate"):
-                            return self.gemini_module.generate(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                        if hasattr(self.gemini_module, "generate_single"):
-                            return self.gemini_module.generate_single(prompt, max_output_tokens=max_tokens, temperature=temperature, api_key=key)
-                        raise RuntimeError("No usable Gemini entrypoint found")
-
+                        role = "user"
+                        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+                    payload = {"contents": contents}
+                    if temperature is not None:
+                        payload["generationConfig"] = {"temperature": temperature, "maxOutputTokens": max_tokens}
                     try:
-                        content = await asyncio.to_thread(sync_call)
-                    except Exception as e:
+                        async with httpx.AsyncClient() as client:
+                            resp = await client.post(
+                                url,
+                                headers={"x-goog-api-key": key},
+                                json=payload,
+                                timeout=timeout,
+                            )
+                            resp.raise_for_status()
+                            body = resp.json()
+                    except httpx.HTTPStatusError as e:
                         bucket = _gemini_exhaustion_bucket(e)
                         if bucket in {"quota", "rate_limit"}:
                             await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
                         elif bucket == "auth":
                             await key_manager.mark_exhausted("gemini", idx, reason="unauthorized")
                         raise
+                    except (httpx.TimeoutException, asyncio.TimeoutError):
+                        raise
+                    except Exception as e:
+                        bucket = _gemini_exhaustion_bucket(e)
+                        if bucket in {"quota", "rate_limit"}:
+                            await _apply_gemini_runtime_exhaustion(idx, bucket, str(e))
+                        raise
 
-                    # Yield as one chunk
+                    candidate = body.get("candidates", [{}])[0]
+                    content = candidate.get("content", {})
+                    parts = content.get("parts", [{}])
+                    text = parts[0].get("text", "") if parts else ""
+
                     class FakeDelta:
                         def __init__(self, content): self.content = content
                     class FakeChoice:
                         def __init__(self, delta): self.delta = delta
                     class FakeChunk:
                         def __init__(self, delta): self.choices = [FakeChoice(FakeDelta(delta))]
-                    yield FakeChunk(content)
+                    yield FakeChunk(text)
 
                     await key_manager.record_usage("gemini", idx)
             return _stream_generator()
@@ -1034,14 +1054,8 @@ class ProviderAdapter:
             raise RuntimeError(f"Unsupported provider: {provider}")
 
     async def close(self):
-        """Close any persistent resources (Gemini client may have its own close)."""
+        """Close any persistent resources."""
         try:
-            if self.provider == "gemini" and self.gemini_instance is not None:
-                close_method = getattr(self.gemini_instance, "close", None)
-                if callable(close_method):
-                    maybe = close_method()
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
             logger.info("Cloud provider adapter closed", extra={"provider": self.provider})
         except Exception as e:
             logger.exception("cloud_adapter_close_failed", extra={"provider": self.provider, "error": str(e)})
@@ -1059,11 +1073,6 @@ _provider_init_status: Dict[str, Dict[str, Any]] = {}
 def _configured_provider_chain_from_env() -> List[str]:
     resolution = get_cloud_provider_chain_resolution()
     return [part.strip().lower() for part in resolution["providers"] if str(part).strip()]
-
-
-def _gemini_helper_enabled() -> bool:
-    # Runtime env is authoritative; keep module snapshot only as fallback default.
-    return get_env_bool("ENABLE_GEMINI_HELPER", default=ENABLE_GEMINI_HELPER)
 
 
 def _cloud_startup_routing_relevant() -> bool:
@@ -1128,45 +1137,8 @@ def _init_provider(provider: str):
         return ProviderAdapter(provider), (AnthroRateLimitError, AnthroConnErr, asyncio.TimeoutError, AnthroAuthError)
 
     elif provider == "gemini":
-        # Legacy Gemini helper path is opt-in only.
-        # This avoids noisy startup warnings when the historical helper module
-        # has already been removed from the deployment.
-        if not _gemini_helper_enabled():
-            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_disabled")
-            logger.debug("Gemini legacy helper disabled (ENABLE_GEMINI_HELPER=0) - skipping provider.")
-            return None
-        try:
-            gemini_mod = importlib.import_module("gemini_multikey_9_3_helper_script")
-        except ModuleNotFoundError:
-            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_module_missing")
-            logger.debug("Gemini legacy helper module not found - skipping provider.")
-            return None
-        except Exception as e:
-            _set_provider_init_status(provider, initialized=False, reason="gemini_helper_import_failed")
-            if _cloud_startup_routing_relevant():
-                logger.warning("Gemini legacy helper import failed - skipping provider: %s", e)
-            else:
-                logger.debug("Gemini legacy helper import failed - skipping provider in non-routing mode: %s", e)
-            return None
-
-        # Look for a GeminiClient class, otherwise use module-level generate functions
-        GeminiClient = getattr(gemini_mod, "GeminiClient", None)
-        gemini_instance = None
-        if GeminiClient is not None:
-            # Instantiate without a key; we'll pass key per call
-            try:
-                gemini_instance = GeminiClient(api_key=None)
-            except TypeError:
-                try:
-                    gemini_instance = GeminiClient()
-                except Exception:
-                    gemini_instance = None  # adjust if constructor requires key
-
-        adapter = ProviderAdapter(provider, gemini_module=gemini_mod, gemini_instance=gemini_instance)
-        # Only retry on timeout for Gemini (or other exceptions if we detect)
-        gemini_retry_exc = (asyncio.TimeoutError,)
         _set_provider_init_status(provider, initialized=True, reason="ok")
-        return adapter, gemini_retry_exc
+        return ProviderAdapter(provider), (asyncio.TimeoutError,)
 
     elif provider == "nim":
         if AsyncOpenAI is None:
@@ -1207,7 +1179,7 @@ def refresh_provider_chain_from_env(*, force: bool = False) -> Dict[str, Any]:
     provider_resolution = get_cloud_provider_chain_resolution()
     configured = _parse_provider_chain()
     configured_source = str(provider_resolution.get("source") or "unknown")
-    signature = (tuple(configured), _gemini_helper_enabled(), configured_source)
+    signature = (tuple(configured), configured_source)
     if not force and _provider_chain_signature == signature:
         return _provider_runtime_capability_snapshot()
 
