@@ -92,7 +92,7 @@ Goal: public URL, observable, defended, backed up, cheap-to-free.
 | ID | Task | Spec/Input | Effort | Owner |
 |---|---|---|---|---|
 | D1 | SSE resilience trio on BOTH stream endpoints (/ask, /jobs/{id}/events): keep-alive comment pings 15–30s, `X-Accel-Buffering: no`, `Cache-Control: no-cache` | INTAKE §4.1 (neither endpoint has them today) | 0.5d | DS |
-| D2 | Router adapters: NVIDIA NIM + Groq backends behind existing breaker/rotation (keys from Sid, G3) | CHECKLIST §3 | 1d | DS |
+| D2 | Router adapters: NVIDIA NIM + Groq backends behind existing breaker/rotation (keys from Sid, G3). **Gemini adapter must be BUILT, not enabled** — found at M1 STOP-1c (D-M1-11): the only gemini path is a legacy helper whose source module is deleted from the tree (flag off, `.pyc` ghost only); today's runtime router is effectively Ollama→OpenAI. Gemini via official SDK/REST behind the same breaker/rotation (key machinery already exists: `core/api_key_manager.py` GEMINI_KEY_n rotation, quota-scope handling in `agents/cloud_llm.py:173-283`) | CHECKLIST §3; M1 D-M1-11 | 1.5d | DS |
 | D3 | Provision VPS (G2): Docker+Compose, ufw (80/443/SSH), SSH keys-only, fail2ban | deployment-topology.md | 0.5d | S+DS |
 | D4 | Caddy TLS per `reverse-proxy-caddy.md`; Cloudflare DNS **proxied** (DDoS+CDN+firewall rules); SSE pass-through verified (cache-bypass rule for stream paths) | FREE-STACK-MAP §7 | 0.5d | DS |
 | D5 | Secrets via docker secrets per `environment-secrets-contract.md`; `.env` never leaves the box; GitGuardian scan on repo | S1–S7 docs | 2h | DS |
