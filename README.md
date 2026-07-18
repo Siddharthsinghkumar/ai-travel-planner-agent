@@ -1,6 +1,6 @@
 # LLM Travel Agent
 
-A production-grade multi-agent travel planning system that demonstrates enterprise patterns for fault-tolerant LLM orchestration, real-time streaming, and distributed agent coordination.
+A single-node demo travel planning system (hardening in progress) that demonstrates fault-tolerant LLM orchestration, real-time streaming, and distributed agent coordination.
 
 **This isn't a tutorial project.** It's a working system with 31K+ lines of Python backend, 57K+ lines of tests, and 13 enterprise documentation files covering security hardening, deployment topology, and operational runbooks.
 
@@ -8,7 +8,6 @@ A production-grade multi-agent travel planning system that demonstrates enterpri
 
 ### Real-Time Streaming Response
 <!-- TODO: Add GIF of streaming response here -->
-![Streaming Demo](docs/demo-streaming.gif)
 
 The system streams LLM reasoning in real-time via SSE, showing:
 - Intent parsing and route extraction
@@ -19,7 +18,6 @@ The system streams LLM reasoning in real-time via SSE, showing:
 
 ### Frontend Interface
 <!-- TODO: Add screenshot of frontend here -->
-![Frontend UI](docs/demo-frontend.png)
 
 React 19 frontend with:
 - Framer Motion animations
@@ -29,7 +27,6 @@ React 19 frontend with:
 
 ### Architecture Overview
 <!-- TODO: Add architecture diagram here -->
-![Architecture](docs/architecture.svg)
 
 Multi-agent orchestration with circuit breakers, retry logic, and API key rotation.
 
@@ -71,7 +68,7 @@ Most LLM applications are fragile:
 
 #### Circuit Breaker Pattern (`core/circuit_breaker.py`)
 
-**530 lines of production-grade async circuit breaker**:
+**530 lines of async circuit breaker (single-node demo, hardening in progress)**:
 
 ```python
 # Get a named circuit breaker with 3-failure threshold
@@ -875,7 +872,7 @@ This project includes **13 enterprise-grade documentation files** covering secur
 
 ## Contributing
 
-This is a portfolio project demonstrating production-grade system design. Feel free to:
+This is a portfolio project demonstrating system-design patterns for a single-node demo (hardening in progress). Feel free to:
 - Study the reliability patterns (circuit breaker, retry, key rotation)
 - Use the architecture as a reference for your own multi-agent systems
 - Open issues for questions or suggestions
