@@ -1,7 +1,6 @@
 """Canonical tool gateway - single source of truth for tool-facing functions.
 
 This module consolidates duplicate gateway wrappers from:
-- agents/planner_tool_gateway.py
 - tools/price_tracker_tool_gateway.py
 
 It provides lazy imports to avoid circular dependencies while maintaining

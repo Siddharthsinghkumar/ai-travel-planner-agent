@@ -488,39 +488,6 @@ async def get_circuit_breaker(
     )
 
 
-# ----------------------------------------------------------------------
-# Example usage (can be removed in production)
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    async def example():
-        import random
-
-        # Using the registry to get isolated breakers per endpoint
-        breaker_a = await get_circuit_breaker("api-a", failure_threshold=2, recovery_timeout=3)
-        breaker_b = await get_circuit_breaker("api-b", failure_threshold=5, recovery_timeout=10)
-
-        async def flaky_call(name: str):
-            if random.random() < 0.6:
-                raise ValueError(f"Failure from {name}")
-            return f"OK from {name}"
-
-        for i in range(5):
-            try:
-                res_a = await breaker_a.call(lambda: flaky_call("A"))
-                print(f"A: {res_a}")
-            except Exception as e:
-                print(f"A failed: {e}")
-
-            try:
-                res_b = await breaker_b.call(lambda: flaky_call("B"))
-                print(f"B: {res_b}")
-            except Exception as e:
-                print(f"B failed: {e}")
-
-            await asyncio.sleep(0.5)
-
-    asyncio.run(example())
-
 async def is_open(name: str) -> bool:
     """
     Convenience helper to check whether a named breaker is open.

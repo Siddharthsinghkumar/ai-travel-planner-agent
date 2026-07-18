@@ -62,8 +62,7 @@ from agents.flight_normalizer import normalize_flights, normalize_flight_field, 
 # Note: get_weather_once and _normalize_weather_for_display are nested in _plan_trip_internal
 # so they use the local weather_cache closure. The module version is available for standalone use.
 
-# Circuit management - imported from focused module
-from agents.circuit_manager import check_llm_circuit, record_llm_success, record_llm_failure
+# Circuit management - defined locally below (see check_llm_circuit / record_llm_* at module level)
 from core.llm_mode import (
     get_llm_mode_and_priority,
     LLM_MODE_OLLAMA_ONLY,
