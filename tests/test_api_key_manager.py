@@ -3,7 +3,7 @@ import asyncio
 import os
 import pytest
 import time
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timezone, timedelta
 import core.api_key_manager as key_manager_module
 from core.api_key_manager import APIKeyManager, KeyEntry
 from agents.database import SessionLocal, ProviderKeyState, ProviderStateOverride, init_db
@@ -878,22 +878,28 @@ async def test_serpapi_known_reset_override_caps_specific_key_horizon(monkeypatc
 async def test_provider_override_datetime_output_is_utc_normalized():
     _clear_provider_key_state_rows()
     km = APIKeyManager()
+    _active_until_ist = (datetime.now() + timedelta(days=60)).replace(
+        hour=5, minute=30, second=0, microsecond=0
+    ).astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    )
+    _expected_utc = _active_until_ist.astimezone(UTC).isoformat()
     row = await km.set_provider_state_override(
         provider="openai",
         scope_type="provider_account",
         scope_identifier="acct-main",
         override_type="force_exhausted_until",
-        active_until="2026-05-01T05:30:00+05:30",
+        active_until=_active_until_ist.isoformat(),
         note="tz normalization check",
     )
-    assert row["active_until"] == "2026-05-01T00:00:00+00:00"
-    assert row["override_until"] == "2026-05-01T00:00:00+00:00"
+    assert row["active_until"] == _expected_utc
+    assert row["override_until"] == _expected_utc
     assert row["override_until_semantics"] == "forces_exhaustion_until"
 
     listed = await km.list_provider_state_overrides(provider="openai", include_inactive=True)
     assert listed
-    assert listed[0]["active_until"] == "2026-05-01T00:00:00+00:00"
-    assert listed[0]["override_until"] == "2026-05-01T00:00:00+00:00"
+    assert listed[0]["active_until"] == _expected_utc
+    assert listed[0]["override_until"] == _expected_utc
 
 
 @pytest.mark.asyncio
