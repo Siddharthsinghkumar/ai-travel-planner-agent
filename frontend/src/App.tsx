@@ -76,17 +76,6 @@ async function fetchServerVersionOnce(): Promise<ServerVersionMeta | null> {
   return devServerVersionBootstrapPromise;
 }
 
-function readThemePreference(): ThemePreference {
-  if (typeof window === "undefined") return "system";
-  const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
-  return saved === "dark" || saved === "light" || saved === "system" ? saved : "system";
-}
-
-function resolveTheme(preference: ThemePreference, prefersDark: boolean): "dark" | "light" {
-  if (preference === "system") return prefersDark ? "dark" : "light";
-  return preference;
-}
-
 function stringifyReasoningCandidate(candidate: unknown): string {
   if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   if (Array.isArray(candidate)) {
@@ -301,11 +290,6 @@ export default function App() {
   const [priceAlertError, setPriceAlertError] = useState<string | null>(null);
   const [priceTrackingStatus, setPriceTrackingStatus] = useState<PriceTrackingStatus | null>(null);
   const [isBookingActionBusy, setIsBookingActionBusy] = useState(false);
-  const [themePreference, setThemePreference] = useState<ThemePreference>(() => readThemePreference());
-  const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() => {
-    if (typeof window === "undefined") return "dark";
-    return resolveTheme(readThemePreference(), window.matchMedia("(prefers-color-scheme: dark)").matches);
-  });
   const autoScrolledRef = useRef(false);
   const bookingResolveInflightRef = useRef<Map<string, Promise<BookingResolveHandoffResponse>>>(new Map());
   const healthPollInFlightRef = useRef(false);
@@ -365,15 +349,11 @@ export default function App() {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
 
     const applyTheme = () => {
-      const nextTheme = resolveTheme(themePreference, media.matches);
-      setResolvedTheme(nextTheme);
-      document.documentElement.setAttribute("data-theme", nextTheme);
-      document.documentElement.style.colorScheme = nextTheme;
+      document.documentElement.setAttribute("data-theme", "dark");
+      document.documentElement.style.colorScheme = "dark";
     };
 
     applyTheme();
-
-    if (themePreference !== "system") return;
 
     const onSystemThemeChange = () => applyTheme();
     if (typeof media.addEventListener === "function") {
@@ -382,16 +362,7 @@ export default function App() {
     }
     media.addListener(onSystemThemeChange);
     return () => media.removeListener(onSystemThemeChange);
-  }, [themePreference]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (themePreference === "system") {
-      window.localStorage.removeItem(THEME_STORAGE_KEY);
-      return;
-    }
-    window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
-  }, [themePreference]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1725,16 +1696,6 @@ export default function App() {
   const activeRouteStepIndex = routeRevealSteps.reduce((lastActive, step, index) => (step.active ? index : lastActive), -1);
   const routeProgressPercent = ((activeRouteStepIndex + 1) / routeRevealSteps.length) * 100;
   const routeNarrativeStatus = isBusy
-    ? "The planner is actively advancing through route composition and scoring."
-    : activeRouteStepIndex >= routeRevealSteps.length - 1
-      ? "Itinerary narrative is complete and ready for comparison below."
-      : "Start planning to watch each stage progress in real time.";
-  const themeStatusLabel =
-    themePreference === "system"
-      ? `Auto (${resolvedTheme === "dark" ? "Dark" : "Light"})`
-      : themePreference === "dark"
-        ? "Dark"
-        : "Light";
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1813,22 +1774,9 @@ export default function App() {
           </div>
 
           <div className="nav-right">
-            <div className="theme-switch" role="group" aria-label="Theme mode">
-              {(["system", "dark", "light"] as ThemePreference[]).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  className={`theme-switch__button ${themePreference === mode ? "theme-switch__button--active" : ""}`}
-                  onClick={() => setThemePreference(mode)}
-                >
-                  {mode === "system" ? "Auto" : mode === "dark" ? "Dark" : "Light"}
-                </button>
-              ))}
-            </div>
             {showServiceStatus && (
               <div
                 className={`api-status ${serverStatus === "offline" ? "api-status--offline" : "api-status--online"} ${IS_PREVIEW_UI ? "api-status--preview" : ""}`}
-                title={`Theme: ${themeStatusLabel}`}
               >
                 {statusText}
               </div>

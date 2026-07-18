@@ -75,3 +75,6 @@ frontend/agentdb.rvf.lock
 
 # Virtual environment
 venv/
+
+# Planning docs (Sid-internal; repo is a public portfolio)
+plans/
