@@ -505,6 +505,7 @@ async def test_debug_keys_sanitizes_sensitive_key_metadata(monkeypatch):
 @pytest.mark.asyncio
 async def test_debug_keys_missing_admin_token_returns_403(monkeypatch):
     monkeypatch.setenv("AUTH_DISABLE", "false")
+    monkeypatch.setenv("AUTH_DISABLE_ADMIN", "false")
     monkeypatch.setenv("ADMIN_TOKEN", "admin-test-token")
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:

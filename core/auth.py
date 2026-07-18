@@ -9,6 +9,7 @@ This module intentionally provides a small, pluggable dependency layer:
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from typing import Dict, Optional
 
@@ -17,8 +18,32 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from core.env_config import get_env_bool, get_env_str
+from core.config import TESTING
+
+logger = logging.getLogger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
+
+_auth_banner_emitted = False
+
+
+def _ensure_auth_banner() -> None:
+    global _auth_banner_emitted
+    if _auth_banner_emitted:
+        return
+    _auth_banner_emitted = True
+    if not TESTING:
+        if get_env_bool("AUTH_DISABLE", False):
+            logger.critical("AUTH_DISABLE set but TESTING is OFF — AUTH_DISABLE ignored outside TESTING=1")
+        if get_env_bool("AUTH_DISABLE_ADMIN", False):
+            logger.critical("AUTH_DISABLE_ADMIN set but TESTING is OFF — AUTH_DISABLE_ADMIN ignored outside TESTING=1")
+
+
+def _is_auth_disabled(testing_only: bool = True) -> bool:
+    if testing_only and not TESTING:
+        _ensure_auth_banner()
+        return False
+    return get_env_bool("AUTH_DISABLE", False)
 
 
 class AuthenticatedPrincipal(BaseModel):
@@ -123,8 +148,8 @@ async def get_optional_principal(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
 ) -> Optional[AuthenticatedPrincipal]:
-    # Allow test/dev bypass via env var
-    if get_env_bool("AUTH_DISABLE", False):
+    # Allow auth bypass only when TESTING=1
+    if _is_auth_disabled():
         return _TEST_PRINCIPAL
     diagnostics = await get_optional_principal_diagnostics(request, credentials)
     if diagnostics.principal is not None:

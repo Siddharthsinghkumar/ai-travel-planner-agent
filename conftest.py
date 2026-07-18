@@ -60,6 +60,7 @@ def patch_llm_router(monkeypatch):
 @pytest.fixture(autouse=True)
 def set_test_auth_tokens(monkeypatch):
     monkeypatch.setenv("AUTH_DISABLE", "true")
+    monkeypatch.setenv("AUTH_DISABLE_ADMIN", "true")
     monkeypatch.setenv(
         "AUTH_BEARER_TOKENS",
         "test-user:test-user-token,other-user:other-user-token",
