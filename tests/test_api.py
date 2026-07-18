@@ -1489,6 +1489,13 @@ async def test_ask_non_stream_warning_fallback_preserves_handoff_contract_fields
     assert "booking_handoff_quality_context" not in (body.get("debug_info") or {})
 
 
+def test_app_security_headers_present_on_api_response(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert "X-Frame-Options" in resp.headers
+
+
 @pytest.mark.asyncio
 async def test_hitl_approve_non_owner_blocked():
     from agents.planner_agent import _approval_store
