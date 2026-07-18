@@ -935,7 +935,11 @@ async def test_plan_trip_internal_forwards_deep_search_and_bounded_breadth(monke
     assert isinstance(result, planner_agent.PlanResult)
     assert calls, "flight tool should be called at least once"
     assert calls[0].get("deep_search") is True
-    assert calls[0].get("max_results") == planner_agent.FLIGHT_SEARCH_MAX_RESULTS_CAP
+    assert calls[0].get("max_results") == (
+        planner_agent.FLIGHT_SEARCH_BASE_RESULTS
+        + planner_agent.FLIGHT_SEARCH_ROUND_TRIP_BONUS
+        + planner_agent.FLIGHT_SEARCH_DEEP_SEARCH_BONUS
+    )
 
 
 @pytest.mark.asyncio
