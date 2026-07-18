@@ -10,57 +10,142 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      TESTING: "true"
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check .
 
+  fast-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TESTING: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-          pip install pip-audit
-
-      - name: Python Dependency Audit Gate
-        run: |
-          pip-audit -r requirements.txt -r requirements-dev.txt
-
-      - name: Frontend Dependency Install
-        run: |
-          cd frontend
-          npm ci
-
-      - name: Frontend Dependency Audit Gate
-        run: |
-          cd frontend
-          npm audit --audit-level=moderate
-
-      - name: Run tests
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run fast suite
         env:
           OLLAMA_BASE_URL: http://localhost:11434
           SERPAPI_KEY_1: dummy
           WEATHER_KEY_1: dummy
           OPENAI_KEY_1: dummy
-          # Backward-compatible dummy vars for any legacy compatibility checks.
-          SERPAPI_KEY: dummy
-          WEATHER_API_KEY: dummy
-          OPENAI_API_KEY: dummy
-          CLOUD_PROVIDER: openai
-        run: pytest -q
+        run: pytest -q tests/
+
+  slow-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TESTING: "1"
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_db"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run slow suite
+        env:
+          OLLAMA_BASE_URL: http://localhost:11434
+          SERPAPI_KEY_1: dummy
+          WEATHER_KEY_1: dummy
+          OPENAI_KEY_1: dummy
+        run: pytest -q tests_slow/
+
+  import-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: llm-travel-agent:ci-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Import check
+        run: docker run --rm llm-travel-agent:ci-check python -c "import api.app"
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install pip-audit
+      - name: Audit
+        run: pip-audit -r requirements.txt -r requirements-dev.txt
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install and audit
+        run: |
+          cd frontend
+          npm ci
+          npm audit --audit-level=moderate
 
   docker-build-and-push:
-    needs: test
+    needs: [lint, fast-tests, slow-tests, import-check, pip-audit, npm-audit]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.ref == 'refs/heads/main'
