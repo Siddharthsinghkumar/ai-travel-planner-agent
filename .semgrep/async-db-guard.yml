@@ -1,0 +1,43 @@
+rules:
+  - id: no-sync-db-in-async-def
+    message: Sync DB call inside async def without asyncio.to_thread wrapping
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      # Direct SessionLocal() call in async def body (not inside a sync inner function)
+      - patterns:
+          - pattern-inside: |
+              async def $FUNC(...):
+                ...
+          - pattern: |
+              $S = SessionLocal(...)
+          - pattern-not-inside: |
+              def $INNER(...):
+                ...
+      # session.commit() / session.query() in async def body
+      - patterns:
+          - pattern-inside: |
+              async def $FUNC(...):
+                ...
+          - pattern-either:
+              - pattern: |
+                  $OBJ.query(...)
+              - pattern: |
+                  $OBJ.commit()
+          - pattern-not-inside: |
+              def $INNER(...):
+                ...
+      # _provider_state_session() context manager in async def
+      - patterns:
+          - pattern-inside: |
+              async def $FUNC(...):
+                ...
+          - pattern: |
+              with $OBJ._provider_state_session() as $S:
+                ...
+    paths:
+      include:
+        - "api/*.py"
+        - "agents/*.py"
+        - "core/*.py"
+        - "tools/*.py"
