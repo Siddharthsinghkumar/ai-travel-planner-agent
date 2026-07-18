@@ -312,6 +312,10 @@ async def _create_client(provider: str, idx: int, key: str):
         if AsyncOpenAI is None:
             raise CloudLLMError("OpenAI SDK not installed")
         return AsyncOpenAI(api_key=key)
+    elif provider == "nim":
+        if AsyncOpenAI is None:
+            raise CloudLLMError("OpenAI SDK not installed")
+        return AsyncOpenAI(api_key=key, base_url="https://integrate.api.nvidia.com/v1")
     elif provider == "anthropic":
         if AsyncAnthropic is None:
             raise CloudLLMError("Anthropic SDK not installed")
@@ -690,6 +694,32 @@ class ProviderAdapter:
                     except Exception:
                         raise
 
+        elif provider == "nim":
+            async with _reserve_provider_key("nim") as (idx, key):
+                async with get_client(provider, idx, key) as client:
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                            ),
+                            timeout=timeout
+                        )
+                        await key_manager.record_usage("nim", idx)
+                        return raw
+                    except OpenAIAuthError:
+                        await key_manager.mark_exhausted("nim", idx, reason="unauthorized")
+                        raise
+                    except RateLimitError as e:
+                        await key_manager.mark_exhausted("nim", idx, reason=_openai_exhaustion_reason(e))
+                        raise
+                    except (APIConnectionError, asyncio.TimeoutError):
+                        raise
+                    except Exception:
+                        raise
+
         elif provider == "anthropic":
             async with _reserve_provider_key("anthropic") as (idx, key):
                 async with get_client(provider, idx, key) as client:
@@ -815,6 +845,38 @@ class ProviderAdapter:
                             yield chunk
 
                         await key_manager.record_usage("openai", idx)
+            return _stream_generator()
+
+        elif provider == "nim":
+            async def _stream_generator():
+                async with _reserve_provider_key("nim") as (idx, key):
+                    async with get_client(provider, idx, key) as client:
+                        try:
+                            stream = await asyncio.wait_for(
+                                client.chat.completions.create(
+                                    model=model,
+                                    messages=messages,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    stream=True,
+                                ),
+                                timeout=timeout
+                            )
+                        except OpenAIAuthError:
+                            await key_manager.mark_exhausted("nim", idx, reason="unauthorized")
+                            raise
+                        except RateLimitError as e:
+                            await key_manager.mark_exhausted("nim", idx, reason=_openai_exhaustion_reason(e))
+                            raise
+                        except (APIConnectionError, asyncio.TimeoutError):
+                            raise
+                        except Exception:
+                            raise
+
+                        async for chunk in stream:
+                            yield chunk
+
+                        await key_manager.record_usage("nim", idx)
             return _stream_generator()
 
         elif provider == "anthropic":
@@ -1043,6 +1105,14 @@ def _init_provider(provider: str):
         gemini_retry_exc = (asyncio.TimeoutError,)
         _set_provider_init_status(provider, initialized=True, reason="ok")
         return adapter, gemini_retry_exc
+
+    elif provider == "nim":
+        if AsyncOpenAI is None:
+            _set_provider_init_status(provider, initialized=False, reason="sdk_missing_openai")
+            logger.debug("OpenAI SDK not installed - skipping nim provider.")
+            return None
+        _set_provider_init_status(provider, initialized=True, reason="ok")
+        return ProviderAdapter(provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError, OpenAIAuthError)
 
     else:
         _set_provider_init_status(provider, initialized=False, reason="unsupported_provider")

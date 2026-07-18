@@ -110,6 +110,7 @@ ENV_PATTERNS = {
     "openai": re.compile(r"OPENAI_KEY_(\d+)"),
     "gemini": re.compile(r"GEMINI_KEY_(\d+)"),
     "anthropic": re.compile(r"ANTHROPIC_KEY_(\d+)"),
+    "nim": re.compile(r"NIM_KEY_(\d+)"),
     "weather": re.compile(r"WEATHER_KEY_(\d+)")
 }
 
