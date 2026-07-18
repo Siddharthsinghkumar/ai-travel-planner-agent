@@ -36,7 +36,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator, model_validator
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, start_http_server
 
 # Use module import instead of direct function import for better testability
 import agents.planner_agent as planner_agent
@@ -1347,6 +1347,18 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.startup_complete = True
+
+    # Expose Prometheus metrics on a dedicated internal port (9091) so the scrape
+    # config can reach them without the admin-token gate on the public /metrics route
+    # (F-006). Guarded: never bind in TESTING (tests/CI), and never fail startup if the
+    # port is unavailable.
+    if not get_env_bool("TESTING", default=False):
+        try:
+            start_http_server(9091)
+            logger.info("prometheus_metrics_server_started", extra={"port": 9091})
+        except Exception:
+            logger.exception("prometheus_metrics_server_start_failed", extra={"port": 9091})
+
     yield
 
     app.state.startup_complete = False
