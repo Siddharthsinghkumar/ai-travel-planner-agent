@@ -111,6 +111,7 @@ ENV_PATTERNS = {
     "gemini": re.compile(r"GEMINI_KEY_(\d+)"),
     "anthropic": re.compile(r"ANTHROPIC_KEY_(\d+)"),
     "nim": re.compile(r"NIM_KEY_(\d+)"),
+    "groq": re.compile(r"GROQ_KEY_(\d+)"),
     "weather": re.compile(r"WEATHER_KEY_(\d+)")
 }
 

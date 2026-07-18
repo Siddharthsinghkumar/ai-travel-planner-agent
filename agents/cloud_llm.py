@@ -316,6 +316,10 @@ async def _create_client(provider: str, idx: int, key: str):
         if AsyncOpenAI is None:
             raise CloudLLMError("OpenAI SDK not installed")
         return AsyncOpenAI(api_key=key, base_url="https://integrate.api.nvidia.com/v1")
+    elif provider == "groq":
+        if AsyncOpenAI is None:
+            raise CloudLLMError("OpenAI SDK not installed")
+        return AsyncOpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
     elif provider == "anthropic":
         if AsyncAnthropic is None:
             raise CloudLLMError("Anthropic SDK not installed")
@@ -720,6 +724,32 @@ class ProviderAdapter:
                     except Exception:
                         raise
 
+        elif provider == "groq":
+            async with _reserve_provider_key("groq") as (idx, key):
+                async with get_client(provider, idx, key) as client:
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                            ),
+                            timeout=timeout
+                        )
+                        await key_manager.record_usage("groq", idx)
+                        return raw
+                    except OpenAIAuthError:
+                        await key_manager.mark_exhausted("groq", idx, reason="unauthorized")
+                        raise
+                    except RateLimitError as e:
+                        await key_manager.mark_exhausted("groq", idx, reason=_openai_exhaustion_reason(e))
+                        raise
+                    except (APIConnectionError, asyncio.TimeoutError):
+                        raise
+                    except Exception:
+                        raise
+
         elif provider == "anthropic":
             async with _reserve_provider_key("anthropic") as (idx, key):
                 async with get_client(provider, idx, key) as client:
@@ -877,6 +907,38 @@ class ProviderAdapter:
                             yield chunk
 
                         await key_manager.record_usage("nim", idx)
+            return _stream_generator()
+
+        elif provider == "groq":
+            async def _stream_generator():
+                async with _reserve_provider_key("groq") as (idx, key):
+                    async with get_client(provider, idx, key) as client:
+                        try:
+                            stream = await asyncio.wait_for(
+                                client.chat.completions.create(
+                                    model=model,
+                                    messages=messages,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    stream=True,
+                                ),
+                                timeout=timeout
+                            )
+                        except OpenAIAuthError:
+                            await key_manager.mark_exhausted("groq", idx, reason="unauthorized")
+                            raise
+                        except RateLimitError as e:
+                            await key_manager.mark_exhausted("groq", idx, reason=_openai_exhaustion_reason(e))
+                            raise
+                        except (APIConnectionError, asyncio.TimeoutError):
+                            raise
+                        except Exception:
+                            raise
+
+                        async for chunk in stream:
+                            yield chunk
+
+                        await key_manager.record_usage("groq", idx)
             return _stream_generator()
 
         elif provider == "anthropic":
@@ -1110,6 +1172,14 @@ def _init_provider(provider: str):
         if AsyncOpenAI is None:
             _set_provider_init_status(provider, initialized=False, reason="sdk_missing_openai")
             logger.debug("OpenAI SDK not installed - skipping nim provider.")
+            return None
+        _set_provider_init_status(provider, initialized=True, reason="ok")
+        return ProviderAdapter(provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError, OpenAIAuthError)
+
+    elif provider == "groq":
+        if AsyncOpenAI is None:
+            _set_provider_init_status(provider, initialized=False, reason="sdk_missing_openai")
+            logger.debug("OpenAI SDK not installed - skipping groq provider.")
             return None
         _set_provider_init_status(provider, initialized=True, reason="ok")
         return ProviderAdapter(provider), (RateLimitError, APIConnectionError, asyncio.TimeoutError, OpenAIAuthError)
