@@ -54,6 +54,7 @@ session-*.md
 
 # Local databases
 *.db
+local.db
 !requirements*.txt
 
 # Eval and validation outputs

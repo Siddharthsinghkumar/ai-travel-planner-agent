@@ -50,6 +50,11 @@ def _build_engine(database_url: Optional[str] = None):
         )
 
     if not database_url:
+        if not is_testing:
+            raise RuntimeError(
+                "DATABASE_URL must be configured. No SQLite fallback outside TESTING mode. "
+                "Set DATABASE_URL to a PostgreSQL connection string or set TESTING=1."
+            )
         database_url = "sqlite:///./local.db"
     return create_engine(database_url, pool_pre_ping=True)
 
