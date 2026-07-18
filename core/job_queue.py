@@ -35,6 +35,7 @@ JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_SECONDS", "3600"))
 JOB_PRUNE_INTERVAL_SECONDS = int(os.getenv("JOB_PRUNE_INTERVAL_SECONDS", "300"))
 JOB_QUEUE_MAXSIZE = max(1, int(os.getenv("JOB_QUEUE_MAXSIZE", "64")))
 JOB_MAX_IN_MEMORY = max(JOB_QUEUE_MAXSIZE, int(os.getenv("JOB_MAX_IN_MEMORY", "512")))
+JOB_TIMEOUT_SECONDS = max(10, int(os.getenv("JOB_TIMEOUT_SECONDS", "300")))
 _last_prune_at: float = 0.0
 _queue: asyncio.Queue = asyncio.Queue(maxsize=JOB_QUEUE_MAXSIZE)
 
@@ -145,7 +146,7 @@ async def _load_jobs_on_startup():
                 job["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await _db_upsert_job(job_id, job)
 
-            _queue.put_nowait((job_id, payload))
+            await _queue.put((job_id, payload))
 
 
 async def initialize_job_queue():
@@ -156,16 +157,16 @@ async def initialize_job_queue():
 
 
 JOB_RUNTIME_WARNING_MESSAGE = (
-    "Async jobs and job-tracking state are persistent in this runtime. "
-    "They are saved to the shared database and restored on process restart."
+    "Async jobs are ephemeral and stored in-memory only. "
+    "Jobs are lost on process restart — at-most-once semantics within a single process."
 )
 
 
 def job_runtime_warning_payload() -> Dict[str, Any]:
     return {
-        "jobs_tracking_memory_only": False,
-        "lost_on_restart": False,
-        "durable_persistence": True,
+        "jobs_tracking_memory_only": True,
+        "lost_on_restart": True,
+        "durable_persistence": False,
         "warning": JOB_RUNTIME_WARNING_MESSAGE,
     }
 
@@ -706,7 +707,10 @@ async def worker_loop():
                 task = asyncio.create_task(_process_job(job_id, payload))
                 async with _get_async_lock():
                     _job_tasks[job_id] = task
-                await task
+                await asyncio.wait_for(task, timeout=JOB_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.error("job_timeout", extra={"job_id": job_id, "timeout_s": JOB_TIMEOUT_SECONDS})
+                await _set_job_status(job_id, "error", error=f"job timed out after {JOB_TIMEOUT_SECONDS}s")
             except asyncio.CancelledError:
                 # Job-level cancellation should not terminate the worker loop.
                 pass
