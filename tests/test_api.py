@@ -7,6 +7,7 @@ import api.app as api_app
 import agents.planner_agent as planner_agent
 from api.app import app
 import tools.booking_handoff as booking_handoff
+from core.rate_limiter import SlidingWindowRateLimiter
 
 future_date = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
 
@@ -1486,6 +1487,43 @@ async def test_ask_non_stream_warning_fallback_preserves_handoff_contract_fields
     assert isinstance(body.get("top_flights"), list)
     assert body.get("debug_info", {}).get("top_flights") == []
     assert "booking_handoff_quality_context" not in (body.get("debug_info") or {})
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_sensitive_fails_closed():
+    limiter = SlidingWindowRateLimiter(max_keys=10, sensitive=True)
+    # Simulate lock failure: make _lock.acquire raise.
+    original_lock = limiter._lock
+
+    class _FailingLock:
+        async def __aenter__(self):
+            raise RuntimeError("simulated lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    limiter._lock = _FailingLock()
+    decision = await limiter.check("test-key", limit=10, window_seconds=60)
+    limiter._lock = original_lock
+    assert not decision.allowed
+    assert decision.retry_after_seconds > 0
+    assert decision.remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_nonsensitive_fails_open(monkeypatch):
+    limiter_ns = SlidingWindowRateLimiter(max_keys=10, sensitive=False)
+
+    class _FailingLock:
+        async def __aenter__(self):
+            raise RuntimeError("simulated lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    limiter_ns._lock = _FailingLock()
+    decision = await limiter_ns.check("test-key", limit=10, window_seconds=60)
+    assert decision.allowed
 
 
 @pytest.mark.asyncio

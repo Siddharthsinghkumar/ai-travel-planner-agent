@@ -231,7 +231,8 @@ def _ensure_ask_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
     if isinstance(limiter, SlidingWindowRateLimiter):
         return limiter
     limiter = SlidingWindowRateLimiter(
-        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000))
+        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000)),
+        sensitive=True,
     )
     app.state.ask_rate_limiter = limiter
     return limiter
@@ -242,7 +243,8 @@ def _ensure_admin_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
     if isinstance(limiter, SlidingWindowRateLimiter):
         return limiter
     limiter = SlidingWindowRateLimiter(
-        max_keys=max(200, get_env_int("ADMIN_RATE_LIMIT_MAX_KEYS", 5000))
+        max_keys=max(200, get_env_int("ADMIN_RATE_LIMIT_MAX_KEYS", 5000)),
+        sensitive=True,
     )
     app.state.admin_rate_limiter = limiter
     return limiter
