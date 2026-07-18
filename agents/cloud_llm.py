@@ -678,16 +678,16 @@ class ProviderAdapter:
                         )
                         await key_manager.record_usage("openai", idx)
                         return raw
-                    except OpenAIAuthError as e:
+                    except OpenAIAuthError:
                         await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
                         raise
                     except RateLimitError as e:
                         await key_manager.mark_exhausted("openai", idx, reason=_openai_exhaustion_reason(e))
                         raise
-                    except (APIConnectionError, asyncio.TimeoutError) as e:
+                    except (APIConnectionError, asyncio.TimeoutError):
                         # Transient errors, don't mark exhausted
                         raise
-                    except Exception as e:
+                    except Exception:
                         raise
 
         elif provider == "anthropic":
@@ -720,15 +720,15 @@ class ProviderAdapter:
                         text = raw.completion if hasattr(raw, "completion") else raw.choices[0].text
                         usage = getattr(raw, "usage", None)
                         return FakeResponse(text, usage)
-                    except AnthroAuthError as e:
+                    except AnthroAuthError:
                         await key_manager.mark_exhausted("anthropic", idx, reason="unauthorized")
                         raise
-                    except AnthroRateLimitError as e:
+                    except AnthroRateLimitError:
                         await key_manager.mark_exhausted("anthropic", idx, reason="rate_limit")
                         raise
-                    except (AnthroConnErr, asyncio.TimeoutError) as e:
+                    except (AnthroConnErr, asyncio.TimeoutError):
                         raise
-                    except Exception as e:
+                    except Exception:
                         raise
 
         elif provider == "gemini":
@@ -801,15 +801,15 @@ class ProviderAdapter:
                                 ),
                                 timeout=timeout
                             )
-                        except OpenAIAuthError as e:
+                        except OpenAIAuthError:
                             await key_manager.mark_exhausted("openai", idx, reason="unauthorized")
                             raise
                         except RateLimitError as e:
                             await key_manager.mark_exhausted("openai", idx, reason=_openai_exhaustion_reason(e))
                             raise
-                        except (APIConnectionError, asyncio.TimeoutError) as e:
+                        except (APIConnectionError, asyncio.TimeoutError):
                             raise
-                        except Exception as e:
+                        except Exception:
                             raise
 
                         async for chunk in stream:
@@ -836,15 +836,15 @@ class ProviderAdapter:
                                 ),
                                 timeout=timeout
                             )
-                        except AnthroAuthError as e:
+                        except AnthroAuthError:
                             await key_manager.mark_exhausted("anthropic", idx, reason="unauthorized")
                             raise
-                        except AnthroRateLimitError as e:
+                        except AnthroRateLimitError:
                             await key_manager.mark_exhausted("anthropic", idx, reason="rate_limit")
                             raise
-                        except (AnthroConnErr, asyncio.TimeoutError) as e:
+                        except (AnthroConnErr, asyncio.TimeoutError):
                             raise
-                        except Exception as e:
+                        except Exception:
                             raise
 
                         async for chunk in raw_stream:

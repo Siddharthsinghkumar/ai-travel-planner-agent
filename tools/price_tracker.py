@@ -26,7 +26,6 @@ Two distinct capabilities:
 
 import asyncio
 import contextlib
-import asyncio
 import logging
 import os
 import time
@@ -44,11 +43,6 @@ from agents.database import Base, SessionLocal, get_engine
 from tools import price_tracker_tool_gateway as tracker_gateway
 
 # Import from canonical gateway for direct function calls
-from tools.tool_gateway import (
-    search_flights,
-    search_with_booking_token,
-    build_booking_handoff_url,
-)
 
 # Use wrappers that delegate to tracker_gateway at call time for test compatibility
 # Tests patch tracker_gateway module attributes, we need to call through that reference

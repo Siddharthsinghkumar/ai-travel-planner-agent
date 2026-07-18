@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from core.iata_resolver import resolve_location
-from core.iata_resolver import city_for_iata, is_iata_token
+from core.iata_resolver import is_iata_token
 
 
 WORD_TO_NUM = {

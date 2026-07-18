@@ -65,7 +65,6 @@ from core.llm_mode import (
     LLM_MODE_CLOUD_ONLY,
     LLM_MODE_CLOUD_FIRST,
     LLM_MODE_OLLAMA_ONLY,
-    LLM_MODE_OLLAMA_FIRST,
     VALID_LLM_MODES,
 )
 from core import job_queue                     # background job worker

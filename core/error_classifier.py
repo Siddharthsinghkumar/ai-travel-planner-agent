@@ -6,7 +6,7 @@ Each caller can use these directly or subclass for service-specific behavior.
 
 import asyncio
 import httpx
-from typing import Any, Optional, Type, Union
+from typing import Optional, Union
 
 
 def classify_error_type(

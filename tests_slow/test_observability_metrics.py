@@ -7,7 +7,6 @@ import pytest
 from prometheus_client import generate_latest
 
 from api.app import app
-import api.app as api_app
 import agents.planner_agent as planner_agent
 import agents.cloud_llm as cloud_llm
 import tools.booking_handoff as booking_handoff

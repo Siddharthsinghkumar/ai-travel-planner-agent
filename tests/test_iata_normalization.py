@@ -1,6 +1,5 @@
 # tests/test_iata_normalization.py
 import pytest
-import asyncio
 from unittest.mock import AsyncMock
 from datetime import datetime, timedelta
 
