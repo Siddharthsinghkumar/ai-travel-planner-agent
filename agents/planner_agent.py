@@ -101,8 +101,14 @@ import core.metrics as metrics
 
 # RAG retriever — lazy singleton
 _rag_retriever = None
+_RAG_INIT_WARNED = False
 def _get_rag_retriever():
-    global _rag_retriever
+    global _rag_retriever, _RAG_INIT_WARNED
+    if get_env_str("RAG_ENABLED", "false").lower() == "false":
+        if not _RAG_INIT_WARNED:
+            _RAG_INIT_WARNED = True
+            logger.warning("RAG disabled (RAG_ENABLED=false): retrieval returns empty context")
+        return None
     if _rag_retriever is None:
         try:
             from rag.retriever import RAGRetriever
@@ -2869,19 +2875,18 @@ Please recommend the best flight, explain why it matches their preferences, ment
 
     # RAG context injection (feature-flagged)
     rag_context_block = ""
-    if get_env_str("RAG_ENABLED", "true").lower() != "false":
+    retriever = _get_rag_retriever()
+    if retriever is not None:
         try:
-            retriever = _get_rag_retriever()
-            if retriever is not None:
-                rag_results = retriever.retrieve(user_query, top_k=4)
-                if rag_results:
-                    rag_lines = ["Relevant context from knowledge base:"]
-                    for r in rag_results:
-                        rag_lines.append(f"{r['source']}: {r['text']}")
-                        rag_lines.append("---")
-                    rag_context_block = "\n".join(rag_lines) + "\n\n"
+            rag_results = retriever.retrieve(user_query, top_k=4)
+            if rag_results:
+                rag_lines = ["Relevant context from knowledge base:"]
+                for r in rag_results:
+                    rag_lines.append(f"{r['source']}: {r['text']}")
+                    rag_lines.append("---")
+                rag_context_block = "\n".join(rag_lines) + "\n\n"
         except Exception as e:
-            logger.debug(f"RAG retrieval failed: {e}")
+            logger.warning(f"RAG retrieval failed: {e}")
 
     # Combine facts block and prompt with an instruction to echo the facts
     session_context_text = ""
@@ -6377,19 +6382,18 @@ Please recommend the best flight, explain why it matches their preferences, ment
 
             # RAG context injection for streaming path (feature-flagged)
             stream_rag_context_block = ""
-            if get_env_str("RAG_ENABLED", "true").lower() != "false":
+            stream_retriever = _get_rag_retriever()
+            if stream_retriever is not None:
                 try:
-                    stream_retriever = _get_rag_retriever()
-                    if stream_retriever is not None:
-                        stream_rag_results = stream_retriever.retrieve(user_query, top_k=4)
-                        if stream_rag_results:
-                            stream_rag_lines = ["Relevant context from knowledge base:"]
-                            for r in stream_rag_results:
-                                stream_rag_lines.append(f"{r['source']}: {r['text']}")
-                                stream_rag_lines.append("---")
-                            stream_rag_context_block = "\n".join(stream_rag_lines) + "\n\n"
+                    stream_rag_results = stream_retriever.retrieve(user_query, top_k=4)
+                    if stream_rag_results:
+                        stream_rag_lines = ["Relevant context from knowledge base:"]
+                        for r in stream_rag_results:
+                            stream_rag_lines.append(f"{r['source']}: {r['text']}")
+                            stream_rag_lines.append("---")
+                        stream_rag_context_block = "\n".join(stream_rag_lines) + "\n\n"
                 except Exception as e:
-                    logger.debug(f"Streaming RAG retrieval failed: {e}")
+                    logger.warning(f"Streaming RAG retrieval failed: {e}")
 
             full_prompt = stream_rag_context_block + full_prompt
             full_prompt, stream_prompt_hard_trimmed = _apply_prompt_hard_limit(

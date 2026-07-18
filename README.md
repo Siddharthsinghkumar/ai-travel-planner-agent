@@ -449,6 +449,7 @@ WEATHER_KEY_1=...                  # Required for weather enrichment
 
 # Database
 DATABASE_URL=sqlite:///./local.db  # Or PostgreSQL URL
+RAG_ENABLED=false                  # RAG is disabled by default (deps undeclared)
 
 # Security
 ADMIN_TOKEN=your_secret_token      # For /debug/* endpoints
