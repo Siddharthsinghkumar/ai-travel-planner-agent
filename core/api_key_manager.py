@@ -1110,7 +1110,8 @@ class APIKeyManager:
                     "serpapi key override binding failed: key must exist with matching name fingerprint"
                 )
 
-        row = self._upsert_provider_state_override(
+        row = await asyncio.to_thread(
+            self._upsert_provider_state_override,
             provider=provider,
             scope_type=scope_type,
             scope_identifier=scope_identifier,
@@ -1206,31 +1207,46 @@ class APIKeyManager:
                     },
                 )
         else:
-            # Best effort for cases where slot is not currently loaded in-memory.
-            with self._provider_state_session() as session:
-                if session is not None:
-                    try:
-                        from agents.database import ProviderKeyState
-                        row = (
-                            session.query(ProviderKeyState)
-                            .filter(
-                                ProviderKeyState.provider == "serpapi",
-                                ProviderKeyState.key_name_fingerprint == str(key_name_fingerprint or ""),
-                            )
-                            .first()
-                        )
-                        if row is not None and str(row.key_value_fingerprint or "") == str(key_value_fingerprint or ""):
-                            row.is_exhausted = True
-                            row.expected_reset_basis = "operator_known_reset_datetime"
-                            row.expected_reset_at = override_until
-                            row.last_checked_at = _now()
-                            row.last_reason = "manual_override_known_reset"
-                            row.last_error = (note or "manual_override_known_reset")[:1000]
-                            row.failure_classification = "manual_override"
-                            session.commit()
-                    except Exception:
-                        session.rollback()
-                        logger.exception("serpapi_known_reset_override_db_patch_failed")
+            await asyncio.to_thread(
+                self._apply_serpapi_known_reset_override_fallback_sync,
+                key_name_fingerprint=str(key_name_fingerprint or ""),
+                key_value_fingerprint=str(key_value_fingerprint or ""),
+                override_until=override_until,
+                note=note,
+            )
+
+    def _apply_serpapi_known_reset_override_fallback_sync(
+        self,
+        key_name_fingerprint: str,
+        key_value_fingerprint: str,
+        override_until: datetime,
+        note: Optional[str] = None,
+    ) -> None:
+        with self._provider_state_session() as session:
+            if session is None:
+                return
+            try:
+                from agents.database import ProviderKeyState
+                row = (
+                    session.query(ProviderKeyState)
+                    .filter(
+                        ProviderKeyState.provider == "serpapi",
+                        ProviderKeyState.key_name_fingerprint == key_name_fingerprint,
+                    )
+                    .first()
+                )
+                if row is not None and str(row.key_value_fingerprint or "") == key_value_fingerprint:
+                    row.is_exhausted = True
+                    row.expected_reset_basis = "operator_known_reset_datetime"
+                    row.expected_reset_at = override_until
+                    row.last_checked_at = _now()
+                    row.last_reason = "manual_override_known_reset"
+                    row.last_error = (note or "manual_override_known_reset")[:1000]
+                    row.failure_classification = "manual_override"
+                    session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("serpapi_known_reset_override_db_patch_failed")
 
     async def list_provider_state_overrides(
         self,
@@ -1238,13 +1254,16 @@ class APIKeyManager:
         provider: Optional[str] = None,
         include_inactive: bool = False,
     ) -> List[Dict[str, Any]]:
-        return self._list_provider_state_overrides(
+        return await asyncio.to_thread(
+            self._list_provider_state_overrides,
             provider=provider,
             include_inactive=include_inactive,
         )
 
     async def disable_provider_state_override(self, override_id: int) -> bool:
-        return self._disable_provider_state_override(override_id)
+        return await asyncio.to_thread(
+            self._disable_provider_state_override, override_id
+        )
 
     async def key_scope_identifier(self, provider: str, index: int) -> Optional[str]:
         normalized_provider = str(provider or "").strip().lower()
