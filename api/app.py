@@ -1594,6 +1594,7 @@ async def observe_http_metrics(request: Request, call_next):
 
 
 class AskRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     origin: Optional[str] = Field(default=None, max_length=8)
     destination: Optional[str] = Field(default=None, max_length=8)
     date: Optional[str] = Field(default=None, max_length=32)

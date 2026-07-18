@@ -390,6 +390,7 @@ async def _run_with_idempotency(
 
 
 class BookingHoldRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     flight: Dict[str, Any] = Field(default_factory=dict)
     origin: str = Field(min_length=3, max_length=8)
     destination: str = Field(min_length=3, max_length=8)

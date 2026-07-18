@@ -1488,6 +1488,24 @@ async def test_ask_non_stream_warning_fallback_preserves_handoff_contract_fields
     assert "booking_handoff_quality_context" not in (body.get("debug_info") or {})
 
 
+@pytest.mark.asyncio
+async def test_booking_hold_handoff_track_rejects_spurious_handoff_url():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/track-price",
+            json={
+                "flight": {"airline": "TestAir", "flight_no": "TA100", "price_inr": 5000},
+                "origin": "DEL",
+                "destination": "BOM",
+                "depart_date": "2030-01-01",
+                "handoff_url": "https://evil.com/phishing",
+            },
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
 def test_app_security_headers_present_on_api_response(client):
     resp = client.get("/health")
     assert resp.status_code == 200
