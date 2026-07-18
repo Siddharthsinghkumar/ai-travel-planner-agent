@@ -2494,6 +2494,7 @@ async def booking_post_handoff_bridge_post(artifact_id: str, request: Request):
 
 
 class PlanApprovalRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     approved: bool
 
 

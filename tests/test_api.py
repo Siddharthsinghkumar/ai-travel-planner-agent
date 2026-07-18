@@ -1544,6 +1544,55 @@ async def test_booking_hold_handoff_track_rejects_spurious_handoff_url():
     assert resp.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_booking_cancel_rejects_spurious_extra_field():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/cancel",
+            json={"booking_id": 1, "spurious_field": "should_reject"},
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_booking_handoff_resolve_rejects_spurious_extra_field():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/handoff/resolve",
+            json={
+                "flight": {"airline": "TestAir", "flight_no": "TA100", "price_inr": 5000},
+                "origin": "DEL",
+                "destination": "BOM",
+                "depart_date": "2030-01-01",
+                "spurious_field": "should_reject",
+            },
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_plan_approve_rejects_spurious_extra_field():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-spurious-extra"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            resp = await client.post(
+                f"/plan/{plan_id}/approve",
+                json={"approved": True, "spurious_field": "should_reject"},
+                headers={"Authorization": "Bearer test-user-token"},
+            )
+        assert resp.status_code == 422
+    finally:
+        _approval_store.clear(plan_id)
+
+
 def test_app_security_headers_present_on_api_response(client):
     resp = client.get("/health")
     assert resp.status_code == 200

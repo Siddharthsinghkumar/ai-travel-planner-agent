@@ -432,6 +432,7 @@ class BookingHoldRequest(BaseModel):
 
 
 class BookingCancelRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     booking_id: int
 
     @field_validator("booking_id")
@@ -447,6 +448,7 @@ class BookingTrackRequest(BookingHoldRequest):
 
 
 class BookingHandoffResolveRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     flight: Dict[str, Any] = Field(default_factory=dict)
     origin: str = Field(min_length=3, max_length=8)
     destination: str = Field(min_length=3, max_length=8)
