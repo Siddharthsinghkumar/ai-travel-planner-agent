@@ -26,6 +26,7 @@ Two distinct capabilities:
 
 import asyncio
 import contextlib
+import asyncio
 import logging
 import os
 import time
@@ -525,7 +526,7 @@ async def record_flight_data(
     # Also persist cheapest price to DB for historical tracking
     if cheapest_price != float("inf"):
         try:
-            record_price_snapshot(
+            await record_price_snapshot(
                 origin=origin,
                 destination=destination,
                 travel_date=travel_date,
@@ -552,7 +553,7 @@ def get_cached_flight_data(
 # 3. Price Snapshot recording
 # ----------------------------------------------------------------------
 
-def record_price_snapshot(
+def _record_price_snapshot_sync(
     *,
     origin: str,
     destination: str,
@@ -560,18 +561,7 @@ def record_price_snapshot(
     price_inr: float,
     insights: Optional[PriceInsights] = None,
 ) -> int:
-    """
-    Persist a price observation to the database.
-
-    Args:
-        origin, destination: IATA codes.
-        travel_date: YYYY-MM-DD.
-        price_inr: Cheapest price found in this search.
-        insights: Parsed PriceInsights (may be None if SerpAPI didn't return the block).
-
-    Returns:
-        int: The new PriceSnapshot row id.
-    """
+    """Internal sync implementation — do not call from async contexts."""
     db = SessionLocal()
     try:
         snap = PriceSnapshot(
@@ -600,6 +590,24 @@ def record_price_snapshot(
         return snap.id
     finally:
         db.close()
+
+
+async def record_price_snapshot(
+    *,
+    origin: str,
+    destination: str,
+    travel_date: str,
+    price_inr: float,
+    insights: Optional[PriceInsights] = None,
+) -> int:
+    return await asyncio.to_thread(
+        _record_price_snapshot_sync,
+        origin=origin,
+        destination=destination,
+        travel_date=travel_date,
+        price_inr=price_inr,
+        insights=insights,
+    )
 
 
 def get_price_history(
@@ -793,7 +801,7 @@ async def check_held_booking_prices() -> list[dict]:
 
         # Record snapshot for this price observation
         try:
-            record_price_snapshot(
+            await record_price_snapshot(
                 origin=origin,
                 destination=destination,
                 travel_date=travel_date,

@@ -229,7 +229,7 @@ async def test_booking_track_price(monkeypatch):
 
     snapshot_calls = []
 
-    def fake_record_price_snapshot(**kwargs):
+    async def fake_record_price_snapshot(**kwargs):
         snapshot_calls.append(kwargs)
         return 1
 
