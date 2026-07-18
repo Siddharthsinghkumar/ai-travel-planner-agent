@@ -888,6 +888,36 @@ def _job_runtime_warning_payload() -> Dict[str, Any]:
     return job_queue.job_runtime_warning_payload()
 
 
+SSE_KEEPALIVE_INTERVAL = 20
+SSE_PING_FRAME = ": ping\n\n"
+
+
+async def _with_keepalive_pings(agen, *, interval_seconds=None, ping_frame=None):
+    if interval_seconds is None:
+        interval_seconds = SSE_KEEPALIVE_INTERVAL
+    if ping_frame is None:
+        ping_frame = SSE_PING_FRAME
+    try:
+        while True:
+            task = asyncio.ensure_future(agen.__anext__())
+            done, _pending = await asyncio.wait([task], timeout=interval_seconds)
+            if task in done:
+                try:
+                    chunk = task.result()
+                except StopAsyncIteration:
+                    return
+                yield chunk
+            else:
+                yield ping_frame
+                try:
+                    chunk = await task
+                except StopAsyncIteration:
+                    return
+                yield chunk
+    except StopAsyncIteration:
+        pass
+
+
 def _apply_job_runtime_headers(response: Response) -> None:
     response.headers["X-Async-Job-Durability"] = "memory-only-ephemeral"
     response.headers["X-Async-Job-Lost-On-Restart"] = "true"
@@ -2194,11 +2224,14 @@ async def ask(
             if ask_slot_acquired:
                 # Defensive release if stream iteration exits early before generator cleanup.
                 release_failsafe = BackgroundTask(_release_ask_inflight_key, ask_request_fingerprint)
-            return StreamingResponse(
-                event_stream(),
+            response = StreamingResponse(
+                _with_keepalive_pings(event_stream()),
                 media_type="text/event-stream",
                 background=release_failsafe,
             )
+            response.headers["X-Accel-Buffering"] = "no"
+            response.headers["Cache-Control"] = "no-cache"
+            return response
 
         # Non‑streaming branch: apply global timeout
         with llm_routing_context(llm_mode=llm_mode, cloud_provider=cloud_provider):
@@ -2632,7 +2665,9 @@ async def job_events(
             if evt.get("event") in ("closed", "done", "error", "cancelled"):
                 break
 
-    response = StreamingResponse(event_stream(), media_type="text/event-stream")
+    response = StreamingResponse(_with_keepalive_pings(event_stream()), media_type="text/event-stream")
+    response.headers["X-Accel-Buffering"] = "no"
+    response.headers["Cache-Control"] = "no-cache"
     _apply_job_runtime_headers(response)
     return response
 

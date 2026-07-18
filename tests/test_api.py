@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import httpx
 import pytest
@@ -1688,3 +1689,59 @@ async def test_ask_non_stream_error_preserves_handoff_contract_fields(monkeypatc
     assert isinstance(body.get("top_flights"), list)
     assert body.get("debug_info", {}).get("top_flights") == []
     assert "booking_handoff_quality_context" not in (body.get("debug_info") or {})
+
+
+@pytest.mark.asyncio
+async def test_ask_stream_endpoint_includes_sse_resilience_headers(monkeypatch):
+    monkeypatch.delenv("RATE_LIMITER_BACKEND", raising=False)
+
+    async def fake_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                yield "test chunk "
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream("POST", "/ask?stream=true", json={
+            "date": "2030-06-01",
+            "user_query": "test header",
+            "trip_type": "Business",
+        }, headers={"Authorization": "Bearer test-user-token"}) as stream_resp:
+            assert stream_resp.status_code == 200
+            assert stream_resp.headers.get("X-Accel-Buffering") == "no"
+            assert stream_resp.headers.get("Cache-Control") == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_ask_stream_idle_yields_ping_frame(monkeypatch):
+    monkeypatch.delenv("RATE_LIMITER_BACKEND", raising=False)
+
+    async def slow_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                await asyncio.sleep(0.15)
+                yield "test chunk "
+                await asyncio.sleep(0.15)
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", slow_plan_trip)
+    monkeypatch.setattr("api.app.SSE_KEEPALIVE_INTERVAL", 0.05)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream("POST", "/ask?stream=true", json={
+            "date": "2030-06-01",
+            "user_query": "test ping",
+            "trip_type": "Business",
+        }, headers={"Authorization": "Bearer test-user-token"}) as stream_resp:
+            raw_text = ""
+            async for chunk in stream_resp.aiter_text():
+                raw_text += chunk
+            assert ": ping\n\n" in raw_text
