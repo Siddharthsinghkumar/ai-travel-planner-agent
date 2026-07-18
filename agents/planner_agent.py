@@ -147,13 +147,16 @@ class ApprovalState:
     def __init__(self):
         self._events: Dict[str, asyncio.Event] = {}
         self._decisions: Dict[str, Optional[bool]] = {}
+        self._owner_principal_ids: Dict[str, str] = {}
         self._lock = asyncio.Lock()
 
-    async def request_approval(self, plan_id: str, timeout: float = 120.0) -> Optional[bool]:
+    async def request_approval(self, plan_id: str, timeout: float = 120.0, owner_principal_id: Optional[str] = None) -> Optional[bool]:
         async with self._lock:
             evt = asyncio.Event()
             self._events[plan_id] = evt
             self._decisions[plan_id] = None
+            if owner_principal_id:
+                self._owner_principal_ids[plan_id] = owner_principal_id
         try:
             await asyncio.wait_for(evt.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -163,17 +166,21 @@ class ApprovalState:
         async with self._lock:
             return self._decisions.get(plan_id, False)
 
-    async def set_decision(self, plan_id: str, approved: bool) -> bool:
+    async def set_decision(self, plan_id: str, approved: bool, principal_id: str, admin_bypass: bool = False) -> Tuple[bool, Optional[str]]:
         async with self._lock:
             if plan_id not in self._events:
-                return False
+                return False, "not_found"
+            owner = self._owner_principal_ids.get(plan_id)
+            if not admin_bypass and owner and owner != principal_id:
+                return False, "principal_mismatch"
             self._decisions[plan_id] = approved
             self._events[plan_id].set()
-            return True
+            return True, None
 
     def clear(self, plan_id: str) -> None:
         self._events.pop(plan_id, None)
         self._decisions.pop(plan_id, None)
+        self._owner_principal_ids.pop(plan_id, None)
 
 _approval_store = ApprovalState()
 
@@ -3445,6 +3452,7 @@ async def _plan_trip_internal(
     plan_id: Optional[str] = None,
     hitl_approval_timeout: float = 120.0,
     session_id: Optional[str] = None,
+    owner_principal_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict]:
     """Internal implementation without top-level timeout. Used for non‑streaming mode."""
     # Prevent excessive recursion
@@ -4715,7 +4723,7 @@ async def _plan_trip_internal(
             details={"timeout_sec": hitl_approval_timeout},
         )
 
-        approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout)
+        approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout, owner_principal_id=owner_principal_id)
         _approval_store.clear(effective_plan_id)
 
         if not approval_decision:
@@ -5599,6 +5607,7 @@ async def plan_trip(
     weather_tool: Callable = default_weather_tool,
     plan_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    owner_principal_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict, AsyncGenerator[str, None]]:
     """
     Public entry point for planning a trip.
@@ -5835,6 +5844,7 @@ async def plan_trip(
             resolve_booking_handoff=False,
             plan_id=plan_id,
             session_id=session_id,
+            owner_principal_id=owner_principal_id,
         )
 
     # --- Streaming branch ---

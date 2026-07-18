@@ -1490,6 +1490,30 @@ async def test_ask_non_stream_warning_fallback_preserves_handoff_contract_fields
 
 
 @pytest.mark.asyncio
+async def test_hitl_approve_non_owner_blocked():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-hl-owner"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    ok, reason = await _approval_store.set_decision(plan_id, True, principal_id="attacker-y")
+    assert not ok
+    assert reason == "principal_mismatch"
+    _approval_store.clear(plan_id)
+
+
+@pytest.mark.asyncio
+async def test_hitl_approve_owner_allowed():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-hl-owner-ok"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    ok, reason = await _approval_store.set_decision(plan_id, True, principal_id="owner-x")
+    assert ok
+    assert reason is None
+    _approval_store.clear(plan_id)
+
+
+@pytest.mark.asyncio
 async def test_ask_non_stream_empty_error_is_not_success(monkeypatch):
     async def fake_plan_trip(**kwargs):
         return {"error": "", "failure_reason": "planner_error"}

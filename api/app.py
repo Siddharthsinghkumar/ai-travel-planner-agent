@@ -2091,7 +2091,8 @@ async def ask(
                             date=effective_date,
                             user_query=planner_user_query,
                             trip_type=req.trip_type,
-                            stream=True
+                            stream=True,
+                            owner_principal_id=principal.principal_id if principal else None,
                         )
                         # If the planner returns an async generator, iterate and yield SSE frames
                         if hasattr(agen_or_result, "__aiter__"):
@@ -2206,6 +2207,7 @@ async def ask(
                     date=effective_date,
                     user_query=planner_user_query,
                     trip_type=req.trip_type,
+                    owner_principal_id=principal.principal_id if principal else None,
                 ),
                 timeout=GLOBAL_TIMEOUT
             )
@@ -2507,7 +2509,7 @@ async def approve_plan(
     _audit = HITLAuditLogger()
     _start = _time.monotonic()
 
-    ok = await _approval_store.set_decision(plan_id, req.approved)
+    ok, reason = await _approval_store.set_decision(plan_id, req.approved, principal_id=principal.principal_id)
     latency_ms = (_time.monotonic() - _start) * 1000
 
     if not ok:
@@ -2516,8 +2518,10 @@ async def approve_plan(
             user_id=principal.principal_id,
             approved=req.approved,
             latency_ms=latency_ms,
-            details={"status": "not_found"},
+            details={"status": reason or "not_found"},
         )
+        if reason == "principal_mismatch":
+            raise HTTPException(status_code=403, detail="HITL approval requires the plan owner principal.")
         raise HTTPException(status_code=404, detail="No pending approval found for this plan_id.")
 
     _audit.log_decision(
