@@ -3545,9 +3545,9 @@ async def _plan_trip_internal(
     effective_plan_id = plan_id or f"plan-{origin}-{destination}-{date}"
     try:
         _set_state(PlannerState.INTENT_PARSING)
-        log_event("plan_start", effective_plan_id, intent_type=trip_type or "unknown")
     except IllegalTransition:
         pass
+    log_event("plan_start", effective_plan_id, intent_type=trip_type or "unknown")
     # Only parse if there is meaningful user input; otherwise start with empty intent.
     if user_query:
         intent = parse_intent(user_query)
@@ -5571,9 +5571,9 @@ async def _plan_trip_internal(
     total_duration_ms = int((time.monotonic() - plan_start_ts) * 1000)
     try:
         _set_state(PlannerState.COMPLETE)
-        log_event("plan_complete", effective_plan_id, total_duration_ms=total_duration_ms, action_count=len(phases))
     except IllegalTransition:
         pass
+    log_event("plan_complete", effective_plan_id, total_duration_ms=total_duration_ms, action_count=len(phases))
 
     return result
 
