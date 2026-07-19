@@ -79,3 +79,12 @@ venv/
 
 # Planning docs (Sid-internal; repo is a public portfolio)
 plans/
+
+# Terraform state and directories (state files carry secrets — D4)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+deploy/terraform/*/terraform.tfvars
