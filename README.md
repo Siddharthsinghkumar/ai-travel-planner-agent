@@ -2,7 +2,7 @@
 
 A single-node demo travel planning system (hardening in progress) that demonstrates fault-tolerant LLM orchestration, real-time streaming, and distributed agent coordination.
 
-**This isn't a tutorial project.** It's a working system with 31K+ lines of Python backend, 57K+ lines of tests, and 13 enterprise documentation files covering security hardening, deployment topology, and operational runbooks.
+**This isn't a tutorial project.** It's a working system with 31K+ lines of Python backend, 57K+ lines of tests, and 13 documentation files covering security hardening, deployment topology, and operational runbooks.
 
 ## Demo
 
@@ -26,7 +26,8 @@ React 19 frontend with:
 - Booking handoff flow
 
 ### Architecture Overview
-<!-- TODO: Add architecture diagram here -->
+
+![Architecture Diagram](docs/architecture.svg)
 
 Multi-agent orchestration with circuit breakers, retry logic, and API key rotation.
 
@@ -783,7 +784,7 @@ See [Deployment Topology](docs/deployment-topology.md) for complete contract.
 
 ## Documentation
 
-This project includes **13 enterprise-grade documentation files** covering security, operations, and architecture:
+This project includes **13 documentation files** covering security, operations, and architecture:
 
 ### Architecture & Design
 - [Deployment Topology](docs/deployment-topology.md) - Single-node production topology contract
@@ -906,5 +907,5 @@ LinkedIn: [siddharth-singh](https://linkedin.com/in/siddharth-singh)
 **This project demonstrates**:
 - Production patterns for fault-tolerant distributed systems
 - Multi-agent orchestration with LLM routing
-- Enterprise-grade reliability (circuit breakers, retry, key rotation)
+- Reliability patterns (circuit breakers, retry, key rotation)
 - Comprehensive documentation and testing
