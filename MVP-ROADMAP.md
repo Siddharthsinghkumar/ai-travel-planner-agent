@@ -24,7 +24,7 @@
 ### Missing (blocks, all Sid's)
 
 1. **⛔ G1** — approve Phase-0 scope (recommend: all 12). Blocks Milestone 1 execution.
-2. **⛔ G2 DECIDED 2026-07-18** — try Oracle Always-Free ARM first, fallback Hetzner CX22 without waiting if signup/capacity blocks. Still pending Sid's actions: host account + Cloudflare account + domain, before M2 Batch B.
+2. **⛔ G2 RE-REVISED 2026-07-19** — Oracle card-blocked; Hetzner rejected (paid). Host: GCP e2-micro Always Free attempt → fallback self-host + Cloudflare Tunnel (₹0, no card). Domain: no purchase — is-a.dev subdomain (PR, immediate) + eu.org application in parallel (own Cloudflare zone when approved).
 3. **⛔ G3 DECIDED 2026-07-18** — NIM + Groq + Gemini free tiers (6-provider router with Ollama+OpenAI). Adapters built key-less in M2 Batch A (Gemini adapter BUILT from scratch, D-M1-11); Sid creates and places keys at STOP-A.
 4. **⛔ G6 (added 2026-07-18)** — frontend REBUILD placement (Sid decided the whole frontend
    will be rebuilt; M1 is backend-only, current frontend frozen as legacy). Pre-ship = MVP
