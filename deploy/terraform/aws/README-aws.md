@@ -5,6 +5,12 @@
 
 ## Step 0: Budget FIRST (do this BEFORE any resource)
 
+> **floci-tested (2026-07-19):** The module was validated against floci
+> (Docker-based AWS emulator) — SG + keypair via Terraform, instance via EC2 API.
+> See `deploy/terraform/aws/floci/README.md` for coverage gaps. Budgets and AMI
+> data sources are not emulated by floci; the toggle variables (`enable_budget`,
+> `ami_id`) handle the difference.
+
 1. Create your AWS account (new = $100–200 credits, 6mo or until spent).
 2. Go to **Billing Dashboard → Budgets → Create budget**.
 3. **Cost budget**, monthly, amount = $5, add alert email.
