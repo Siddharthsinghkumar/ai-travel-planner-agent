@@ -1,0 +1,11 @@
+# deploy/security/zap-full.tsv — local ZAP full-scan tuning file
+# This file is LOCAL to the deploy/security/ runner.
+# It is NEVER .zap/rules.tsv (CI-owned, frozen per N-M2.5).
+#
+# Format: <id>\t<name>\t<action>\t<strength>\t<and not>\t<url>
+# Actions: IGNORE, WARN, FAIL
+#
+# Add ignore/warn rules here for false positives discovered in §6 live runs.
+
+# Example (commented out — add after live scan audit):
+# 10096	Timestamp Disclosure - Unix	IGNORE	Default		.*
