@@ -1,0 +1,40 @@
+# Alerting sidecar overlay — deploy/compose.alerting.yml
+# Usage: docker compose -f docker-compose.yml -f deploy/compose.prod.yml -f deploy/compose.alerting.yml up -d
+#
+# Adds a lightweight alpine+curl sidecar that polls /health + inspects container
+# liveness, firing Telegram alerts on transition-to-unhealthy. Debounced 5 min.
+# ₹0 lean — no Alertmanager.
+#
+# ⛔ Sid sets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env before deploy.
+# Never commit real tokens (N-M2.1).
+
+services:
+  alerting:
+    image: alpine:3.21
+    container_name: llm-travel-alerting
+    restart: always
+    mem_limit: 64m
+    command: >
+      sh -c "
+        apk add --no-cache curl docker-cli &&
+        /watch.sh
+      "
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-PLACEHOLDER_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-PLACEHOLDER_CHAT_ID}
+      POLL_INTERVAL: ${ALERTING_POLL_INTERVAL:-15}
+      DEBOUNCE_SEC: ${ALERTING_DEBOUNCE_SEC:-300}
+      HEALTH_URL: ${ALERTING_HEALTH_URL:-http://api:8000/health}
+      CONTAINERS_CHECK: "llm-travel-api llm-postgres llm-travel-caddy"
+    volumes:
+      - ./deploy/alerting/notify_telegram.sh:/notify_telegram.sh:ro
+      - ./deploy/alerting/watch.sh:/watch.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - api
+      - postgres
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
