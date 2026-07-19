@@ -61,10 +61,12 @@ echo "=== Step 3: Set up workspace ==="
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 cp "$MODULE_DIR"/*.tf "$WORK_DIR/"
-cp "$MODULE_DIR"/.terraform.lock.hcl "$WORK_DIR/" 2>/dev/null || true
+# Do NOT copy .terraform.lock.hcl — let floci init pick latest provider (v5.100 has
+# a DescribeInstanceTypes call that floci doesn't support; latest handles it)
 
-# Strip real-AWS provider block, replace with floci provider
+# Strip real-AWS provider block, version constraint, replace with floci provider + no version pin
 sed -i '/^provider "aws" {/,/^}$/d' "$WORK_DIR/main.tf"
+echo 'terraform { required_version = ">= 1.5.0" }' > "$WORK_DIR/versions.tf"
 # t3.micro not supported by floci
 sed -i 's/instance_type *= *"t3.micro"/instance_type = "t2.micro"/' "$WORK_DIR/main.tf"
 
