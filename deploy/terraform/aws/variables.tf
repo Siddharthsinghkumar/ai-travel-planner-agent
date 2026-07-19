@@ -42,3 +42,15 @@ variable "app_user" {
   type        = string
   default     = "llm-agent"
 }
+
+variable "ami_id" {
+  description = "Override AMI ID for testing (floci has no Canonical AMIs). Leave empty for real AWS."
+  type        = string
+  default     = ""
+}
+
+variable "enable_budget" {
+  description = "Whether to create the AWS Budget resource (floci does not emulate Budgets)"
+  type        = bool
+  default     = true
+}

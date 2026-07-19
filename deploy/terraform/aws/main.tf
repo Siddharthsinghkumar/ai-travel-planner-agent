@@ -3,7 +3,9 @@ provider "aws" {
 }
 
 # Ubuntu 24.04 LTS AMI (Canonical, official)
+# Skipped when var.ami_id is set (floci has no Canonical AMIs)
 data "aws_ami" "ubuntu" {
+  count       = var.ami_id == "" ? 1 : 0
   most_recent = true
   owners      = ["099720109477"]
 
@@ -52,7 +54,7 @@ resource "aws_security_group" "app" {
 
 # EC2 instance — free-tier pinned shape
 resource "aws_instance" "app" {
-  ami                         = data.aws_ami.ubuntu.id
+  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu[0].id
   instance_type               = "t3.micro"
   key_name                    = aws_key_pair.app.key_name
   vpc_security_group_ids      = [aws_security_group.app.id]
@@ -111,7 +113,9 @@ resource "aws_instance" "app" {
 }
 
 # Budget — cost guard in code (NOTIFY only; does not terminate resources)
+# Toggled off for floci (floci does not emulate Budgets)
 resource "aws_budgets_budget" "monthly" {
+  count        = var.enable_budget ? 1 : 0
   name         = "${var.instance_name}-monthly"
   budget_type  = "COST"
   limit_amount = var.budget_usd
