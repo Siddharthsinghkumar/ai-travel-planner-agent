@@ -2077,11 +2077,15 @@ def parse_intent(user_query: str) -> ParsedIntent:
         q,
     )
     if return_match:
-        try:
-            dt = dateutil.parser.parse(return_match.group(1), dayfirst=True)
-            intent.return_date = dt.strftime("%Y-%m-%d")
-        except:
-            pass
+        date_str = return_match.group(1)
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            intent.return_date = date_str
+        else:
+            try:
+                dt = dateutil.parser.parse(date_str, dayfirst=True)
+                intent.return_date = dt.strftime("%Y-%m-%d")
+            except:
+                pass
 
     # --- Stopover city ---
     # Parse from original query to preserve multi-word city names (for example, "New Delhi", "Abu Dhabi").

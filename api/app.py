@@ -50,6 +50,7 @@ from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
 import core.metrics as app_metrics
 from core.auth import AuthenticatedPrincipal, get_current_principal, get_optional_principal
+from core.signal_handler import setup_signal_handlers
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, is_env_set
 from core.ollama_context import RUNTIME_NUM_CTX_DEFAULT, resolve_runtime_num_ctx
 from core.llm_mode import (
@@ -1224,6 +1225,7 @@ async def lifespan(app: FastAPI):
 
     # Startup: configure structured JSON logging
     setup_logging()
+    setup_signal_handlers()
     deprecated_env_detected = _emit_deprecated_config_warnings()
 
     def _validate_secret_runtime_config() -> None:
