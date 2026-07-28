@@ -164,10 +164,28 @@ jobs:
   e2e-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TESTING: "1"
+      AUTH_DISABLE: "true"
+      LLM_MODE: ollama_only
+      OLLAMA_BASE_URL: http://localhost:11434
+      SERPAPI_KEY_1: dummy
+      WEATHER_KEY_1: dummy
+      OPENAI_KEY_1: dummy
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install backend dependencies
+        run: |
+          python -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install -r requirements.txt -r requirements-dev.txt
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
