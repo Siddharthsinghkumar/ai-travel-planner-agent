@@ -5,7 +5,7 @@ on:
     branches: [ main, dev ]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
