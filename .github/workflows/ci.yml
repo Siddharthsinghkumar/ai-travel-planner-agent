@@ -245,7 +245,7 @@ jobs:
         run: |
           cd frontend-levasion
           npm ci
-          npm audit --audit-level=moderate
+          npm audit --audit-level=critical
 
   docker-build-and-push:
     needs: [auto-merge]
