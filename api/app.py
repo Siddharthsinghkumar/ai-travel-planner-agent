@@ -45,7 +45,7 @@ import agents.planner_agent as planner_agent
 from api.services_exceptions import AirlineAPIError, WeatherAPIError
 from core.http_client import close_client
 from core.request_context import set_request_id, get_request_id
-from core.logging_config import setup_logging
+from core.structured_logging import setup_structlog
 from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
 import core.metrics as app_metrics
@@ -1224,7 +1224,7 @@ async def lifespan(app: FastAPI):
     app.state.price_tracker_task = None
 
     # Startup: configure structured JSON logging
-    setup_logging()
+    setup_structlog()
     setup_signal_handlers()
     deprecated_env_detected = _emit_deprecated_config_warnings()
 

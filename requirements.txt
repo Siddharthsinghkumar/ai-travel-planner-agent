@@ -13,3 +13,4 @@ airportsdata==20250523
 dateparser==1.4.0
 rapidfuzz==3.14.3
 pydantic>=2.13,<3
+structlog
