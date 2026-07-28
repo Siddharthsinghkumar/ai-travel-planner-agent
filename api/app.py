@@ -36,6 +36,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator, model_validator
+from agents.v2_graph import v2_agent
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, start_http_server
 
 # Use module import instead of direct function import for better testability
@@ -1756,8 +1757,6 @@ class ProviderStateOverrideRequest(BaseModel):
 class V2AskRequest(BaseModel):
     query: str
     thread_id: Optional[str] = None
-
-from agents.v2_graph import v2_agent
 
 @app.post("/v2/ask")
 async def ask_v2(req: V2AskRequest, stream: bool = False):

@@ -1,7 +1,8 @@
 import logging
-import asyncio
 from langgraph.graph import StateGraph, START, END
 from agents.v2_state import TravelPlannerState
+from langgraph.checkpoint.memory import MemorySaver
+
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,6 @@ workflow.add_edge("fetch_weather", "generate_plan")
 workflow.add_edge("generate_plan", END)
 
 # In-memory checkpointer for now until Section 5 (Infra agent) finishes Postgres.
-from langgraph.checkpoint.memory import MemorySaver
 memory = MemorySaver()
 
 # Compile the graph

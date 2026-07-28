@@ -28,7 +28,7 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
     },
     {
-      command: 'cd .. && uvicorn api.app:app --port 8000',
+      command: 'cd .. && venv/bin/uvicorn api.app:app --port 8000',
       port: 8000,
       reuseExistingServer: !process.env.CI,
     }

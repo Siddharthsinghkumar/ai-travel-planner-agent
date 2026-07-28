@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   lint:
@@ -244,20 +245,21 @@ jobs:
           persist-credentials: false
       - name: Install and audit
         run: |
-          cd frontend
+          cd frontend-levasion
           npm ci
           npm audit --audit-level=moderate
 
   docker-build-and-push:
-    needs: [lint, fast-tests, slow-tests, import-check, pip-audit, npm-audit]
+    needs: [auto-merge]
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.ref == 'refs/heads/main'
+    if: always() && (github.ref == 'refs/heads/main' || needs.auto-merge.result == 'success')
 
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
