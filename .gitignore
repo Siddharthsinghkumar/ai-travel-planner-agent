@@ -88,3 +88,19 @@ plans/
 crash.log
 crash.*.log
 deploy/terraform/*/terraform.tfvars
+
+# Docker secret material — local dev creds; NEVER commit (public portfolio repo — N-M2.1/D4)
+deploy/secrets/
+# Local-only compose overrides (dev-machine port/network workarounds)
+deploy/compose.local*.yml
+
+# Local/Session Artifacts and Scripts
+.agents/
+report/
+research/
+vault/
+jul19-session.txt
+llm-travel-agent-fullstack-summary.md
+build_vault.py
+concat_all.py
+patch.py

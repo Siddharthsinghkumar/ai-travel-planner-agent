@@ -19,17 +19,17 @@ The system streams LLM reasoning in real-time via SSE, showing:
 ### Frontend Interface
 <!-- TODO: Add screenshot of frontend here -->
 
-React 19 frontend with:
-- Framer Motion animations
-- Real-time SSE streaming
-- Debug drawer to inspect LLM routing decisions
-- Booking handoff flow
+React 19 + Vite frontend (L'ÉVASION) with:
+- Minimalist "Single Omni-Box" UI approach
+- Real-time SSE streaming resilient reconnection hooks
+- Debug drawer to inspect LangGraph routing decisions
+- Booking handoff flow with checkout validation
 
 ### Architecture Overview
 
 ![Architecture Diagram](docs/architecture.svg)
 
-Multi-agent orchestration with circuit breakers, retry logic, and API key rotation.
+LangGraph Stateful Orchestration (`/v2/ask`) with Postgres Checkpointing, circuit breakers, retry logic, and API key rotation. Includes strict PII-redacted structured JSON logging via `structlog` and Playwright E2E gating.
 
 ---
 
@@ -39,10 +39,10 @@ Multi-agent orchestration with circuit breakers, retry logic, and API key rotati
 
 **Processing Pipeline**:
 1. **Intent Parser** extracts origin/destination (DEL→BLR), dates (2030-01-14), constraints (business class, direct, <₹15k)
-2. **Planner Agent** orchestrates the search:
+2. **Planner Agent (LangGraph)** orchestrates the stateful search:
    - Queries SerpAPI for Google Flights results
    - Enriches with OpenWeather forecast data
-   - Applies user preference scoring from session memory
+   - Applies user preference scoring from session memory, checkpointed reliably via Postgres
 3. **LLM Router** generates explanation:
    - Routes to Ollama (local) or cloud (OpenAI, Gemini, Anthropic, NIM, Groq via circuit-breaker + key rotation)
    - Circuit breaker protects against degraded providers

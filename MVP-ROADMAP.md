@@ -26,12 +26,7 @@
 1. **⛔ G1** — approve Phase-0 scope (recommend: all 12). Blocks Milestone 1 execution.
 2. **⛔ G2 RE-REVISED 2026-07-19** — Oracle card-blocked; Hetzner rejected (paid). Host: GCP e2-micro Always Free attempt → fallback self-host + Cloudflare Tunnel (₹0, no card). Domain: no purchase — is-a.dev subdomain (PR, immediate) + eu.org application in parallel (own Cloudflare zone when approved).
 3. **⛔ G3 DECIDED 2026-07-18** — NIM + Groq + Gemini free tiers (6-provider router with Ollama+OpenAI). Adapters built key-less in M2 Batch A (Gemini adapter BUILT from scratch, D-M1-11); Sid creates and places keys at STOP-A.
-4. **⛔ G6 (added 2026-07-18)** — frontend REBUILD placement (Sid decided the whole frontend
-   will be rebuilt; M1 is backend-only, current frontend frozen as legacy). Pre-ship = MVP
-   ships the NEW UI (M3 captures it, adds a rebuild workstream before M3; the rebuild should
-   consume `/openapi.json` + could adopt the typed-SSE protocol from RESEARCH-INTAKE §1
-   directly instead of retrofitting later). Post-ship = MVP ships the current working UI,
-   rebuild becomes the first post-ship workstream. Blocks M3 asset capture only.
+3. **✅ G6 (added 2026-07-18, COMPLETED 2026-07-28)** — frontend REBUILD placement. MVP ships the NEW UI React Vite L'ÉVASION application with full SSE streaming and Playwright coverage.
 
 Verify-before-commit items (10 min each, inside M2): Cloudflare free-plan SSE pass-through;
 Oracle free-tier ARM capacity actually claimable; current NIM/Groq free limits.
