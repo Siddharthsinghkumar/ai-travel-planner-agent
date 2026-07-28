@@ -1751,6 +1751,41 @@ class ProviderStateOverrideRequest(BaseModel):
         return self
 
 
+
+
+class V2AskRequest(BaseModel):
+    query: str
+    thread_id: Optional[str] = None
+
+from agents.v2_graph import v2_agent
+
+@app.post("/v2/ask")
+async def ask_v2(req: V2AskRequest, stream: bool = False):
+    thread_id = req.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    if not stream:
+        result = await v2_agent.ainvoke(
+            {"user_query": req.query, "thread_id": thread_id, "session_id": "api"},
+            config=config
+        )
+        return {"result": result, "thread_id": thread_id}
+        
+    async def sse_generator():
+        try:
+            async for event in v2_agent.astream(
+                {"user_query": req.query, "thread_id": thread_id, "session_id": "api"},
+                config=config,
+                stream_mode="updates"
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+
 @app.post("/ask")
 async def ask(
     req: AskRequest,
