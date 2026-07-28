@@ -180,7 +180,7 @@ jobs:
         run: npx playwright test
 
   auto-merge:
-    needs: [lint, fast-tests, slow-tests, ragas-eval, e2e-tests]
+    needs: [lint, fast-tests, slow-tests, ragas-eval, e2e-tests, zap-baseline, semgrep-async-db, import-check, pip-audit, npm-audit]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/dev'
     steps:

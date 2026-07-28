@@ -20,4 +20,4 @@ Python 3 / FastAPI monolith serving a multi-agent travel planner: NL query → r
 ### 3. Observability & Gating
 - **Logging:** Structlog intercepts all logging events. A strict `pii_processor` scrubs emails, phone numbers, and passport IDs dynamically.
 - **Metrics:** Prometheus exporter now binds to port `8765`, recording precise LLM token usage.
-- **CI/CD:** Github Actions pipeline now enforces Ruff, Fast Suite, Slow Suite (PG), RAGAS evaluations, and Playwright before auto-merging `dev` into `main`.
+- **CI/CD:** Github Actions pipeline now enforces Ruff, Fast Suite, Slow Suite (PG), RAGAS evaluations, Playwright, Semgrep, and Audits before auto-merging `dev` into `main`. Note: `zap-baseline` is currently non-blocking (`continue-on-error: true`), but will be flipped to blocking prior to production deployment (AWS/Oracle/GCP).
