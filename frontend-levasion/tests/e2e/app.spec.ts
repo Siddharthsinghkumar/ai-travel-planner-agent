@@ -16,8 +16,11 @@ test.describe('L\'ÉVASION End-to-End Flow', () => {
     // Should redirect to Planner with SSE stream
     await expect(page).toHaveURL(/.*\/planner/, { timeout: 10000 });
 
+    // Click "Generate Itinerary"
+    const generateBtn = page.locator('button', { hasText: 'Generate Itinerary' });
+    await generateBtn.click();
+
     // Wait for the stream to complete and the flight card to appear.
-    // Based on the UI UX Pro Max design, we wait for a button indicating a booking/hold action.
     const holdButton = page.locator('button', { hasText: /Hold|Book|Select/i }).first();
     await expect(holdButton).toBeVisible({ timeout: 25000 });
 

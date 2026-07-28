@@ -1,7 +1,9 @@
 import { useStreamingPlan } from '../hooks/useStreamingPlan';
+import { useNavigate } from 'react-router-dom';
 
 export default function Planner() {
   const { start, tokens, isStreaming, error, reasoningSteps } = useStreamingPlan();
+  const navigate = useNavigate();
 
   const handleSearch = () => {
     start({ user_query: "Plan a luxury trip to Paris" });
@@ -35,6 +37,15 @@ export default function Planner() {
           <h3 className="text-xl mb-4 text-amber-500">Concierge Insights</h3>
           <div className="text-gray-300 whitespace-pre-wrap">{tokens || "Awaiting instructions..."}</div>
           {isStreaming && <span className="animate-pulse">_</span>}
+          
+          {(tokens || error) && !isStreaming && (
+            <button
+              onClick={() => navigate('/checkout')}
+              className="mt-6 bg-amber-500 hover:bg-amber-400 text-black px-6 py-2 rounded-full font-medium transition-colors"
+            >
+              Book Flight
+            </button>
+          )}
         </div>
       </div>
       
