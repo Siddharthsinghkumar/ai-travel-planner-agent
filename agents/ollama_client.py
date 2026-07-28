@@ -535,9 +535,10 @@ async def _streaming_call(
     Assumes AsyncCircuitBreaker has a method `run_generator_protected` that
     takes a generator factory and yields items while managing circuit state.
     """
-    agen_factory = lambda: _streaming_call_internal(payload, request_id, timeout)
+    def _gen_factory():
+        return _streaming_call_internal(payload, request_id, timeout)
     try:
-        async for token in ollama_breaker.run_generator_protected(agen_factory):
+        async for token in ollama_breaker.run_generator_protected(_gen_factory):
             yield token
     except CircuitBreakerOpenError as exc:
         logger.warning(

@@ -36,7 +36,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator, model_validator
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from agents.v2_graph import v2_agent
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, start_http_server
 
 # Use module import instead of direct function import for better testability
 import agents.planner_agent as planner_agent
@@ -45,11 +46,12 @@ import agents.planner_agent as planner_agent
 from api.services_exceptions import AirlineAPIError, WeatherAPIError
 from core.http_client import close_client
 from core.request_context import set_request_id, get_request_id
-from core.logging_config import setup_logging
+from core.structured_logging import setup_structlog
 from core.health import full_health_check
 from core.async_llm_client import init_llm_client, close_llm_client
 import core.metrics as app_metrics
 from core.auth import AuthenticatedPrincipal, get_current_principal, get_optional_principal
+from core.signal_handler import setup_signal_handlers
 from core.env_config import get_env_bool, get_env_float, get_env_int, get_env_str, is_env_set
 from core.ollama_context import RUNTIME_NUM_CTX_DEFAULT, resolve_runtime_num_ctx
 from core.llm_mode import (
@@ -65,7 +67,6 @@ from core.llm_mode import (
     LLM_MODE_CLOUD_ONLY,
     LLM_MODE_CLOUD_FIRST,
     LLM_MODE_OLLAMA_ONLY,
-    LLM_MODE_OLLAMA_FIRST,
     VALID_LLM_MODES,
 )
 from core import job_queue                     # background job worker
@@ -232,7 +233,8 @@ def _ensure_ask_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
     if isinstance(limiter, SlidingWindowRateLimiter):
         return limiter
     limiter = SlidingWindowRateLimiter(
-        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000))
+        max_keys=max(500, get_env_int("ASK_RATE_LIMIT_MAX_KEYS", 10000)),
+        sensitive=True,
     )
     app.state.ask_rate_limiter = limiter
     return limiter
@@ -243,7 +245,8 @@ def _ensure_admin_rate_limiter(app: FastAPI) -> SlidingWindowRateLimiter:
     if isinstance(limiter, SlidingWindowRateLimiter):
         return limiter
     limiter = SlidingWindowRateLimiter(
-        max_keys=max(200, get_env_int("ADMIN_RATE_LIMIT_MAX_KEYS", 5000))
+        max_keys=max(200, get_env_int("ADMIN_RATE_LIMIT_MAX_KEYS", 5000)),
+        sensitive=True,
     )
     app.state.admin_rate_limiter = limiter
     return limiter
@@ -887,6 +890,36 @@ def _job_runtime_warning_payload() -> Dict[str, Any]:
     return job_queue.job_runtime_warning_payload()
 
 
+SSE_KEEPALIVE_INTERVAL = 20
+SSE_PING_FRAME = ": ping\n\n"
+
+
+async def _with_keepalive_pings(agen, *, interval_seconds=None, ping_frame=None):
+    if interval_seconds is None:
+        interval_seconds = SSE_KEEPALIVE_INTERVAL
+    if ping_frame is None:
+        ping_frame = SSE_PING_FRAME
+    try:
+        while True:
+            task = asyncio.ensure_future(agen.__anext__())
+            done, _pending = await asyncio.wait([task], timeout=interval_seconds)
+            if task in done:
+                try:
+                    chunk = task.result()
+                except StopAsyncIteration:
+                    return
+                yield chunk
+            else:
+                yield ping_frame
+                try:
+                    chunk = await task
+                except StopAsyncIteration:
+                    return
+                yield chunk
+    except StopAsyncIteration:
+        pass
+
+
 def _apply_job_runtime_headers(response: Response) -> None:
     response.headers["X-Async-Job-Durability"] = "memory-only-ephemeral"
     response.headers["X-Async-Job-Lost-On-Restart"] = "true"
@@ -1081,8 +1114,9 @@ async def prewarm_llm():
 
 
 def _validate_admin_token(x_admin_token: Optional[str]) -> str:
-    from core.env_config import get_env_bool
-    if get_env_bool("AUTH_DISABLE", False):
+    from core.config import TESTING
+    testing = TESTING
+    if testing and get_env_bool("AUTH_DISABLE_ADMIN", False):
         return "test-admin-token"
     expected = (get_env_str("ADMIN_TOKEN") or "").strip()
     provided = (x_admin_token or "").strip()
@@ -1191,7 +1225,8 @@ async def lifespan(app: FastAPI):
     app.state.price_tracker_task = None
 
     # Startup: configure structured JSON logging
-    setup_logging()
+    setup_structlog()
+    setup_signal_handlers()
     deprecated_env_detected = _emit_deprecated_config_warnings()
 
     def _validate_secret_runtime_config() -> None:
@@ -1347,6 +1382,18 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.startup_complete = True
+
+    # Expose Prometheus metrics on a dedicated internal port (8765) so the scrape
+    # config can reach them without the admin-token gate on the public /metrics route
+    # (F-006). Guarded: never bind in TESTING (tests/CI), and never fail startup if the
+    # port is unavailable.
+    if not get_env_bool("TESTING", default=False):
+        try:
+            start_http_server(8765)
+            logger.info("prometheus_metrics_server_started", extra={"port": 8765})
+        except Exception:
+            logger.exception("prometheus_metrics_server_start_failed", extra={"port": 8765})
+
     yield
 
     app.state.startup_complete = False
@@ -1582,6 +1629,7 @@ async def observe_http_metrics(request: Request, call_next):
 
 
 class AskRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     origin: Optional[str] = Field(default=None, max_length=8)
     destination: Optional[str] = Field(default=None, max_length=8)
     date: Optional[str] = Field(default=None, max_length=32)
@@ -1702,6 +1750,39 @@ class ProviderStateOverrideRequest(BaseModel):
         if not self.override_type:
             raise ValueError("override_type is required")
         return self
+
+
+
+
+class V2AskRequest(BaseModel):
+    query: str
+    thread_id: Optional[str] = None
+
+@app.post("/v2/ask")
+async def ask_v2(req: V2AskRequest, stream: bool = False):
+    thread_id = req.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    if not stream:
+        result = await v2_agent.ainvoke(
+            {"user_query": req.query, "thread_id": thread_id, "session_id": "api"},
+            config=config
+        )
+        return {"result": result, "thread_id": thread_id}
+        
+    async def sse_generator():
+        try:
+            async for event in v2_agent.astream(
+                {"user_query": req.query, "thread_id": thread_id, "session_id": "api"},
+                config=config,
+                stream_mode="updates"
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 @app.post("/ask")
@@ -2078,7 +2159,8 @@ async def ask(
                             date=effective_date,
                             user_query=planner_user_query,
                             trip_type=req.trip_type,
-                            stream=True
+                            stream=True,
+                            owner_principal_id=principal.principal_id if principal else None,
                         )
                         # If the planner returns an async generator, iterate and yield SSE frames
                         if hasattr(agen_or_result, "__aiter__"):
@@ -2178,11 +2260,14 @@ async def ask(
             if ask_slot_acquired:
                 # Defensive release if stream iteration exits early before generator cleanup.
                 release_failsafe = BackgroundTask(_release_ask_inflight_key, ask_request_fingerprint)
-            return StreamingResponse(
-                event_stream(),
+            response = StreamingResponse(
+                _with_keepalive_pings(event_stream()),
                 media_type="text/event-stream",
                 background=release_failsafe,
             )
+            response.headers["X-Accel-Buffering"] = "no"
+            response.headers["Cache-Control"] = "no-cache"
+            return response
 
         # Non‑streaming branch: apply global timeout
         with llm_routing_context(llm_mode=llm_mode, cloud_provider=cloud_provider):
@@ -2193,6 +2278,7 @@ async def ask(
                     date=effective_date,
                     user_query=planner_user_query,
                     trip_type=req.trip_type,
+                    owner_principal_id=principal.principal_id if principal else None,
                 ),
                 timeout=GLOBAL_TIMEOUT
             )
@@ -2477,6 +2563,7 @@ async def booking_post_handoff_bridge_post(artifact_id: str, request: Request):
 
 
 class PlanApprovalRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     approved: bool
 
 
@@ -2494,7 +2581,7 @@ async def approve_plan(
     _audit = HITLAuditLogger()
     _start = _time.monotonic()
 
-    ok = await _approval_store.set_decision(plan_id, req.approved)
+    ok, reason = await _approval_store.set_decision(plan_id, req.approved, principal_id=principal.principal_id)
     latency_ms = (_time.monotonic() - _start) * 1000
 
     if not ok:
@@ -2503,8 +2590,10 @@ async def approve_plan(
             user_id=principal.principal_id,
             approved=req.approved,
             latency_ms=latency_ms,
-            details={"status": "not_found"},
+            details={"status": reason or "not_found"},
         )
+        if reason == "principal_mismatch":
+            raise HTTPException(status_code=403, detail="HITL approval requires the plan owner principal.")
         raise HTTPException(status_code=404, detail="No pending approval found for this plan_id.")
 
     _audit.log_decision(
@@ -2612,7 +2701,9 @@ async def job_events(
             if evt.get("event") in ("closed", "done", "error", "cancelled"):
                 break
 
-    response = StreamingResponse(event_stream(), media_type="text/event-stream")
+    response = StreamingResponse(_with_keepalive_pings(event_stream()), media_type="text/event-stream")
+    response.headers["X-Accel-Buffering"] = "no"
+    response.headers["Cache-Control"] = "no-cache"
     _apply_job_runtime_headers(response)
     return response
 
@@ -2974,7 +3065,6 @@ async def health():
 
     llm_mode = get_llm_mode_default()
     primary_llm_backend = "ollama"
-    fallback_llm_backend = None
     required_dependencies: list[str] = []
     fallback_dependencies: list[str] = []
     required_unavailable: list[str] = []
@@ -2994,7 +3084,6 @@ async def health():
         dependencies["ollama"] = "not_relevant"
     elif llm_mode == LLM_MODE_CLOUD_FIRST:
         primary_llm_backend = "cloud"
-        fallback_llm_backend = "ollama"
         required_dependencies = ["cloud"]
         fallback_dependencies = ["ollama"]
         dependencies["cloud"] = cloud_dep_status
@@ -3002,7 +3091,6 @@ async def health():
     else:
         # ollama_first default
         primary_llm_backend = "ollama"
-        fallback_llm_backend = "cloud"
         required_dependencies = ["ollama"]
         fallback_dependencies = ["cloud"]
         dependencies["ollama"] = ollama_status

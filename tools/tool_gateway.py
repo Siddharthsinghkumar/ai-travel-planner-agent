@@ -1,7 +1,6 @@
 """Canonical tool gateway - single source of truth for tool-facing functions.
 
 This module consolidates duplicate gateway wrappers from:
-- agents/planner_tool_gateway.py
 - tools/price_tracker_tool_gateway.py
 
 It provides lazy imports to avoid circular dependencies while maintaining
@@ -69,7 +68,7 @@ def booking_resolution_cache_stats() -> dict:
     return impl()
 
 
-from agents.high_impact import high_impact
+from agents.high_impact import high_impact  # noqa: E402 — deferred import to break circular dependency
 
 
 @high_impact("booking")

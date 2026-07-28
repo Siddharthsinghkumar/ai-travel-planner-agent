@@ -462,10 +462,15 @@ class LLMRouter:
 
                     # First chunk succeeded; now we can stream with per-chunk timeout
                     async def stream_with_first():
+                        response_chars = len(first_chunk or "")
                         yield first_chunk
                         # Use the existing _stream_with_timeout for the rest
                         async for chunk in self._stream_with_timeout(gen, timeout, backend_label, request_id):
+                            response_chars += len(chunk or "")
                             yield chunk
+                        
+                        response_est_tokens = _estimate_tokens_from_chars(response_chars)
+                        metrics.record_llm_tokens(backend_label, prompt_est_tokens, response_est_tokens)
 
                     logger.debug("LLM streaming started", extra={
                         "backend": backend_label,
@@ -556,12 +561,14 @@ class LLMRouter:
                     })
                     # Route usage should reflect the backend that actually served this request,
                     # not the configured/requested cloud provider.
+                    response_est_tokens = _estimate_tokens_from_chars(response_chars)
                     metrics.record_llm_route_usage(
                         mode=requested_mode,
                         effective_mode=mode,
                         provider=backend_label,
                         stream=stream,
                     )
+                    metrics.record_llm_tokens(backend_label, prompt_est_tokens, response_est_tokens)
                     metrics.increment("llm.backend.success", tags={"backend": backend_label})
                     metrics.increment("llm.router.success", tags={"backend": backend_label})
                     metrics.observe_llm_full_response(provider=backend_label, stream=False, duration_sec=latency)

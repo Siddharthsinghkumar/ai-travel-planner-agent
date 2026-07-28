@@ -1,0 +1,89 @@
+# Canonical single-node Caddyfile — deploy/Caddyfile
+# See: docs/reverse-proxy-caddy.md, docs/deployment-topology.md
+#
+# Placeholders (⛔ Sid replaces before deploy):
+#   TRAVEL_DOMAIN        = public domain, e.g. travel.example.com
+#   TLS_ACME_EMAIL       = ops email for Let's Encrypt notifications
+#   GRAFANA_DOMAIN       = grafana subdomain, e.g. grafana.travel.example.com
+#   GRAFANA_BASIC_AUTH   = output of: caddy hash-password --plaintext '<password>'
+#
+# Uvicorn stays on 127.0.0.1:8000 (api service in compose network).
+
+{
+	email {$TLS_ACME_EMAIL}
+}
+
+{$TRAVEL_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+		-Server
+	}
+
+	# Admin/debug — block from public
+	@debug_public {
+		path /debug/*
+		not remote_ip private_ranges
+	}
+	respond @debug_public 403
+
+	# Diagnostic surfaces — block from public
+	@diagnostic_public {
+		path /health/deep /health/keys /metrics /llm/options /docs /redoc /openapi.json
+		not remote_ip private_ranges
+	}
+	respond @diagnostic_public 403
+
+	# SSE stream paths — flush_interval -1 (disable buffering) + long timeouts
+	# /ask and /jobs/{id}/events may hold connections for minutes
+	@stream {
+		path /ask /jobs/*/events
+	}
+	reverse_proxy @stream 127.0.0.1:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+			write_timeout 0s
+		}
+	}
+
+	# Everything else — normal reverse proxy
+	reverse_proxy 127.0.0.1:8000 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+
+	log {
+		output file /var/log/caddy/llm-travel-agent-access.log {
+			roll_size 50MiB
+			roll_keep 10
+			roll_keep_for 336h
+		}
+		format json
+	}
+}
+
+# Grafana — separate subdomain behind basic auth
+{$GRAFANA_DOMAIN} {
+	basicauth {
+		admin {$GRAFANA_BASIC_AUTH}
+	}
+
+	reverse_proxy 127.0.0.1:3000
+
+	log {
+		output file /var/log/caddy/grafana-access.log {
+			roll_size 50MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+}

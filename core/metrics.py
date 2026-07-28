@@ -104,6 +104,12 @@ LLM_REQUESTS = Counter(
     ["provider", "status"]
 )
 
+LLM_TOKENS = Counter(
+    "llm_tokens_total",
+    "Total LLM tokens consumed",
+    ["provider", "type"]  # type: prompt, completion
+)
+
 TOOL_REQUESTS = Counter(
     "tool_requests_total",
     "Total tool API requests",
@@ -284,6 +290,12 @@ ACTIVE_FALLBACKS = Gauge(
 # ----------------------------
 # LLM Metric Helper Functions
 # ----------------------------
+
+def record_llm_tokens(provider: str, prompt_tokens: int, completion_tokens: int) -> None:
+    if prompt_tokens > 0:
+        LLM_TOKENS.labels(provider=provider, type="prompt").inc(prompt_tokens)
+    if completion_tokens > 0:
+        LLM_TOKENS.labels(provider=provider, type="completion").inc(completion_tokens)
 
 def increment_llm_success(provider: str) -> None:
     """

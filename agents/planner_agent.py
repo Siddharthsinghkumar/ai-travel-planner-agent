@@ -62,8 +62,7 @@ from agents.flight_normalizer import normalize_flights, normalize_flight_field, 
 # Note: get_weather_once and _normalize_weather_for_display are nested in _plan_trip_internal
 # so they use the local weather_cache closure. The module version is available for standalone use.
 
-# Circuit management - imported from focused module
-from agents.circuit_manager import check_llm_circuit, record_llm_success, record_llm_failure
+# Circuit management - defined locally below (see check_llm_circuit / record_llm_* at module level)
 from core.llm_mode import (
     get_llm_mode_and_priority,
     LLM_MODE_OLLAMA_ONLY,
@@ -102,8 +101,14 @@ import core.metrics as metrics
 
 # RAG retriever — lazy singleton
 _rag_retriever = None
+_RAG_INIT_WARNED = False
 def _get_rag_retriever():
-    global _rag_retriever
+    global _rag_retriever, _RAG_INIT_WARNED
+    if get_env_str("RAG_ENABLED", "false").lower() == "false":
+        if not _RAG_INIT_WARNED:
+            _RAG_INIT_WARNED = True
+            logger.warning("RAG disabled (RAG_ENABLED=false): retrieval returns empty context")
+        return None
     if _rag_retriever is None:
         try:
             from rag.retriever import RAGRetriever
@@ -142,13 +147,16 @@ class ApprovalState:
     def __init__(self):
         self._events: Dict[str, asyncio.Event] = {}
         self._decisions: Dict[str, Optional[bool]] = {}
+        self._owner_principal_ids: Dict[str, str] = {}
         self._lock = asyncio.Lock()
 
-    async def request_approval(self, plan_id: str, timeout: float = 120.0) -> Optional[bool]:
+    async def request_approval(self, plan_id: str, timeout: float = 120.0, owner_principal_id: Optional[str] = None) -> Optional[bool]:
         async with self._lock:
             evt = asyncio.Event()
             self._events[plan_id] = evt
             self._decisions[plan_id] = None
+            if owner_principal_id:
+                self._owner_principal_ids[plan_id] = owner_principal_id
         try:
             await asyncio.wait_for(evt.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -158,17 +166,21 @@ class ApprovalState:
         async with self._lock:
             return self._decisions.get(plan_id, False)
 
-    async def set_decision(self, plan_id: str, approved: bool) -> bool:
+    async def set_decision(self, plan_id: str, approved: bool, principal_id: str, admin_bypass: bool = False) -> Tuple[bool, Optional[str]]:
         async with self._lock:
             if plan_id not in self._events:
-                return False
+                return False, "not_found"
+            owner = self._owner_principal_ids.get(plan_id)
+            if not admin_bypass and owner and owner != principal_id:
+                return False, "principal_mismatch"
             self._decisions[plan_id] = approved
             self._events[plan_id].set()
-            return True
+            return True, None
 
     def clear(self, plan_id: str) -> None:
         self._events.pop(plan_id, None)
         self._decisions.pop(plan_id, None)
+        self._owner_principal_ids.pop(plan_id, None)
 
 _approval_store = ApprovalState()
 
@@ -2065,11 +2077,15 @@ def parse_intent(user_query: str) -> ParsedIntent:
         q,
     )
     if return_match:
-        try:
-            dt = dateutil.parser.parse(return_match.group(1), dayfirst=True)
-            intent.return_date = dt.strftime("%Y-%m-%d")
-        except:
-            pass
+        date_str = return_match.group(1)
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            intent.return_date = date_str
+        else:
+            try:
+                dt = dateutil.parser.parse(date_str, dayfirst=True)
+                intent.return_date = dt.strftime("%Y-%m-%d")
+            except:
+                pass
 
     # --- Stopover city ---
     # Parse from original query to preserve multi-word city names (for example, "New Delhi", "Abu Dhabi").
@@ -2870,19 +2886,18 @@ Please recommend the best flight, explain why it matches their preferences, ment
 
     # RAG context injection (feature-flagged)
     rag_context_block = ""
-    if get_env_str("RAG_ENABLED", "true").lower() != "false":
+    retriever = _get_rag_retriever()
+    if retriever is not None:
         try:
-            retriever = _get_rag_retriever()
-            if retriever is not None:
-                rag_results = retriever.retrieve(user_query, top_k=4)
-                if rag_results:
-                    rag_lines = ["Relevant context from knowledge base:"]
-                    for r in rag_results:
-                        rag_lines.append(f"{r['source']}: {r['text']}")
-                        rag_lines.append("---")
-                    rag_context_block = "\n".join(rag_lines) + "\n\n"
+            rag_results = retriever.retrieve(user_query, top_k=4)
+            if rag_results:
+                rag_lines = ["Relevant context from knowledge base:"]
+                for r in rag_results:
+                    rag_lines.append(f"{r['source']}: {r['text']}")
+                    rag_lines.append("---")
+                rag_context_block = "\n".join(rag_lines) + "\n\n"
         except Exception as e:
-            logger.debug(f"RAG retrieval failed: {e}")
+            logger.warning(f"RAG retrieval failed: {e}")
 
     # Combine facts block and prompt with an instruction to echo the facts
     session_context_text = ""
@@ -3441,6 +3456,7 @@ async def _plan_trip_internal(
     plan_id: Optional[str] = None,
     hitl_approval_timeout: float = 120.0,
     session_id: Optional[str] = None,
+    owner_principal_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict]:
     """Internal implementation without top-level timeout. Used for non‑streaming mode."""
     # Prevent excessive recursion
@@ -3546,9 +3562,9 @@ async def _plan_trip_internal(
     effective_plan_id = plan_id or f"plan-{origin}-{destination}-{date}"
     try:
         _set_state(PlannerState.INTENT_PARSING)
-        log_event("plan_start", effective_plan_id, intent_type=trip_type or "unknown")
     except IllegalTransition:
         pass
+    log_event("plan_start", effective_plan_id, intent_type=trip_type or "unknown")
     # Only parse if there is meaningful user input; otherwise start with empty intent.
     if user_query:
         intent = parse_intent(user_query)
@@ -4711,7 +4727,7 @@ async def _plan_trip_internal(
             details={"timeout_sec": hitl_approval_timeout},
         )
 
-        approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout)
+        approval_decision = await _approval_store.request_approval(effective_plan_id, timeout=hitl_approval_timeout, owner_principal_id=owner_principal_id)
         _approval_store.clear(effective_plan_id)
 
         if not approval_decision:
@@ -5572,9 +5588,9 @@ async def _plan_trip_internal(
     total_duration_ms = int((time.monotonic() - plan_start_ts) * 1000)
     try:
         _set_state(PlannerState.COMPLETE)
-        log_event("plan_complete", effective_plan_id, total_duration_ms=total_duration_ms, action_count=len(phases))
     except IllegalTransition:
         pass
+    log_event("plan_complete", effective_plan_id, total_duration_ms=total_duration_ms, action_count=len(phases))
 
     return result
 
@@ -5595,6 +5611,7 @@ async def plan_trip(
     weather_tool: Callable = default_weather_tool,
     plan_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    owner_principal_id: Optional[str] = None,
 ) -> Union[PlanResult, MultiCityResult, Dict, AsyncGenerator[str, None]]:
     """
     Public entry point for planning a trip.
@@ -5831,6 +5848,7 @@ async def plan_trip(
             resolve_booking_handoff=False,
             plan_id=plan_id,
             session_id=session_id,
+            owner_principal_id=owner_principal_id,
         )
 
     # --- Streaming branch ---
@@ -6378,19 +6396,18 @@ Please recommend the best flight, explain why it matches their preferences, ment
 
             # RAG context injection for streaming path (feature-flagged)
             stream_rag_context_block = ""
-            if get_env_str("RAG_ENABLED", "true").lower() != "false":
+            stream_retriever = _get_rag_retriever()
+            if stream_retriever is not None:
                 try:
-                    stream_retriever = _get_rag_retriever()
-                    if stream_retriever is not None:
-                        stream_rag_results = stream_retriever.retrieve(user_query, top_k=4)
-                        if stream_rag_results:
-                            stream_rag_lines = ["Relevant context from knowledge base:"]
-                            for r in stream_rag_results:
-                                stream_rag_lines.append(f"{r['source']}: {r['text']}")
-                                stream_rag_lines.append("---")
-                            stream_rag_context_block = "\n".join(stream_rag_lines) + "\n\n"
+                    stream_rag_results = stream_retriever.retrieve(user_query, top_k=4)
+                    if stream_rag_results:
+                        stream_rag_lines = ["Relevant context from knowledge base:"]
+                        for r in stream_rag_results:
+                            stream_rag_lines.append(f"{r['source']}: {r['text']}")
+                            stream_rag_lines.append("---")
+                        stream_rag_context_block = "\n".join(stream_rag_lines) + "\n\n"
                 except Exception as e:
-                    logger.debug(f"Streaming RAG retrieval failed: {e}")
+                    logger.warning(f"Streaming RAG retrieval failed: {e}")
 
             full_prompt = stream_rag_context_block + full_prompt
             full_prompt, stream_prompt_hard_trimmed = _apply_prompt_hard_limit(

@@ -1,0 +1,18 @@
+# ruff.toml — llm-travel-agent lint gate definition (D-M1-15, ratified 2026-07-18)
+#
+# This file DEFINES the zero-error CI gate. Every exemption has a reason.
+# Exemptions die with their owning task:
+#   - vault/report excludes: removed when those tools leave the tree (M2)
+#   - planner_agent per-file-ignores: removed at WS-A decomposition (post-ship)
+#   - targeted per-line noqa in code: lifespan noted in comment
+
+exclude = [
+    "full_validation.py",
+    "build_vault.py",
+    "concat_all.py",
+    "vault/",
+    "report/",
+]
+
+[lint.per-file-ignores]
+"agents/planner_agent.py" = ["E402", "E701", "E722", "F401", "F811", "F821", "F841"]

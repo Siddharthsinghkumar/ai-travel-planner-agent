@@ -1,7 +1,7 @@
 """Flight normalizer - normalizes flight data from various sources."""
 
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional
 from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)

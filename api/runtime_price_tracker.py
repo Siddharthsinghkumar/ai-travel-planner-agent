@@ -34,6 +34,14 @@ async def run_price_tracker_loop(app: FastAPI, *, logger) -> None:
             alerts = await price_tracker.check_held_booking_prices()
             app.state.price_tracker_status["last_alert_count"] = len(alerts)
             app.state.price_tracker_status["last_error"] = None
+            # Session memory hygiene: prune expired sessions on tracker cadence
+            try:
+                from agents.planner_agent import _session_memory
+                removed = await asyncio.to_thread(_session_memory.cleanup_expired)
+                if removed:
+                    logger.debug("session_memory_cleanup", extra={"removed_sessions": removed})
+            except Exception:
+                pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:

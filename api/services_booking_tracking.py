@@ -500,7 +500,7 @@ async def booking_track_price(
         )
 
     try:
-        snapshot_id = record_price_snapshot(
+        snapshot_id = await record_price_snapshot(
             origin=req.origin,
             destination=req.destination,
             travel_date=req.depart_date,

@@ -182,3 +182,82 @@ async def test_job_events_stream_contract_is_structured_and_not_nested_sse(monke
     finally:
         await job_queue.stop_worker()
         await worker_task
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_includes_sse_resilience_headers(monkeypatch):
+    _reset_job_queue_state()
+    monkeypatch.setenv("UVICORN_WORKERS", "1")
+    monkeypatch.setenv("ASYNC_JOB_REQUIRE_SINGLE_WORKER", "1")
+    monkeypatch.delenv("ALLOW_UNSAFE_ASYNC_JOBS", raising=False)
+    monkeypatch.setattr(app.state, "async_job_support", None, raising=False)
+
+    async def fake_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("agents.planner_agent.plan_trip", fake_plan_trip)
+
+    worker_task = asyncio.create_task(job_queue.worker_loop())
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", timeout=5.0) as client:
+            r = await client.post("/ask?async_job=true", json={
+                "date": "2026-03-15",
+                "user_query": "test",
+                "trip_type": "Business",
+            })
+            assert r.status_code == 202
+            job_id = r.json()["job_id"]
+
+            async with client.stream("GET", f"/jobs/{job_id}/events") as stream_resp:
+                assert stream_resp.status_code == 200
+                assert stream_resp.headers.get("X-Accel-Buffering") == "no"
+                assert stream_resp.headers.get("Cache-Control") == "no-cache"
+    finally:
+        await job_queue.stop_worker()
+        await worker_task
+
+
+@pytest.mark.asyncio
+async def test_job_events_stream_keepalive_ping_frames(monkeypatch):
+    _reset_job_queue_state()
+    monkeypatch.setenv("UVICORN_WORKERS", "1")
+    monkeypatch.setenv("ASYNC_JOB_REQUIRE_SINGLE_WORKER", "1")
+    monkeypatch.delenv("ALLOW_UNSAFE_ASYNC_JOBS", raising=False)
+    monkeypatch.setattr(app.state, "async_job_support", None, raising=False)
+
+    async def slow_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                await asyncio.sleep(0.15)
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("agents.planner_agent.plan_trip", slow_plan_trip)
+    monkeypatch.setattr("api.app.SSE_KEEPALIVE_INTERVAL", 0.05)
+
+    worker_task = asyncio.create_task(job_queue.worker_loop())
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", timeout=5.0) as client:
+            r = await client.post("/ask?async_job=true", json={
+                "date": "2026-03-15",
+                "user_query": "test",
+                "trip_type": "Business",
+            })
+            assert r.status_code == 202
+            job_id = r.json()["job_id"]
+
+            async with client.stream("GET", f"/jobs/{job_id}/events") as stream_resp:
+                raw_text = ""
+                async for chunk in stream_resp.aiter_text():
+                    raw_text += chunk
+                assert ": ping\n\n" in raw_text
+    finally:
+        await job_queue.stop_worker()
+        await worker_task

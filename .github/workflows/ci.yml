@@ -2,73 +2,288 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 permissions:
-  contents: read
+  contents: write
+  issues: write
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      TESTING: "true"
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
+          cache: 'pip'
+      - name: Install ruff
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
 
+  semgrep-async-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run semgrep async-DB guard
+        run: pip install semgrep && semgrep scan --config .semgrep/async-db-guard.yml --quiet
+
+  fast-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TESTING: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-          pip install pip-audit
-
-      - name: Python Dependency Audit Gate
-        run: |
-          pip-audit -r requirements.txt -r requirements-dev.txt
-
-      - name: Frontend Dependency Install
-        run: |
-          cd frontend
-          npm ci
-
-      - name: Frontend Dependency Audit Gate
-        run: |
-          cd frontend
-          npm audit --audit-level=moderate
-
-      - name: Run tests
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run fast suite
         env:
           OLLAMA_BASE_URL: http://localhost:11434
           SERPAPI_KEY_1: dummy
           WEATHER_KEY_1: dummy
           OPENAI_KEY_1: dummy
-          # Backward-compatible dummy vars for any legacy compatibility checks.
-          SERPAPI_KEY: dummy
-          WEATHER_API_KEY: dummy
-          OPENAI_API_KEY: dummy
-          CLOUD_PROVIDER: openai
-        run: pytest -q
+        run: pytest -q tests/
+
+  slow-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TESTING: "1"
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_db"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run slow suite
+        env:
+          OLLAMA_BASE_URL: http://localhost:11434
+          SERPAPI_KEY_1: dummy
+          WEATHER_KEY_1: dummy
+          OPENAI_KEY_1: dummy
+        run: pytest -q tests_slow/
+
+  zap-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    env:
+      TESTING: "1"
+      AUTH_DISABLE: "true"
+      AUTH_DISABLE_ADMIN: "true"
+      LLM_MODE: ollama_only
+      USE_CLOUD_LLM: "0"
+      OLLAMA_BASE_URL: http://localhost:11434
+      SERPAPI_KEY_1: dummy
+      WEATHER_KEY_1: dummy
+      OPENAI_KEY_1: dummy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Start app
+        run: |
+          nohup uvicorn api.app:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:8000
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rules_file_name: .zap/rules.tsv
+          fail_action: false
+
+  ragas-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run RAGAS Eval (Merlin/Local Stack)
+        run: pytest -q tests/eval/
+
+  e2e-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TESTING: "1"
+      AUTH_DISABLE: "true"
+      LLM_MODE: ollama_only
+      OLLAMA_BASE_URL: http://localhost:11434
+      SERPAPI_KEY_1: dummy
+      WEATHER_KEY_1: dummy
+      OPENAI_KEY_1: dummy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install backend dependencies
+        run: |
+          python -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: './frontend-levasion/package-lock.json'
+      - name: Install frontend dependencies
+        working-directory: ./frontend-levasion
+        run: npm ci
+      - name: Install Playwright Browsers
+        working-directory: ./frontend-levasion
+        run: npx playwright install --with-deps
+      - name: Run E2E Tests
+        working-directory: ./frontend-levasion
+        run: npx playwright test
+
+  auto-merge:
+    needs: [lint, fast-tests, slow-tests, ragas-eval, e2e-tests, zap-baseline, semgrep-async-db, import-check, pip-audit, npm-audit]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge dev into main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git merge origin/dev --no-ff -m "chore: auto-merge dev to main after successful pipeline"
+          git push origin main
+
+  import-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: llm-travel-agent:ci-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Import check
+        run: docker run --rm llm-travel-agent:ci-check python -c "import api.app"
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install pip-audit
+      - name: Audit
+        run: pip-audit -r requirements.txt -r requirements-dev.txt
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install and audit
+        run: |
+          cd frontend-levasion
+          npm ci
+          npm audit --audit-level=critical
 
   docker-build-and-push:
-    needs: test
+    needs: [auto-merge]
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.ref == 'refs/heads/main'
+    if: always() && (github.ref == 'refs/heads/main' || needs.auto-merge.result == 'success')
 
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -16,7 +16,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.hitl_audit import HITLAuditLogger
+from core.hitl_audit import HITLAuditLogger  # noqa: E402 — script-level sys.path.insert before import
 
 
 def main() -> None:

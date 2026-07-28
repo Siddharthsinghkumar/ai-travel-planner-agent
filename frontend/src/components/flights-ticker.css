@@ -95,29 +95,3 @@
   animation-duration: calc(var(--ticker-length, 30s));
 }
 
-html[data-theme="light"] .ticker-wrap {
-  border-color: rgba(31, 58, 96, 0.2);
-  background:
-    linear-gradient(180deg, rgba(86, 124, 203, 0.12), rgba(86, 124, 203, 0.03) 62%),
-    rgba(255, 255, 255, 0.8);
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.52),
-    0 14px 24px -20px rgba(31, 58, 96, 0.42);
-}
-
-html[data-theme="light"] .ticker-wrap::before {
-  background: linear-gradient(90deg, rgba(241, 246, 253, 0.94) 0%, rgba(241, 246, 253, 0.38) 50%, rgba(241, 246, 253, 0) 100%);
-}
-
-html[data-theme="light"] .ticker-wrap::after {
-  background: linear-gradient(270deg, rgba(241, 246, 253, 0.94) 0%, rgba(241, 246, 253, 0.38) 50%, rgba(241, 246, 253, 0) 100%);
-}
-
-html[data-theme="light"] .ticker-item {
-  border-color: rgba(31, 58, 96, 0.24);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(234, 242, 252, 0.84)),
-    rgba(255, 255, 255, 0.9);
-  color: rgba(20, 36, 61, 0.86);
-  box-shadow: 0 10px 20px -20px rgba(44, 76, 128, 0.54);
-}

@@ -26,10 +26,12 @@ class SessionMemory:
         max_tokens: int = 4000,
         summary_ratio: float = 0.3,
         ttl_seconds: float = 1800,
+        max_messages_per_session: int = 50,
     ) -> None:
         self.max_tokens = max(500, max_tokens)
         self.summary_ratio = max(0.1, min(0.8, summary_ratio))
         self.ttl_seconds = max(60, ttl_seconds)
+        self.max_messages_per_session = max(10, max_messages_per_session)
         self._sessions: Dict[str, _Session] = {}
         self._lock = threading.Lock()
 
@@ -40,6 +42,8 @@ class SessionMemory:
                 sess = _Session()
                 self._sessions[session_id] = sess
             sess.messages.append({"role": role, "content": content, "ts": time.time()})
+            if len(sess.messages) > self.max_messages_per_session:
+                sess.messages[: len(sess.messages) - self.max_messages_per_session] = []
             sess.last_accessed = time.monotonic()
 
     def get_context(self, session_id: str) -> Tuple[str, int]:

@@ -1,4 +1,3 @@
-import asyncio
 import pytest
 import core.health as health_module
 from core.health import full_health_check

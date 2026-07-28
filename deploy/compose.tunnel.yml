@@ -1,0 +1,21 @@
+# Cloudflare Tunnel ingress overlay — deploy/compose.tunnel.yml
+# Adds cloudflared as an outbound-tunnel sidecar. No inbound 80/443 on the
+# box — the tunnel is the ONLY public ingress path.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f deploy/compose.prod.yml \
+#                  -f deploy/compose.tunnel.yml up -d
+#
+# Requires: TUNNEL_TOKEN env var (Sid's — PLACEHOLDER only, N-M2.1).
+# See: deploy/tunnel/README.md for named + quick-tunnel fallback paths.
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: llm-tunnel
+    restart: always
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set TUNNEL_TOKEN (Sid's Cloudflare named tunnel token)}
+    depends_on:
+      - caddy

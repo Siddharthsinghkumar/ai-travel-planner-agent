@@ -35,7 +35,8 @@ async def test_lifespan_logs_deprecation_warnings_when_legacy_vars_present(monke
     async with api_app.app.router.lifespan_context(api_app.app):
         assert api_app.app.state.startup_complete is True
 
-    stdout = capsys.readouterr().out
+    captured = capsys.readouterr()
+    stdout = captured.out + captured.err
     messages = [line for line in stdout.splitlines() if "Config deprecation:" in line]
     for var_name in (
         "OPENAI_API_KEY",
@@ -57,7 +58,8 @@ async def test_lifespan_skips_cloud_base_url_deprecation_when_legacy_path_disabl
     async with api_app.app.router.lifespan_context(api_app.app):
         assert api_app.app.state.startup_complete is True
 
-    stdout = capsys.readouterr().out
+    captured = capsys.readouterr()
+    stdout = captured.out + captured.err
     messages = [line for line in stdout.splitlines() if "Config deprecation:" in line]
     assert not any("CLOUD_BASE_URL" in message for message in messages)
 
@@ -78,7 +80,8 @@ async def test_lifespan_has_no_deprecation_warning_when_vars_absent(monkeypatch,
     async with api_app.app.router.lifespan_context(api_app.app):
         assert api_app.app.state.startup_complete is True
 
-    stdout = capsys.readouterr().out
+    captured = capsys.readouterr()
+    stdout = captured.out + captured.err
     assert "Config deprecation:" not in stdout
 
 
@@ -95,7 +98,8 @@ async def test_lifespan_logs_startup_config_summary(monkeypatch, capsys):
     async with api_app.app.router.lifespan_context(api_app.app):
         assert api_app.app.state.startup_complete is True
 
-    stdout = capsys.readouterr().out
+    captured = capsys.readouterr()
+    stdout = captured.out + captured.err
     assert "Startup config summary | llm_mode=cloud_first" in stdout
     assert "llm_mode_source=LLM_MODE" in stdout
     assert "cloud_provider_chain=gemini,openai" in stdout

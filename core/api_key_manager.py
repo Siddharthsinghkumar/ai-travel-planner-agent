@@ -110,6 +110,8 @@ ENV_PATTERNS = {
     "openai": re.compile(r"OPENAI_KEY_(\d+)"),
     "gemini": re.compile(r"GEMINI_KEY_(\d+)"),
     "anthropic": re.compile(r"ANTHROPIC_KEY_(\d+)"),
+    "nim": re.compile(r"NIM_KEY_(\d+)"),
+    "groq": re.compile(r"GROQ_KEY_(\d+)"),
     "weather": re.compile(r"WEATHER_KEY_(\d+)")
 }
 
@@ -490,10 +492,13 @@ class APIKeyManager:
         _ = state
 
     async def _persist_exhaustion(self):
-        """Persist current key state to canonical DB store."""
+        """Persist current key state to canonical DB store (DB write runs off the event loop)."""
+        snapshots = []
         async with self._lock:
             self._sweep_key_invariants_locked()
-            self._persist_all_entries_locked()
+            snapshots = self._snapshot_all_entries_locked()
+        for snap in snapshots:
+            await self._persist_entry_snapshot_to_db(**snap)
 
     def _load_initial_state(self):
         """Load environment key slots and hydrate persisted provider state from DB."""
@@ -1107,7 +1112,8 @@ class APIKeyManager:
                     "serpapi key override binding failed: key must exist with matching name fingerprint"
                 )
 
-        row = self._upsert_provider_state_override(
+        row = await asyncio.to_thread(
+            self._upsert_provider_state_override,
             provider=provider,
             scope_type=scope_type,
             scope_identifier=scope_identifier,
@@ -1181,7 +1187,7 @@ class APIKeyManager:
 
         if matched:
             for key_value_fp, key_name_fp, idx in matched:
-                self._upsert_serpapi_provider_state(
+                await self._upsert_serpapi_provider_state_to_db(
                     key_name_fingerprint=key_name_fp,
                     key_value_fingerprint=key_value_fp,
                     is_exhausted=True,
@@ -1203,31 +1209,46 @@ class APIKeyManager:
                     },
                 )
         else:
-            # Best effort for cases where slot is not currently loaded in-memory.
-            with self._provider_state_session() as session:
-                if session is not None:
-                    try:
-                        from agents.database import ProviderKeyState
-                        row = (
-                            session.query(ProviderKeyState)
-                            .filter(
-                                ProviderKeyState.provider == "serpapi",
-                                ProviderKeyState.key_name_fingerprint == str(key_name_fingerprint or ""),
-                            )
-                            .first()
-                        )
-                        if row is not None and str(row.key_value_fingerprint or "") == str(key_value_fingerprint or ""):
-                            row.is_exhausted = True
-                            row.expected_reset_basis = "operator_known_reset_datetime"
-                            row.expected_reset_at = override_until
-                            row.last_checked_at = _now()
-                            row.last_reason = "manual_override_known_reset"
-                            row.last_error = (note or "manual_override_known_reset")[:1000]
-                            row.failure_classification = "manual_override"
-                            session.commit()
-                    except Exception:
-                        session.rollback()
-                        logger.exception("serpapi_known_reset_override_db_patch_failed")
+            await asyncio.to_thread(
+                self._apply_serpapi_known_reset_override_fallback_sync,
+                key_name_fingerprint=str(key_name_fingerprint or ""),
+                key_value_fingerprint=str(key_value_fingerprint or ""),
+                override_until=override_until,
+                note=note,
+            )
+
+    def _apply_serpapi_known_reset_override_fallback_sync(
+        self,
+        key_name_fingerprint: str,
+        key_value_fingerprint: str,
+        override_until: datetime,
+        note: Optional[str] = None,
+    ) -> None:
+        with self._provider_state_session() as session:
+            if session is None:
+                return
+            try:
+                from agents.database import ProviderKeyState
+                row = (
+                    session.query(ProviderKeyState)
+                    .filter(
+                        ProviderKeyState.provider == "serpapi",
+                        ProviderKeyState.key_name_fingerprint == key_name_fingerprint,
+                    )
+                    .first()
+                )
+                if row is not None and str(row.key_value_fingerprint or "") == key_value_fingerprint:
+                    row.is_exhausted = True
+                    row.expected_reset_basis = "operator_known_reset_datetime"
+                    row.expected_reset_at = override_until
+                    row.last_checked_at = _now()
+                    row.last_reason = "manual_override_known_reset"
+                    row.last_error = (note or "manual_override_known_reset")[:1000]
+                    row.failure_classification = "manual_override"
+                    session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("serpapi_known_reset_override_db_patch_failed")
 
     async def list_provider_state_overrides(
         self,
@@ -1235,13 +1256,16 @@ class APIKeyManager:
         provider: Optional[str] = None,
         include_inactive: bool = False,
     ) -> List[Dict[str, Any]]:
-        return self._list_provider_state_overrides(
+        return await asyncio.to_thread(
+            self._list_provider_state_overrides,
             provider=provider,
             include_inactive=include_inactive,
         )
 
     async def disable_provider_state_override(self, override_id: int) -> bool:
-        return self._disable_provider_state_override(override_id)
+        return await asyncio.to_thread(
+            self._disable_provider_state_override, override_id
+        )
 
     async def key_scope_identifier(self, provider: str, index: int) -> Optional[str]:
         normalized_provider = str(provider or "").strip().lower()
@@ -1359,6 +1383,43 @@ class APIKeyManager:
             failure_classification=failure_classification,
         )
 
+    async def _upsert_serpapi_provider_state_to_db(
+        self,
+        *,
+        key_name_fingerprint: str,
+        key_value_fingerprint: str,
+        is_exhausted: bool,
+        exhausted_until: Optional[datetime] = None,
+        retry_after: Optional[datetime] = None,
+        searches_left: Optional[int] = None,
+        last_checked_at: Optional[datetime] = None,
+        expected_reset_basis: Optional[str] = None,
+        expected_reset_at: Optional[datetime] = None,
+        last_error: Optional[str] = None,
+        last_reason: Optional[str] = None,
+        failure_classification: Optional[str] = None,
+    ) -> None:
+        exhausted_dt = exhausted_until if isinstance(exhausted_until, datetime) else None
+        if exhausted_dt is None and is_exhausted and isinstance(expected_reset_at, datetime):
+            exhausted_dt = expected_reset_at
+        retry_dt = retry_after if isinstance(retry_after, datetime) else exhausted_dt
+        await asyncio.to_thread(
+            self._upsert_provider_key_state,
+            provider="serpapi",
+            key_name_fingerprint=key_name_fingerprint,
+            key_value_fingerprint=key_value_fingerprint,
+            is_exhausted=bool(is_exhausted),
+            exhausted_until=exhausted_dt,
+            retry_after=retry_dt,
+            searches_left=searches_left,
+            last_checked_at=last_checked_at,
+            expected_reset_basis=expected_reset_basis,
+            expected_reset_at=expected_reset_at,
+            last_error=last_error,
+            last_reason=last_reason,
+            failure_classification=failure_classification,
+        )
+
     def _load_provider_state_map(self, provider: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, Any]]]:
         normalized_provider = str(provider or "").strip().lower() or None
         with self._provider_state_session() as session:
@@ -1433,9 +1494,10 @@ class APIKeyManager:
             return monthly_target, "default_key_monthly_reset_day"
         return self._serpapi_weekly_retry_datetime(), "weekly_unknown_reset_fallback"
 
-    def _clear_rotated_serpapi_state(self, key_name_fingerprint: str, key_value_fingerprint: str) -> None:
+    async def _clear_rotated_serpapi_state(self, key_name_fingerprint: str, key_value_fingerprint: str) -> None:
         # Rotation-safe: preserve slot identity but reset stale exhaustion metadata.
-        self._upsert_provider_key_state(
+        await asyncio.to_thread(
+            self._upsert_provider_key_state,
             provider="serpapi",
             key_name_fingerprint=key_name_fingerprint,
             key_value_fingerprint=key_value_fingerprint,
@@ -1485,13 +1547,13 @@ class APIKeyManager:
             return _first_of_next_month(_now())
         return None
 
-    def _persist_entry_state_locked(self, service: str, idx: int, ke: KeyEntry, *, checked_now: bool = False) -> None:
+    def _snapshot_entry_state_locked(self, service: str, idx: int, ke: KeyEntry, *, checked_now: bool = False) -> Optional[Dict[str, Any]]:
         provider = str(service or "").strip().lower()
         if not provider:
-            return
+            return None
         key_name_fp = str(ke.name_fingerprint or "")
         if not key_name_fp:
-            return
+            return None
         now_ts = _now_ts()
         exhausted_until_ts = _future_ts_or_none(ke.exhausted_until, now_ts)
         retry_after_ts = _future_ts_or_none(ke.retry_after, now_ts)
@@ -1509,9 +1571,8 @@ class APIKeyManager:
                 expected_reset_dt = datetime.fromtimestamp(float(ke.expected_reset_at), tz=UTC)
             except Exception:
                 expected_reset_dt = None
-        # in-memory last_used is monotonic; persist wall-clock "now" when saving usage-side state.
         last_used_dt = _now() if not checked_now else None
-        self._upsert_provider_key_state(
+        return dict(
             provider=provider,
             key_name_fingerprint=key_name_fp,
             key_value_fingerprint=str(ke.fingerprint or ""),
@@ -1529,15 +1590,48 @@ class APIKeyManager:
             state_meta={"default_reset_day": ke.default_reset_day} if provider == "serpapi" and ke.default_reset_day else None,
         )
 
-    def _persist_all_entries_locked(self) -> None:
+    async def _persist_entry_snapshot_to_db(self, **kwargs: Any) -> None:
+        if not kwargs.get("provider") or not kwargs.get("key_name_fingerprint"):
+            return
+        await asyncio.to_thread(
+            self._upsert_provider_key_state,
+            provider=kwargs["provider"],
+            key_name_fingerprint=kwargs["key_name_fingerprint"],
+            key_value_fingerprint=kwargs.get("key_value_fingerprint", ""),
+            is_exhausted=kwargs.get("is_exhausted", False),
+            exhausted_until=kwargs.get("exhausted_until"),
+            retry_after=kwargs.get("retry_after"),
+            searches_left=kwargs.get("searches_left"),
+            last_checked_at=kwargs.get("last_checked_at"),
+            last_used_at=kwargs.get("last_used_at"),
+            expected_reset_basis=kwargs.get("expected_reset_basis"),
+            expected_reset_at=kwargs.get("expected_reset_at"),
+            last_error=kwargs.get("last_error"),
+            last_reason=kwargs.get("last_reason"),
+            failure_classification=kwargs.get("failure_classification"),
+            state_meta=kwargs.get("state_meta"),
+        )
+
+    def _snapshot_all_entries_locked(self) -> List[Dict[str, Any]]:
+        snapshots: List[Dict[str, Any]] = []
         for service, entries in self._keys.items():
             for idx, ke in enumerate(entries):
-                self._persist_entry_state_locked(service, idx, ke, checked_now=False)
+                snap = self._snapshot_entry_state_locked(service, idx, ke, checked_now=False)
+                if snap is not None:
+                    snapshots.append(snap)
+        return snapshots
 
-    def _hydrate_all_provider_state_from_db_sync(self) -> None:
+    def _persist_entry_state_locked(self, service: str, idx: int, ke: KeyEntry, *, checked_now: bool = False) -> Optional[Dict[str, Any]]:
+        return self._snapshot_entry_state_locked(service, idx, ke, checked_now=checked_now)
+
+    def _persist_all_entries_locked(self) -> List[Dict[str, Any]]:
+        return self._snapshot_all_entries_locked()
+
+    def _hydrate_all_provider_state_from_db_sync(self) -> List[Tuple[str, str]]:
         rows_by_provider = self._load_provider_state_map()
+        cleared_rotations: List[Tuple[str, str]] = []
         if not rows_by_provider:
-            return
+            return cleared_rotations
         now_ts = _now_ts()
         for service, entries in self._keys.items():
             provider_rows = rows_by_provider.get(str(service or "").strip().lower(), {})
@@ -1561,7 +1655,7 @@ class APIKeyManager:
                     ke.failure_classification = "rotation"
                     if service == "serpapi":
                         self._serpapi_force_reconcile_name_fps.add(name_fp)
-                        self._clear_rotated_serpapi_state(name_fp, ke.fingerprint)
+                        cleared_rotations.append((name_fp, ke.fingerprint))
                     continue
 
                 exhausted_dt = row.get("exhausted_until")
@@ -1612,10 +1706,14 @@ class APIKeyManager:
                         ke.last_exhausted_reason_class = _normalize_reason_class(str(fc))
 
         self._sweep_key_invariants_locked()
+        return cleared_rotations
 
     async def _hydrate_all_provider_state_from_db(self) -> None:
+        cleared_rotations: List[Tuple[str, str]] = []
         async with self._lock:
-            self._hydrate_all_provider_state_from_db_sync()
+            cleared_rotations = self._hydrate_all_provider_state_from_db_sync()
+        for name_fp, value_fp in cleared_rotations:
+            await self._clear_rotated_serpapi_state(name_fp, value_fp)
 
     async def _hydrate_serpapi_state_from_db(self) -> None:
         await self._hydrate_all_provider_state_from_db()
@@ -1711,18 +1809,17 @@ class APIKeyManager:
             try:
                 if asyncio.iscoroutinefunction(listener):
                     # run async listener in its own task and catch/log exceptions
-                    async def _run_async_listener(l=listener):
+                    async def _run_async_listener(fn=listener):  # noqa: E741 — 'fn' captures bound listener
                         try:
-                            await l(event_name, payload)
+                            await fn(event_name, payload)
                         except Exception:
                             logger.exception("Async key event listener raised an exception",
                                              extra={"event": event_name})
                     asyncio.create_task(_run_async_listener())
                 else:
-                    # wrap sync listener in a callable that logs exceptions, then run in executor
-                    def _run_sync_listener(l=listener):
+                    def _run_sync_listener(fn=listener):  # noqa: E741 — 'fn' captures bound listener
                         try:
-                            l(event_name, payload)
+                            fn(event_name, payload)
                         except Exception:
                             logger.exception("Sync key event listener raised an exception",
                                              extra={"event": event_name})
@@ -1933,8 +2030,9 @@ class APIKeyManager:
             self._keys = new_keys
             state_sanitized = self._sweep_key_invariants_locked()
             changed = bool(fingerprint_changed or state_sanitized)
+            reload_snapshots: List[Dict[str, Any]] = []
             if changed:
-                self._persist_all_entries_locked()
+                reload_snapshots = self._persist_all_entries_locked()
 
             for name_fp, old_value_fp in old_serpapi_by_name.items():
                 new_value_fp = new_serpapi_by_name.get(name_fp)
@@ -1943,6 +2041,10 @@ class APIKeyManager:
                 if old_value_fp != new_value_fp:
                     serpapi_rotated.append((name_fp, new_value_fp))
                     self._serpapi_force_reconcile_name_fps.add(name_fp)
+
+        # Outside lock: persist DB writes off the event loop
+        for snap in reload_snapshots:
+            await self._persist_entry_snapshot_to_db(**snap)
 
         # Outside lock: notify if changed
         if changed:
@@ -1960,7 +2062,7 @@ class APIKeyManager:
                 logger.debug("Key state normalized without keyset fingerprint changes")
 
         for name_fp, new_value_fp in serpapi_rotated:
-            self._clear_rotated_serpapi_state(name_fp, new_value_fp)
+            await self._clear_rotated_serpapi_state(name_fp, new_value_fp)
 
         return bool(fingerprint_changed)
 
@@ -2091,7 +2193,11 @@ class APIKeyManager:
                         "service": service,
                         "index": idx,
                     }
-                self._persist_entry_state_locked(service, idx, ke, checked_now=False)
+                release_snapshot = self._persist_entry_state_locked(service, idx, ke, checked_now=False)
+
+            # DB write outside all held locks
+            if release_snapshot is not None:
+                await self._persist_entry_snapshot_to_db(**release_snapshot)
 
             if pending_exhaust_event is not None:
                 asyncio.create_task(self._notify_listeners("key_exhausted", pending_exhaust_event))
@@ -2129,7 +2235,7 @@ class APIKeyManager:
            after all users release the key.
            reset_at can be a datetime (aware) or a float epoch timestamp.
            until is an alias for reset_at used by airline_api.
-           The state is persisted when exhaustion actually takes effect.
+           The state is persisted (off the event loop) when exhaustion actually takes effect.
 
            Returns True if the exhaustion was newly applied or was a meaningful state change.
            Returns False if the key was already exhausted with the same reason_class within
@@ -2141,6 +2247,8 @@ class APIKeyManager:
 
         now_ts = _now_ts()
         reason_class = _normalize_reason_class(reason)
+        mark_snapshot: Optional[Dict[str, Any]] = None
+        result: bool = True
 
         async with self._lock:
             try:
@@ -2178,123 +2286,129 @@ class APIKeyManager:
             existing_until = _future_ts_or_none(ke.exhausted_until, now_ts)
             if existing_until is not None and reason_class == ke.last_exhausted_reason_class:
                 ke.last_checked_at = now_ts
-                self._persist_entry_state_locked(service, idx, ke, checked_now=True)
-                return False
+                mark_snapshot = self._persist_entry_state_locked(service, idx, ke, checked_now=True)
+                result = False
 
-            # Cap exhaustion horizon: never extend beyond 2x the requested TTL for the same reason_class.
-            if existing_until is not None:
-                requested_ttl = until_ts - now_ts
-                max_allowed = existing_until + requested_ttl
-                if until_ts > max_allowed:
-                    until_ts = max_allowed
+            if result:
+                # Cap exhaustion horizon: never extend beyond 2x the requested TTL for the same reason_class.
+                if existing_until is not None:
+                    requested_ttl = until_ts - now_ts
+                    max_allowed = existing_until + requested_ttl
+                    if until_ts > max_allowed:
+                        until_ts = max_allowed
 
-            merged_until = _merge_exhaustion_until(ke.exhausted_until, until_ts, now_ts)
-            pending_merged_until = _merge_exhaustion_until(ke._pending_exhaust_until, until_ts, now_ts)
-            requested_until_iso = datetime.fromtimestamp(until_ts, tz=UTC).isoformat()
-            ke.last_exhausted_reason = reason
-            ke.last_exhausted_reason_class = reason_class
-            ke.last_exhausted_at = now_ts
-            ke.last_provider_reason = reason
-            ke.last_provider_error = reason
-            if service == "serpapi":
-                ke.failure_classification = self._classify_serpapi_failure(reason, reason_class)
-            else:
-                ke.failure_classification = reason_class or "unknown"
-            ke.last_checked_at = now_ts
+                merged_until = _merge_exhaustion_until(ke.exhausted_until, until_ts, now_ts)
+                pending_merged_until = _merge_exhaustion_until(ke._pending_exhaust_until, until_ts, now_ts)
+                requested_until_iso = datetime.fromtimestamp(until_ts, tz=UTC).isoformat()
+                ke.last_exhausted_reason = reason
+                ke.last_exhausted_reason_class = reason_class
+                ke.last_exhausted_at = now_ts
+                ke.last_provider_reason = reason
+                ke.last_provider_error = reason
+                if service == "serpapi":
+                    ke.failure_classification = self._classify_serpapi_failure(reason, reason_class)
+                else:
+                    ke.failure_classification = reason_class or "unknown"
+                ke.last_checked_at = now_ts
 
-            dedup_key = self._exhaustion_dedup_key(service, idx, reason_class)
-            should_log = self._should_log_exhaustion(dedup_key, now_ts)
-            sanitized_reason = self._sanitize_reason_for_log(reason)
-            was_already_exhausted = existing_until is not None
+                dedup_key = self._exhaustion_dedup_key(service, idx, reason_class)
+                should_log = self._should_log_exhaustion(dedup_key, now_ts)
+                sanitized_reason = self._sanitize_reason_for_log(reason)
+                was_already_exhausted = existing_until is not None
 
-            if ke.in_use > 0:
-                ke._pending_exhaust = pending_merged_until is not None
-                ke._pending_exhaust_until = pending_merged_until
-                app_metrics.record_key_state_event(
-                    service=service,
-                    event="exhausted_pending",
-                    reason_class=reason_class,
-                )
-                pending_until_iso = (
-                    datetime.fromtimestamp(pending_merged_until, tz=UTC).isoformat()
-                    if pending_merged_until is not None
-                    else requested_until_iso
-                )
-                if should_log:
-                    log_fn = logger.warning if reason_class == "auth" else logger.info
-                    log_fn(
-                        "Key exhaustion deferred (pending release)",
-                        extra={
-                            "service": service,
-                            "index": idx,
-                            "until": pending_until_iso,
-                            "reason_class": reason_class,
-                            "pending": True,
-                        },
+                if ke.in_use > 0:
+                    ke._pending_exhaust = pending_merged_until is not None
+                    ke._pending_exhaust_until = pending_merged_until
+                    app_metrics.record_key_state_event(
+                        service=service,
+                        event="exhausted_pending",
+                        reason_class=reason_class,
                     )
-                asyncio.create_task(self._notify_listeners("key_exhausted", {
-                    "service": service,
-                    "index": idx,
-                    "reason": sanitized_reason,
-                    "reason_class": reason_class,
-                    "until": pending_until_iso,
-                    "pending": True
-                }))
-            else:
-                ke.exhausted_until = merged_until
-                ke.retry_after = merged_until
-                app_metrics.record_key_state_event(
-                    service=service,
-                    event="exhausted",
-                    reason_class=reason_class,
-                )
-                effective_until_iso = (
-                    datetime.fromtimestamp(ke.exhausted_until, tz=UTC).isoformat()
-                    if ke.exhausted_until is not None
-                    else requested_until_iso
-                )
-
-                if should_log:
-                    if reason_class == "auth":
-                        log_fn = logger.warning
-                    elif was_already_exhausted:
-                        log_fn = logger.debug
-                    else:
-                        log_fn = logger.info
-                    log_fn(
-                        "Key exhaustion applied",
-                        extra={
-                            "service": service,
-                            "index": idx,
-                            "until": effective_until_iso,
-                            "reason_class": reason_class,
-                            "was_already_exhausted": was_already_exhausted,
-                        },
+                    pending_until_iso = (
+                        datetime.fromtimestamp(pending_merged_until, tz=UTC).isoformat()
+                        if pending_merged_until is not None
+                        else requested_until_iso
                     )
-                asyncio.create_task(self._notify_listeners("key_exhausted", {
-                    "service": service,
-                    "index": idx,
-                    "reason": sanitized_reason,
-                    "reason_class": reason_class,
-                    "until": effective_until_iso,
-                    "pending": False
-                }))
-            if service == "serpapi" and ke.expected_reset_at is None:
-                ke.expected_reset_basis = self._serpapi_expected_reset_basis(
-                    reason=reason,
-                    reason_class=reason_class,
-                    has_reset_at=bool(until_ts),
-                    from_account="account_reconcile" in str(reason or "").lower(),
-                )
-                ke.expected_reset_at = float(until_ts)
+                    if should_log:
+                        log_fn = logger.warning if reason_class == "auth" else logger.info
+                        log_fn(
+                            "Key exhaustion deferred (pending release)",
+                            extra={
+                                "service": service,
+                                "index": idx,
+                                "until": pending_until_iso,
+                                "reason_class": reason_class,
+                                "pending": True,
+                            },
+                        )
+                    asyncio.create_task(self._notify_listeners("key_exhausted", {
+                        "service": service,
+                        "index": idx,
+                        "reason": sanitized_reason,
+                        "reason_class": reason_class,
+                        "until": pending_until_iso,
+                        "pending": True
+                    }))
+                else:
+                    ke.exhausted_until = merged_until
+                    ke.retry_after = merged_until
+                    app_metrics.record_key_state_event(
+                        service=service,
+                        event="exhausted",
+                        reason_class=reason_class,
+                    )
+                    effective_until_iso = (
+                        datetime.fromtimestamp(ke.exhausted_until, tz=UTC).isoformat()
+                        if ke.exhausted_until is not None
+                        else requested_until_iso
+                    )
 
-            self._sweep_key_invariants_locked()
-            self._persist_entry_state_locked(service, idx, ke, checked_now=True)
-            return True
+                    if should_log:
+                        if reason_class == "auth":
+                            log_fn = logger.warning
+                        elif was_already_exhausted:
+                            log_fn = logger.debug
+                        else:
+                            log_fn = logger.info
+                        log_fn(
+                            "Key exhaustion applied",
+                            extra={
+                                "service": service,
+                                "index": idx,
+                                "until": effective_until_iso,
+                                "reason_class": reason_class,
+                                "was_already_exhausted": was_already_exhausted,
+                            },
+                        )
+                    asyncio.create_task(self._notify_listeners("key_exhausted", {
+                        "service": service,
+                        "index": idx,
+                        "reason": sanitized_reason,
+                        "reason_class": reason_class,
+                        "until": effective_until_iso,
+                        "pending": False
+                    }))
+                if service == "serpapi" and ke.expected_reset_at is None:
+                    ke.expected_reset_basis = self._serpapi_expected_reset_basis(
+                        reason=reason,
+                        reason_class=reason_class,
+                        has_reset_at=bool(until_ts),
+                        from_account="account_reconcile" in str(reason or "").lower(),
+                    )
+                    ke.expected_reset_at = float(until_ts)
+
+                self._sweep_key_invariants_locked()
+                mark_snapshot = self._persist_entry_state_locked(service, idx, ke, checked_now=True)
+
+        # DB write outside held lock
+        if mark_snapshot is not None:
+            await self._persist_entry_snapshot_to_db(**mark_snapshot)
+        return result
 
     # ---------- clear exhaustion / pending clear ----------
     async def clear_exhausted(self, service: str, idx: int):
         """Manually re-enable a key by clearing its exhaustion flag (and any pending flag)."""
+        clear_snapshot: Optional[Dict[str, Any]] = None
         async with self._lock:
             try:
                 ke = self._keys[service][idx]
@@ -2321,10 +2435,12 @@ class APIKeyManager:
                         reason_class=ke.last_exhausted_reason_class or "unknown",
                     )
                     self._sweep_key_invariants_locked()
-                    self._persist_entry_state_locked(service, idx, ke, checked_now=True)
+                    clear_snapshot = self._persist_entry_state_locked(service, idx, ke, checked_now=True)
                     logger.info("Key cleared from exhausted state", extra={"service": service, "index": idx})
             except (KeyError, IndexError):
                 pass
+        if clear_snapshot is not None:
+            await self._persist_entry_snapshot_to_db(**clear_snapshot)
 
     async def mark_key_pending_clear(self, service: str, idx: int):
         """Mark a key for later cleanup (e.g., remove from rotation). When the key is no longer in use,
@@ -2477,7 +2593,7 @@ class APIKeyManager:
                 errors += 1
                 error_text = str(exc)
                 failure_classification = self._classify_serpapi_failure(error_text, "transient")
-                self._upsert_serpapi_provider_state(
+                await self._upsert_serpapi_provider_state_to_db(
                     key_name_fingerprint=key_name_fp,
                     key_value_fingerprint=key_value_fp,
                     is_exhausted=was_exhausted,
@@ -2508,7 +2624,7 @@ class APIKeyManager:
                     await self.mark_exhausted("serpapi", idx, reason=reason)
                     exhausted += 1
                     was_exhausted = True
-                self._upsert_serpapi_provider_state(
+                await self._upsert_serpapi_provider_state_to_db(
                     key_name_fingerprint=key_name_fp,
                     key_value_fingerprint=key_value_fp,
                     is_exhausted=was_exhausted,
@@ -2526,7 +2642,7 @@ class APIKeyManager:
                 data = response.json()
             except Exception as exc:
                 errors += 1
-                self._upsert_serpapi_provider_state(
+                await self._upsert_serpapi_provider_state_to_db(
                     key_name_fingerprint=key_name_fp,
                     key_value_fingerprint=key_value_fp,
                     is_exhausted=was_exhausted,
@@ -2626,7 +2742,7 @@ class APIKeyManager:
                         else "ok"
                     )
 
-            self._upsert_serpapi_provider_state(
+            await self._upsert_serpapi_provider_state_to_db(
                 key_name_fingerprint=key_name_fp,
                 key_value_fingerprint=key_value_fp,
                 is_exhausted=is_exhausted_now,
@@ -2789,13 +2905,16 @@ class APIKeyManager:
         Updates last_used timestamp. This is a lightweight tracking call —
         it does not increment in_use (that is handled by reserve_key).
         """
+        snap: Optional[Dict[str, Any]] = None
         async with self._lock:
             try:
                 ke = self._keys[service][idx]
                 ke.last_used = time.monotonic()
-                self._persist_entry_state_locked(service, idx, ke, checked_now=False)
+                snap = self._persist_entry_state_locked(service, idx, ke, checked_now=False)
             except (KeyError, IndexError):
                 logger.debug("record_usage: unknown service/index %s:%s", service, idx)
+        if snap is not None:
+            await self._persist_entry_snapshot_to_db(**snap)
 
 # Global singleton instance
 key_manager = APIKeyManager()

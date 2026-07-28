@@ -32,7 +32,7 @@ def disable_real_llm(monkeypatch):
 
 
 # conftest.py (append or merge into your existing file)
-import asyncio
+import asyncio  # noqa: E402 — conftest imports after existing header
 
 async def _fake_stream_generator():
     yield "Searching flights...\n"

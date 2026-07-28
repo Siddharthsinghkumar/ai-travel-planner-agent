@@ -3382,7 +3382,7 @@ async def build_booking_handoff_url(
 # Core booking CRUD
 # ----------------------------------------------------------------------
 
-from agents.high_impact import high_impact
+from agents.high_impact import high_impact  # noqa: E402 — deferred import to break circular dependency
 
 @high_impact("booking")
 async def hold_booking(

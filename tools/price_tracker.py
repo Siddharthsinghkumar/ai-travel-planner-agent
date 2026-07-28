@@ -43,11 +43,6 @@ from agents.database import Base, SessionLocal, get_engine
 from tools import price_tracker_tool_gateway as tracker_gateway
 
 # Import from canonical gateway for direct function calls
-from tools.tool_gateway import (
-    search_flights,
-    search_with_booking_token,
-    build_booking_handoff_url,
-)
 
 # Use wrappers that delegate to tracker_gateway at call time for test compatibility
 # Tests patch tracker_gateway module attributes, we need to call through that reference
@@ -525,7 +520,7 @@ async def record_flight_data(
     # Also persist cheapest price to DB for historical tracking
     if cheapest_price != float("inf"):
         try:
-            record_price_snapshot(
+            await record_price_snapshot(
                 origin=origin,
                 destination=destination,
                 travel_date=travel_date,
@@ -552,7 +547,7 @@ def get_cached_flight_data(
 # 3. Price Snapshot recording
 # ----------------------------------------------------------------------
 
-def record_price_snapshot(
+def _record_price_snapshot_sync(
     *,
     origin: str,
     destination: str,
@@ -560,18 +555,7 @@ def record_price_snapshot(
     price_inr: float,
     insights: Optional[PriceInsights] = None,
 ) -> int:
-    """
-    Persist a price observation to the database.
-
-    Args:
-        origin, destination: IATA codes.
-        travel_date: YYYY-MM-DD.
-        price_inr: Cheapest price found in this search.
-        insights: Parsed PriceInsights (may be None if SerpAPI didn't return the block).
-
-    Returns:
-        int: The new PriceSnapshot row id.
-    """
+    """Internal sync implementation — do not call from async contexts."""
     db = SessionLocal()
     try:
         snap = PriceSnapshot(
@@ -600,6 +584,24 @@ def record_price_snapshot(
         return snap.id
     finally:
         db.close()
+
+
+async def record_price_snapshot(
+    *,
+    origin: str,
+    destination: str,
+    travel_date: str,
+    price_inr: float,
+    insights: Optional[PriceInsights] = None,
+) -> int:
+    return await asyncio.to_thread(
+        _record_price_snapshot_sync,
+        origin=origin,
+        destination=destination,
+        travel_date=travel_date,
+        price_inr=price_inr,
+        insights=insights,
+    )
 
 
 def get_price_history(
@@ -717,7 +719,6 @@ async def check_held_booking_prices() -> list[dict]:
         return []
 
     alerts_fired = []
-    now = time.time()
 
     for booking in held:
         context = tracking_context_from_booking(booking)
@@ -726,7 +727,6 @@ async def check_held_booking_prices() -> list[dict]:
         destination = context.destination
         travel_date = context.travel_date
         held_price = context.held_price
-        booking_token = context.booking_token
 
         missing_fields = []
         if not origin:
@@ -793,7 +793,7 @@ async def check_held_booking_prices() -> list[dict]:
 
         # Record snapshot for this price observation
         try:
-            record_price_snapshot(
+            await record_price_snapshot(
                 origin=origin,
                 destination=destination,
                 travel_date=travel_date,

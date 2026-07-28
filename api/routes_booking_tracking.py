@@ -149,7 +149,6 @@ def _booking_handoff_capability_payload(
 ) -> Dict[str, Any]:
     principal = auth_diagnostics.principal
     token_present = bool(auth_diagnostics.token_present)
-    token_valid = bool(auth_diagnostics.token_valid)
     auth_rejected = bool(auth_diagnostics.auth_rejected)
     auth_error = str(auth_diagnostics.auth_error or "").strip() or None
     loopback_request = _request_is_loopback(request)
@@ -391,6 +390,7 @@ async def _run_with_idempotency(
 
 
 class BookingHoldRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     flight: Dict[str, Any] = Field(default_factory=dict)
     origin: str = Field(min_length=3, max_length=8)
     destination: str = Field(min_length=3, max_length=8)
@@ -432,6 +432,7 @@ class BookingHoldRequest(BaseModel):
 
 
 class BookingCancelRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     booking_id: int
 
     @field_validator("booking_id")
@@ -447,6 +448,7 @@ class BookingTrackRequest(BookingHoldRequest):
 
 
 class BookingHandoffResolveRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     flight: Dict[str, Any] = Field(default_factory=dict)
     origin: str = Field(min_length=3, max_length=8)
     destination: str = Field(min_length=3, max_length=8)

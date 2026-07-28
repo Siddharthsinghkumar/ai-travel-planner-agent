@@ -1,0 +1,54 @@
+# Production compose overlay — deploy/compose.prod.yml
+# Overrides docker-compose.yml for single-node production.
+# Usage: docker compose -f docker-compose.yml -f deploy/compose.prod.yml up -d
+#
+# Placeholders (⛔ Sid replaces before deploy):
+#   TRAVEL_DOMAIN          = public domain
+#   TLS_ACME_EMAIL         = ops email
+#   GRAFANA_DOMAIN         = grafana subdomain
+#   GRAFANA_BASIC_AUTH     = caddy hash-password output
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: llm-travel-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TRAVEL_DOMAIN: ${TRAVEL_DOMAIN:?Set TRAVEL_DOMAIN}
+      TLS_ACME_EMAIL: ${TLS_ACME_EMAIL:?Set TLS_ACME_EMAIL}
+      GRAFANA_DOMAIN: ${GRAFANA_DOMAIN:?Set GRAFANA_DOMAIN}
+      GRAFANA_BASIC_AUTH: ${GRAFANA_BASIC_AUTH:?Set GRAFANA_BASIC_AUTH}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  api:
+    restart: always
+    ports:
+      - "127.0.0.1:8000:8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  postgres:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:

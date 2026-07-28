@@ -10,4 +10,4 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets:
-          - api:8000
+          - api:9091

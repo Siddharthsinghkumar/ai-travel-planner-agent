@@ -2,11 +2,15 @@
 import asyncio
 import pytest
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from agents.planner_agent import parse_intent, filter_flights, Flight, _ensure_route_grounding
 import agents.planner_agent as planner_agent
 from agents.llm_router import AllBackendsFailed
 from core.iata_resolver import is_iata_token
+
+
+def _future(days=60):
+    return (date.today() + timedelta(days=days)).isoformat()
 
 
 @pytest.mark.asyncio
@@ -618,7 +622,7 @@ async def test_plan_trip_internal_prefers_deterministic_route_recovery_before_ll
         return planner_agent.ParsedIntent(
             origin_iata=None,
             destination_iata=None,
-            date="2026-06-20",
+            date=_future(60),
             trip_type="Business",
         )
 
@@ -690,7 +694,7 @@ async def test_plan_trip_internal_explicit_fastest_selects_shortest_duration(mon
         return {"condition": "Clear", "temperature_c": 29, "forecast_date": date, "location": location}
 
     result = await planner_agent._plan_trip_internal(
-        user_query="BOM to BLR with least travel time on 2026-05-15",
+        user_query=f"BOM to BLR with least travel time on {_future(60)}",
         trip_type="Business",
         skip_llm=True,
         flight_tool=fake_flight_tool,
@@ -734,7 +738,7 @@ async def test_plan_trip_internal_explicit_business_request_is_truthful_when_una
         return {"condition": "Sunny", "temperature_c": 32, "forecast_date": date, "location": location}
 
     result = await planner_agent._plan_trip_internal(
-        user_query="Need business class flight from MAA to DEL on 2026-05-15",
+        user_query=f"Need business class flight from MAA to DEL on {_future(60)}",
         trip_type="Business",
         skip_llm=True,
         flight_tool=fake_flight_tool,
@@ -770,7 +774,7 @@ async def test_plan_trip_internal_invalid_route_still_surfaces_handoff_contract(
         return planner_agent.ParsedIntent(
             origin_iata=None,
             destination_iata=None,
-            date="2026-06-20",
+            date=_future(60),
             trip_type="Business",
         )
 
@@ -821,7 +825,7 @@ async def test_plan_trip_internal_forwards_deep_search_and_bounded_breadth(monke
 
     result = await planner_agent._plan_trip_internal(
         user_query=(
-            "Round-trip from DEL to BOM on 2026-06-20 returning on 2026-06-24 "
+            f"Round-trip from DEL to BOM on {_future(60)} returning on {_future(70)} "
             "absolute cheapest possible"
         ),
         trip_type="Business",
@@ -850,7 +854,7 @@ async def test_plan_trip_internal_llm_correction_does_not_overwrite_resolved_sid
         return planner_agent.ParsedIntent(
             origin_iata="DEL",
             destination_iata=None,
-            date="2026-06-20",
+            date=_future(60),
             trip_type="Business",
         )
 
@@ -902,7 +906,7 @@ async def test_plan_trip_internal_llm_correction_does_not_overwrite_resolved_sid
 @pytest.mark.asyncio
 async def test_plan_trip_internal_natural_language_round_trip_phrase_populates_contract(monkeypatch):
     query = (
-        "Round-trip Delhi to Mumbai, leave 2026-05-15 and return 2026-05-17, "
+        f"Round-trip Delhi to Mumbai, leave {_future(60)} and return {_future(70)}, "
         "prioritize cheapest acceptable option."
     )
 
@@ -942,7 +946,7 @@ async def test_plan_trip_internal_natural_language_round_trip_phrase_populates_c
     )
 
     assert isinstance(result, planner_agent.PlanResult)
-    assert result.search_date == "2026-05-15"
+    assert result.search_date == _future(60)
     assert result.return_trip is not None
     assert result.debug_info["route_labels"]["origin_iata"] == "DEL"
     assert result.debug_info["route_labels"]["destination_iata"] == "BOM"
@@ -959,7 +963,7 @@ async def test_plan_trip_internal_natural_language_round_trip_phrase_populates_c
 @pytest.mark.asyncio
 async def test_round_trip_block_marks_outbound_only_when_return_leg_fails(monkeypatch):
     query = (
-        "Round-trip Delhi to Mumbai, leave 2026-05-15 and return 2026-05-17, "
+        f"Round-trip Delhi to Mumbai, leave {_future(60)} and return {_future(70)}, "
         "prioritize cheapest acceptable option."
     )
 

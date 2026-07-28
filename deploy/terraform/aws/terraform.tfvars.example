@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in YOUR values.
+# terraform.tfvars is gitignored (secrets — N-M2.1).
+
+region        = "ap-south-1"
+admin_cidr    = "YOUR-IP/32"
+ssh_public_key  = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... you@example"
+alert_email   = "you@example.com"
+budget_usd    = 5
+instance_name = "llm-travel-agent"
+swap_size_gb  = 2
+app_user      = "llm-agent"

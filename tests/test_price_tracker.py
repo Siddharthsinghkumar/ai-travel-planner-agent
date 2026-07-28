@@ -1,5 +1,4 @@
 #tests/test_price_tracker.py
-from types import SimpleNamespace
 
 import pytest
 import tools.price_tracker as price_tracker

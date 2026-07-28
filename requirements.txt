@@ -1,6 +1,5 @@
 cachetools==5.5.2
 fastapi==0.135.3
-starlette==1.0.0
 uvicorn==0.34.3
 openai==1.84.0
 prometheus-client==0.24.1
@@ -13,9 +12,7 @@ redis==7.2.0
 airportsdata==20250523
 dateparser==1.4.0
 rapidfuzz==3.14.3
-requests==2.33.1
-urllib3==2.6.3
-orjson==3.11.6
-pillow==12.2.0
-protobuf==6.33.5
-tornado==6.5.5
+pydantic>=2.13,<3
+structlog
+langgraph-checkpoint-postgres
+langgraph

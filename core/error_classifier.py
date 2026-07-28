@@ -6,7 +6,7 @@ Each caller can use these directly or subclass for service-specific behavior.
 
 import asyncio
 import httpx
-from typing import Any, Optional, Type, Union
+from typing import Optional, Union
 
 
 def classify_error_type(
@@ -27,8 +27,6 @@ def classify_error_type(
         return classify_http_status(error)
     
     if isinstance(error, Exception):
-        error_type = type(error).__name__.lower()
-        
         # Check common exception types first
         if isinstance(error, (httpx.TimeoutException, asyncio.TimeoutError)):
             return "timeout"

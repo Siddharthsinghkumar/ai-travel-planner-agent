@@ -8,6 +8,7 @@ import api.app as api_app
 import agents.planner_agent as planner_agent
 from api.app import app
 import tools.booking_handoff as booking_handoff
+from core.rate_limiter import SlidingWindowRateLimiter
 
 future_date = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
 
@@ -229,7 +230,7 @@ async def test_booking_track_price(monkeypatch):
 
     snapshot_calls = []
 
-    def fake_record_price_snapshot(**kwargs):
+    async def fake_record_price_snapshot(**kwargs):
         snapshot_calls.append(kwargs)
         return 1
 
@@ -505,6 +506,7 @@ async def test_debug_keys_sanitizes_sensitive_key_metadata(monkeypatch):
 @pytest.mark.asyncio
 async def test_debug_keys_missing_admin_token_returns_403(monkeypatch):
     monkeypatch.setenv("AUTH_DISABLE", "false")
+    monkeypatch.setenv("AUTH_DISABLE_ADMIN", "false")
     monkeypatch.setenv("ADMIN_TOKEN", "admin-test-token")
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -1489,6 +1491,141 @@ async def test_ask_non_stream_warning_fallback_preserves_handoff_contract_fields
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_sensitive_fails_closed():
+    limiter = SlidingWindowRateLimiter(max_keys=10, sensitive=True)
+    # Simulate lock failure: make _lock.acquire raise.
+    original_lock = limiter._lock
+
+    class _FailingLock:
+        async def __aenter__(self):
+            raise RuntimeError("simulated lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    limiter._lock = _FailingLock()
+    decision = await limiter.check("test-key", limit=10, window_seconds=60)
+    limiter._lock = original_lock
+    assert not decision.allowed
+    assert decision.retry_after_seconds > 0
+    assert decision.remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_nonsensitive_fails_open(monkeypatch):
+    limiter_ns = SlidingWindowRateLimiter(max_keys=10, sensitive=False)
+
+    class _FailingLock:
+        async def __aenter__(self):
+            raise RuntimeError("simulated lock failure")
+
+        async def __aexit__(self, *args):
+            pass
+
+    limiter_ns._lock = _FailingLock()
+    decision = await limiter_ns.check("test-key", limit=10, window_seconds=60)
+    assert decision.allowed
+
+
+@pytest.mark.asyncio
+async def test_booking_hold_handoff_track_rejects_spurious_handoff_url():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/track-price",
+            json={
+                "flight": {"airline": "TestAir", "flight_no": "TA100", "price_inr": 5000},
+                "origin": "DEL",
+                "destination": "BOM",
+                "depart_date": "2030-01-01",
+                "handoff_url": "https://evil.com/phishing",
+            },
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_booking_cancel_rejects_spurious_extra_field():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/cancel",
+            json={"booking_id": 1, "spurious_field": "should_reject"},
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_booking_handoff_resolve_rejects_spurious_extra_field():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/booking/handoff/resolve",
+            json={
+                "flight": {"airline": "TestAir", "flight_no": "TA100", "price_inr": 5000},
+                "origin": "DEL",
+                "destination": "BOM",
+                "depart_date": "2030-01-01",
+                "spurious_field": "should_reject",
+            },
+            headers={"Authorization": "Bearer test-user-token"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_plan_approve_rejects_spurious_extra_field():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-spurious-extra"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            resp = await client.post(
+                f"/plan/{plan_id}/approve",
+                json={"approved": True, "spurious_field": "should_reject"},
+                headers={"Authorization": "Bearer test-user-token"},
+            )
+        assert resp.status_code == 422
+    finally:
+        _approval_store.clear(plan_id)
+
+
+def test_app_security_headers_present_on_api_response(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert "X-Frame-Options" in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_hitl_approve_non_owner_blocked():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-hl-owner"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    ok, reason = await _approval_store.set_decision(plan_id, True, principal_id="attacker-y")
+    assert not ok
+    assert reason == "principal_mismatch"
+    _approval_store.clear(plan_id)
+
+
+@pytest.mark.asyncio
+async def test_hitl_approve_owner_allowed():
+    from agents.planner_agent import _approval_store
+
+    plan_id = "plan-test-hl-owner-ok"
+    await _approval_store.request_approval(plan_id, timeout=5.0, owner_principal_id="owner-x")
+    ok, reason = await _approval_store.set_decision(plan_id, True, principal_id="owner-x")
+    assert ok
+    assert reason is None
+    _approval_store.clear(plan_id)
+
+
+@pytest.mark.asyncio
 async def test_ask_non_stream_empty_error_is_not_success(monkeypatch):
     async def fake_plan_trip(**kwargs):
         return {"error": "", "failure_reason": "planner_error"}
@@ -1552,3 +1689,59 @@ async def test_ask_non_stream_error_preserves_handoff_contract_fields(monkeypatc
     assert isinstance(body.get("top_flights"), list)
     assert body.get("debug_info", {}).get("top_flights") == []
     assert "booking_handoff_quality_context" not in (body.get("debug_info") or {})
+
+
+@pytest.mark.asyncio
+async def test_ask_stream_endpoint_includes_sse_resilience_headers(monkeypatch):
+    monkeypatch.delenv("RATE_LIMITER_BACKEND", raising=False)
+
+    async def fake_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                yield "test chunk "
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", fake_plan_trip)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream("POST", "/ask?stream=true", json={
+            "date": "2030-06-01",
+            "user_query": "test header",
+            "trip_type": "Business",
+        }, headers={"Authorization": "Bearer test-user-token"}) as stream_resp:
+            assert stream_resp.status_code == 200
+            assert stream_resp.headers.get("X-Accel-Buffering") == "no"
+            assert stream_resp.headers.get("Cache-Control") == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_ask_stream_idle_yields_ping_frame(monkeypatch):
+    monkeypatch.delenv("RATE_LIMITER_BACKEND", raising=False)
+
+    async def slow_plan_trip(*_args, **kwargs):
+        if kwargs.get("stream"):
+            async def _agen():
+                await asyncio.sleep(0.15)
+                yield "test chunk "
+                await asyncio.sleep(0.15)
+                yield "[DONE_JSON]" + json.dumps({"ok": True})
+            return _agen()
+        return {"ok": True}
+
+    monkeypatch.setattr("api.app.planner_agent.plan_trip", slow_plan_trip)
+    monkeypatch.setattr("api.app.SSE_KEEPALIVE_INTERVAL", 0.05)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with client.stream("POST", "/ask?stream=true", json={
+            "date": "2030-06-01",
+            "user_query": "test ping",
+            "trip_type": "Business",
+        }, headers={"Authorization": "Bearer test-user-token"}) as stream_resp:
+            raw_text = ""
+            async for chunk in stream_resp.aiter_text():
+                raw_text += chunk
+            assert ": ping\n\n" in raw_text

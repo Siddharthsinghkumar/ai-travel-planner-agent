@@ -6,7 +6,6 @@ and other caching backends with metrics tracking and cross-cache invalidation ho
 
 import logging
 import threading
-import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from functools import wraps
 
