@@ -1382,16 +1382,16 @@ async def lifespan(app: FastAPI):
 
     app.state.startup_complete = True
 
-    # Expose Prometheus metrics on a dedicated internal port (9091) so the scrape
+    # Expose Prometheus metrics on a dedicated internal port (8765) so the scrape
     # config can reach them without the admin-token gate on the public /metrics route
     # (F-006). Guarded: never bind in TESTING (tests/CI), and never fail startup if the
     # port is unavailable.
     if not get_env_bool("TESTING", default=False):
         try:
-            start_http_server(9091)
-            logger.info("prometheus_metrics_server_started", extra={"port": 9091})
+            start_http_server(8765)
+            logger.info("prometheus_metrics_server_started", extra={"port": 8765})
         except Exception:
-            logger.exception("prometheus_metrics_server_start_failed", extra={"port": 9091})
+            logger.exception("prometheus_metrics_server_start_failed", extra={"port": 8765})
 
     yield
 
