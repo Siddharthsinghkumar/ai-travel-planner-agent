@@ -1,5 +1,4 @@
 import signal
-import threading
 from core.signal_handler import SignalHandler
 
 def test_signal_handler_sets_flag():

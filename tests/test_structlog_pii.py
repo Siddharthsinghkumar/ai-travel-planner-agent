@@ -1,4 +1,3 @@
-import pytest
 from core.structured_logging import _redact_pii, _PII_REDACTION_MASK
 
 def test_pii_redaction_email():

@@ -1,5 +1,4 @@
 from typing import TypedDict, Annotated, Optional
-import operator
 
 def merge_list(a: list, b: list) -> list:
     return a + b

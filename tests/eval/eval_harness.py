@@ -1,5 +1,4 @@
-import os
-from typing import Dict, List, Any
+from typing import Dict, Any
 
 class Judge:
     def evaluate_faithfulness(self, query: str, context: str, response: str) -> float:
