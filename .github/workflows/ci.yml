@@ -140,7 +140,7 @@ jobs:
           target: http://localhost:8000
           token: ${{ secrets.GITHUB_TOKEN }}
           rules_file_name: .zap/rules.tsv
-          fail_action: warn
+          fail_action: false
 
   ragas-eval:
     runs-on: ubuntu-latest
