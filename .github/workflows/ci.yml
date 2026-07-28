@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 permissions:
   contents: read
@@ -138,6 +138,62 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           rules_file_name: .zap/rules.tsv
           fail_action: warn
+
+  ragas-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run RAGAS Eval (Merlin/Local Stack)
+        run: pytest -q tests/eval/
+
+  e2e-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install frontend dependencies
+        working-directory: ./frontend-levasion
+        run: npm ci
+      - name: Install Playwright Browsers
+        working-directory: ./frontend-levasion
+        run: npx playwright install --with-deps
+      - name: Run E2E Tests
+        working-directory: ./frontend-levasion
+        run: npx playwright test
+
+  auto-merge:
+    needs: [lint, fast-tests, slow-tests, ragas-eval, e2e-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge dev into main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git merge origin/dev --no-ff -m "chore: auto-merge dev to main after successful pipeline"
+          git push origin main
 
   import-check:
     runs-on: ubuntu-latest
